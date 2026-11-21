@@ -1074,7 +1074,7 @@ fn main() {
                 if f[0].is_empty() {
                     return;
                 }
-                let ingest = ts::parse_ts(f[3]);
+                let ingest = ts::parse_ingest(f[3]);
                 let mut kind = match f[4] {
                     b"view" => VIEW,
                     b"cart" => CART,

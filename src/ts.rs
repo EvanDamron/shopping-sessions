@@ -111,6 +111,42 @@ fn parse_iso(b: &[u8], n: usize) -> Option<i64> {
     Some(((dn * 86_400 + h * 3600 + mi * 60 + s) - off * 60) * 1000)
 }
 
+/// `ingest_ts`, which rules.md guarantees is valid F1: digits are not re-validated.
+/// Anything not shaped like F1 goes through the full parser.
+#[inline(always)]
+pub fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() != 20 || b[10] != b'T' || b[19] != b'Z' {
+        return parse_ts(b);
+    }
+    const M0: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const M1: u64 = 0xFFFF_00FF_FF00_FFFF;
+    let w0 = load8(b, 0);
+    let w1 = load8(b, 8);
+    let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64;
+    let p0 = {
+        let x = (w0 ^ ZEROS) & M0;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
+    };
+    let p1 = {
+        let x = (w1 ^ ZEROS) & M1;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
+    };
+    let p2 = {
+        let x = (w2 ^ ZEROS) & 0x00FF_FF00;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
+    };
+    let pick = |p: u64, i: u32| ((p >> (8 * i)) & 0xff) as i64;
+    let y = (pick(p0, 0) * 100 + pick(p0, 2)) as usize;
+    let mo = pick(p0, 5);
+    if y > 9999 || !(1..=12).contains(&mo) {
+        return parse_ts(b);
+    }
+    let ys = YEAR_START[y] as i64;
+    let leap = YEAR_START[y + 1] as i64 - ys - 365;
+    let dn = ys + CUM[mo as usize] + (mo > 2) as i64 * leap + pick(p1, 0) - 1;
+    Some((dn * 86_400 + pick(p1, 3) * 3600 + pick(p1, 6) * 60 + pick(p2, 1)) * 1000)
+}
+
 /// Eight ASCII digits (little-endian load) to their value.
 #[inline(always)]
 fn parse8(w: u64) -> u64 {
@@ -219,6 +255,7 @@ mod tests {
             let sod = secs.rem_euclid(86400);
             let s = format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, sod / 60 % 60, sod % 60);
             assert_eq!(parse_ts(s.as_bytes()), Some(secs * 1000), "{s}");
+            assert_eq!(parse_ingest(s.as_bytes()), Some(secs * 1000), "{s}");
             check(&s);
             check(&ms.to_string());
         }
