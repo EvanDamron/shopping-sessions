@@ -932,6 +932,7 @@ struct CS {
     tmp: Vec<(u32, u32)>,
     catrev: Vec<(u16, u64)>,
     evs: Vec<PEv>,
+    raw: Vec<PEv>,
     cl: Vec<PClk>,
     table: Vec<u32>,
     keys: Vec<u64>,
@@ -1217,6 +1218,7 @@ fn rest(
             tmp: Vec::new(),
             catrev: Vec::new(),
             evs: Vec::new(),
+            raw: Vec::new(),
             cl: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
@@ -1264,12 +1266,15 @@ fn rest(
                     i = (i + 1) & mask;
                 }
             };
+            let mut raw = std::mem::take(&mut st.raw);
+            raw.clear();
             for a in ast.iter() {
                 for e in a.pe[p].iter() {
                     if e.live() {
                         let id = lookup(&mut table, &mut keys, &mut cnt, e.ph, true);
                         cnt[id as usize] += 1;
                         pid.push(id);
+                        raw.push(*e);
                     }
                 }
             }
@@ -1288,16 +1293,9 @@ fn rest(
             unsafe { evs.set_len(total) };
             {
                 let mut pos: Vec<u32> = off[..np].to_vec();
-                let mut k = 0;
-                for a in ast.iter() {
-                    for e in a.pe[p].iter() {
-                        if e.live() {
-                            let id = pid[k] as usize;
-                            k += 1;
-                            evs[pos[id] as usize] = *e;
-                            pos[id] += 1;
-                        }
-                    }
+                for (e, &id) in raw.iter().zip(pid.iter()) {
+                    evs[pos[id as usize] as usize] = *e;
+                    pos[id as usize] += 1;
                 }
             }
             // Clicks of these persons, grouped the same way.
@@ -1352,6 +1350,7 @@ fn rest(
                 person(st, &evs[off[i] as usize..off[i + 1] as usize], &cl[coff[i] as usize..coff[i + 1] as usize], ctx);
             }
             st.evs = evs;
+            st.raw = raw;
             st.cl = cl;
             st.table = table;
             st.keys = keys;
