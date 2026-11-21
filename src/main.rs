@@ -485,7 +485,6 @@ struct LEntry {
     ph: u64,
     name: u64, // packed name of the person
     h2: u32,
-    ph2: u32,
 }
 
 struct Links {
@@ -497,7 +496,6 @@ struct Links {
 struct Person {
     ph: u64,
     name: u64,
-    ph2: u32,
 }
 
 impl Links {
@@ -519,12 +517,12 @@ impl Links {
                     break;
                 }
                 if e.h == h && e.h2 == h2 {
-                    return Person { ph: e.ph, name: e.name, ph2: e.ph2 };
+                    return Person { ph: e.ph, name: e.name };
                 }
                 i = (i + 1) & *mask as usize;
             }
         }
-        Person { ph: h, name: pack(s), ph2: h2 }
+        Person { ph: h, name: pack(s) }
     }
 }
 
@@ -689,8 +687,7 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
                 let rname = names_ref[r as usize].b();
                 let me = s.names[i].b();
                 let h = s.hashes[i];
-                let (ph, ph2) = hh(rname);
-                let e = LEntry { h, h2: hh(me).1, ph, ph2, name: pack(rname) };
+                let e = LEntry { h, h2: hh(me).1, ph: hh(rname).0, name: pack(rname) };
                 let mut k = (h & mask) as usize;
                 while slots[k].name != 0 {
                     k = (k + 1) & mask as usize;
@@ -768,18 +765,30 @@ const CART: u8 = 1;
 const PURCHASE: u8 = 2;
 const INVALID: u8 = 255;
 
-/// An event, filed under its person. `del` is set by dedup when another copy wins.
+/// An event, filed under its person. Purchases have price > 0; views and carts 0.
+/// `t` is ms since base, with bit 31 set by dedup when another copy wins.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
     ph: u64,
     name: u64,
-    ts: u32, // ms since base
-    price: u32,
-    ph2: u32,
-    cat: u16,
-    kind: u8,
-    del: u8,
+    t: u32,
+    pc: u32, // price (24 bits) | category << 24
+}
+
+impl PEv {
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.pc & 0x00FF_FFFF
+    }
+    #[inline(always)]
+    fn cat(&self) -> u16 {
+        (self.pc >> 24) as u16
+    }
+    #[inline(always)]
+    fn live(&self) -> bool {
+        self.t >> 31 == 0
+    }
 }
 
 /// An event id copy, filed under its event-id bucket, for dedup.
@@ -798,7 +807,6 @@ struct PClk {
     ph: u64,
     cid: u64,
     ts: u32,
-    ph2: u32,
     camp: u32,
 }
 
@@ -888,11 +896,10 @@ struct Pend {
     ts: u32,
     price: u32,
     cat: u16,
-    kind: u8,
 }
 impl Default for Pend {
     fn default() -> Self {
-        Pend { user: &[], uh: 0, uh2: 0, eh: 0, eh2: 0, ing: 0, ts: 0, price: 0, cat: 0, kind: 0 }
+        Pend { user: &[], uh: 0, uh2: 0, eh: 0, eh2: 0, ing: 0, ts: 0, price: 0, cat: 0 }
     }
 }
 
@@ -927,7 +934,7 @@ struct CS {
     evs: Vec<PEv>,
     cl: Vec<PClk>,
     table: Vec<u32>,
-    keys: Vec<(u64, u32)>,
+    keys: Vec<u64>,
     pid: Vec<u32>,
     cnt: Vec<u32>,
     off: Vec<u32>,
@@ -962,7 +969,8 @@ fn main() {
 
     // All in-window times are stored as u32 milliseconds since `base`.
     let base = ws - WEEK;
-    assert!(we - base <= u32::MAX as i64, "window too long for 32-bit offsets");
+    assert!(we - base < 1i64 << 31, "window too long for 31-bit offsets");
+    assert!(lk.categories.len() <= 256, "more than 256 categories");
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let ncamp = lk.channels.len();
@@ -1003,7 +1011,7 @@ fn main() {
                     let part = (p.ph >> PB_SHIFT) as usize;
                     let v = &mut a.pe[part];
                     let r = (tid << 58) | ((part as u64) << 48) | v.len() as u64;
-                    v.push(PEv { ph: p.ph, name: p.name, ts: q.ts, price: q.price, ph2: p.ph2, cat: q.cat, kind: q.kind, del: 0 });
+                    v.push(PEv { ph: p.ph, name: p.name, t: q.ts, pc: q.price | ((q.cat as u32) << 24) });
                     a.ek[(q.eh >> EB_SHIFT) as usize].push(EKey { h: q.eh, r, h2: q.eh2, ingest: q.ing });
                 }
             };
@@ -1050,7 +1058,7 @@ fn main() {
                 }
                 let (uh, uh2) = hh(f[1]);
                 links.prefetch(uh);
-                pend[np] = Pend { user: f[1], uh, uh2, eh, eh2, ing, ts: (ts - base) as u32, price, cat, kind };
+                pend[np] = Pend { user: f[1], uh, uh2, eh, eh2, ing, ts: (ts - base) as u32, price, cat };
                 np += 1;
                 if np == BATCH {
                     flush(a, &pend);
@@ -1064,7 +1072,7 @@ fn main() {
             let flush = |a: &mut AState, pend: &[CPend]| {
                 for q in pend {
                     let p = links.person_h(q.user, q.uh, q.uh2);
-                    a.pc[(p.ph >> PB_SHIFT) as usize].push(PClk { ph: p.ph, cid: q.cid, ts: q.ts, ph2: p.ph2, camp: q.camp });
+                    a.pc[(p.ph >> PB_SHIFT) as usize].push(PClk { ph: p.ph, cid: q.cid, ts: q.ts, camp: q.camp });
                 }
             };
             scan::for_records::<4>(cch[t - nev], |f| {
@@ -1141,7 +1149,7 @@ fn rest(
                 let t = (r >> 58) as usize;
                 let p = ((r >> 48) & 0x3ff) as usize;
                 let i = (r & 0xffff_ffff_ffff) as usize;
-                unsafe { (*pe_ptrs[t][p].get().add(i)).del = 1 };
+                unsafe { (*pe_ptrs[t][p].get().add(i)).t |= 1 << 31 };
             }
         };
         let mut dummy: Vec<Vec<u32>> = (0..nthreads).map(|_| Vec::new()).collect();
@@ -1230,13 +1238,13 @@ fn rest(
             let mut table = std::mem::take(&mut st.table);
             table.clear();
             table.resize(cap, u32::MAX);
-            let mut keys = std::mem::take(&mut st.keys); // local person -> (ph, ph2)
+            let mut keys = std::mem::take(&mut st.keys); // local person -> ph
             keys.clear();
             let mut pid = std::mem::take(&mut st.pid);
             pid.clear();
             let mut cnt = std::mem::take(&mut st.cnt);
             cnt.clear();
-            let lookup = |table: &mut Vec<u32>, keys: &mut Vec<(u64, u32)>, cnt: &mut Vec<u32>, ph: u64, ph2: u32, insert: bool| -> u32 {
+            let lookup = |table: &mut Vec<u32>, keys: &mut Vec<u64>, cnt: &mut Vec<u32>, ph: u64, insert: bool| -> u32 {
                 let mut i = (ph as usize) & mask;
                 loop {
                     let v = table[i];
@@ -1245,12 +1253,12 @@ fn rest(
                             return u32::MAX;
                         }
                         let id = keys.len() as u32;
-                        keys.push((ph, ph2));
+                        keys.push(ph);
                         cnt.push(0);
                         table[i] = id;
                         return id;
                     }
-                    if keys[v as usize] == (ph, ph2) {
+                    if keys[v as usize] == ph {
                         return v;
                     }
                     i = (i + 1) & mask;
@@ -1258,8 +1266,8 @@ fn rest(
             };
             for a in ast.iter() {
                 for e in a.pe[p].iter() {
-                    if e.del == 0 {
-                        let id = lookup(&mut table, &mut keys, &mut cnt, e.ph, e.ph2, true);
+                    if e.live() {
+                        let id = lookup(&mut table, &mut keys, &mut cnt, e.ph, true);
                         cnt[id as usize] += 1;
                         pid.push(id);
                     }
@@ -1283,7 +1291,7 @@ fn rest(
                 let mut k = 0;
                 for a in ast.iter() {
                     for e in a.pe[p].iter() {
-                        if e.del == 0 {
+                        if e.live() {
                             let id = pid[k] as usize;
                             k += 1;
                             evs[pos[id] as usize] = *e;
@@ -1300,7 +1308,7 @@ fn rest(
             }
             for a in ast.iter() {
                 for c in a.pc[p].iter() {
-                    let id = lookup(&mut table, &mut keys, &mut cnt, c.ph, c.ph2, false);
+                    let id = lookup(&mut table, &mut keys, &mut cnt, c.ph, false);
                     if id != u32::MAX {
                         cnt[id as usize] += 1;
                     }
@@ -1335,7 +1343,7 @@ fn rest(
             for i in 0..np {
                 let ev = &mut evs[off[i] as usize..off[i + 1] as usize];
                 if ev.len() > 1 {
-                    ev.sort_unstable_by_key(|e| e.ts);
+                    ev.sort_unstable_by_key(|e| e.t);
                 }
                 let c = &mut cl[coff[i] as usize..coff[i + 1] as usize];
                 if c.len() > 1 {
@@ -1409,7 +1417,7 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
     let (mut us, mut ue, mut ur) = (0u32, 0u32, 0u64);
     st.catrev.clear();
     while k < ev.len() {
-        let start = ev[k].ts as i64;
+        let start = ev[k].t as i64;
         let day = (start + ctx.dayoff).div_euclid(DAY);
         if day != cur_day {
             if cur_day >= 0 {
@@ -1424,16 +1432,18 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
         let mut n = 0u32;
         let mut rev = 0u64;
         let mut purch = false;
-        while k < ev.len() && ev[k].ts as i64 - last <= MIN30 {
+        while k < ev.len() && ev[k].t as i64 - last <= MIN30 {
             let e = &ev[k];
-            last = e.ts as i64;
+            last = e.t as i64;
             n += 1;
-            if e.kind == PURCHASE {
-                rev += e.price as u64;
+            let price = e.price();
+            if price > 0 {
+                let cat = e.cat();
+                rev += price as u64;
                 purch = true;
-                match st.catrev.iter_mut().find(|c| c.0 == e.cat) {
-                    Some(c) => c.1 += e.price as u64,
-                    None => st.catrev.push((e.cat, e.price as u64)),
+                match st.catrev.iter_mut().find(|c| c.0 == cat) {
+                    Some(c) => c.1 += price as u64,
+                    None => st.catrev.push((cat, price as u64)),
                 }
             }
             k += 1;
