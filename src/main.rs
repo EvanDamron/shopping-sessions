@@ -925,6 +925,59 @@ struct AState {
     pc: Vec<Vec<PClk>>,
 }
 
+/// Open-addressing map from a person hash to a dense local id; grows as needed.
+#[derive(Default)]
+struct PTable {
+    slots: Vec<(u64, u32)>, // id u32::MAX = empty
+    mask: usize,
+    len: usize,
+}
+
+impl PTable {
+    fn reset(&mut self, expect: usize) {
+        let cap = (expect * 2).next_power_of_two().max(16);
+        self.slots.clear();
+        self.slots.resize(cap, (0, u32::MAX));
+        self.mask = cap - 1;
+        self.len = 0;
+    }
+    /// Ok(id) if present, else Err(slot to insert at).
+    #[inline]
+    fn find(&mut self, ph: u64) -> Result<u32, usize> {
+        if (self.len + 1) * 2 > self.slots.len() {
+            let old = std::mem::take(&mut self.slots);
+            let cap = old.len() * 2;
+            self.slots.resize(cap, (0, u32::MAX));
+            self.mask = cap - 1;
+            for (k, v) in old {
+                if v != u32::MAX {
+                    let mut i = (k as usize) & self.mask;
+                    while self.slots[i].1 != u32::MAX {
+                        i = (i + 1) & self.mask;
+                    }
+                    self.slots[i] = (k, v);
+                }
+            }
+        }
+        let mut i = (ph as usize) & self.mask;
+        loop {
+            let (k, v) = self.slots[i];
+            if v == u32::MAX {
+                return Err(i);
+            }
+            if k == ph {
+                return Ok(v);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline]
+    fn put(&mut self, slot: usize, ph: u64, id: u32) {
+        self.slots[slot] = (ph, id);
+        self.len += 1;
+    }
+}
+
 struct CS {
     rows: Vec<URow>,
     camp: Vec<[u64; 4]>, // (camp*ndays + day) -> sessions, purchasing, revenue, assisted
@@ -935,7 +988,7 @@ struct CS {
     evs: Vec<PEv>,
     raw: Vec<PEv>,
     cl: Vec<PClk>,
-    table: Vec<u32>,
+    table: PTable,
     keys: Vec<u64>,
     pid: Vec<u32>,
     cnt: Vec<u32>,
@@ -1154,7 +1207,7 @@ fn rest(
                 unsafe { (*pe_ptrs[t][p].get().add(i)).t |= 1 << 31 };
             }
         };
-        let mut dummy: Vec<Vec<u32>> = (0..nthreads).map(|_| Vec::new()).collect();
+        let mut dummy: Vec<Vec<u64>> = (0..nthreads).map(|_| Vec::new()).collect();
         par(&mut dummy, EB, |slots, b| {
             let total: usize = ek.iter().map(|t| t[b].len()).sum();
             if total == 0 {
@@ -1178,25 +1231,30 @@ fn rest(
                 }
                 &ek[ti][b][(code - offs[ti]) as usize]
             };
+            // Slot = (high 32 bits of the hash) << 32 | (code + 1); 0 = empty.
             for (ti, t) in ek.iter().enumerate() {
                 for (i, e) in t[b].iter().enumerate() {
-                    let code = offs[ti] + i as u32 + 1;
+                    let code = offs[ti] + i as u32;
+                    let tag = e.h & 0xFFFF_FFFF_0000_0000;
+                    let mine = tag | (code as u64 + 1);
                     let mut s = (e.h as usize) & mask;
                     loop {
                         let v = slots[s];
                         if v == 0 {
-                            slots[s] = code;
+                            slots[s] = mine;
                             break;
                         }
-                        let o = get(v - 1);
-                        if o.h == e.h && o.h2 == e.h2 {
-                            if e.ingest < o.ingest {
-                                kill(o.r);
-                                slots[s] = code;
-                            } else {
-                                kill(e.r);
+                        if v & 0xFFFF_FFFF_0000_0000 == tag {
+                            let o = get((v & 0xFFFF_FFFF) as u32 - 1);
+                            if o.h == e.h && o.h2 == e.h2 {
+                                if e.ingest < o.ingest {
+                                    kill(o.r);
+                                    slots[s] = mine;
+                                } else {
+                                    kill(e.r);
+                                }
+                                break;
                             }
-                            break;
                         }
                         s = (s + 1) & mask;
                     }
@@ -1221,7 +1279,7 @@ fn rest(
             evs: Vec::new(),
             raw: Vec::new(),
             cl: Vec::new(),
-            table: Vec::new(),
+            table: PTable::default(),
             keys: Vec::new(),
             pid: Vec::new(),
             cnt: Vec::new(),
@@ -1236,35 +1294,27 @@ fn rest(
         par(&mut cs, PB, |st, p| {
             // Group by person with a local table, then sort each person's rows by time.
             let n_ev: usize = ast.iter().map(|a| a.pe[p].len()).sum();
-            let cap = (n_ev.max(8) * 2).next_power_of_two();
-            let mask = cap - 1;
             let mut table = std::mem::take(&mut st.table);
-            table.clear();
-            table.resize(cap, u32::MAX);
+            table.reset((n_ev / 8).max(64));
             let mut keys = std::mem::take(&mut st.keys); // local person -> ph
             keys.clear();
             let mut pid = std::mem::take(&mut st.pid);
             pid.clear();
             let mut cnt = std::mem::take(&mut st.cnt);
             cnt.clear();
-            let lookup = |table: &mut Vec<u32>, keys: &mut Vec<u64>, cnt: &mut Vec<u32>, ph: u64, insert: bool| -> u32 {
-                let mut i = (ph as usize) & mask;
-                loop {
-                    let v = table[i];
-                    if v == u32::MAX {
+            let lookup = |table: &mut PTable, keys: &mut Vec<u64>, cnt: &mut Vec<u32>, ph: u64, insert: bool| -> u32 {
+                match table.find(ph) {
+                    Ok(v) => v,
+                    Err(slot) => {
                         if !insert {
                             return u32::MAX;
                         }
                         let id = keys.len() as u32;
                         keys.push(ph);
                         cnt.push(0);
-                        table[i] = id;
-                        return id;
+                        table.put(slot, ph, id);
+                        id
                     }
-                    if keys[v as usize] == ph {
-                        return v;
-                    }
-                    i = (i + 1) & mask;
                 }
             };
             let mut raw = std::mem::take(&mut st.raw);
