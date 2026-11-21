@@ -79,6 +79,14 @@ impl Links {
         prefetch(unsafe { self.tab.add((h >> self.shift) as usize) });
     }
 
+    /// The ID in slot `i` and its person, if the slot is in use.
+    #[inline(always)]
+    pub fn linked_at(&self, i: usize) -> Option<(Id, u32)> {
+        let e = unsafe { &*self.tab.add(i) };
+        let hi = e.hi.load(Relaxed);
+        (hi != 0 && hi != BUSY).then(|| (Id { lo: e.lo.load(Relaxed), hi }, e.person.load(Relaxed)))
+    }
+
     /// The name of person `n`.
     #[inline(always)]
     pub fn name(&self, n: u32) -> Id {
