@@ -1167,7 +1167,14 @@ fn main() {
                 flush(a, &pend[k..k + 1]);
             }
         }
+        parts::sfence(); // this thread's non-temporal stores, before the task ends
     });
+    // Write the staged remainders (plain stores; tiny).
+    for a in ast.iter_mut() {
+        a.pe.finish();
+        a.ek.finish();
+        a.pc.finish();
+    }
     log("phase A parsed");
     rest(ast, links, lk, ctx, ws, base, ncamp, day0, nthreads, &out, t0);
 }
