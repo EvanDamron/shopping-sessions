@@ -22,6 +22,32 @@ unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
 const HUGE: usize = 2 << 20;
 
+/// Whether to ask for transparent huge pages. With little free contiguous memory the
+/// kernel would compact synchronously on every fault, which costs far more than it saves.
+static USE_HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Free memory in blocks of 2 MB or larger, from /proc/buddyinfo (0 if unreadable).
+fn free_huge_bytes() -> usize {
+    let Ok(s) = std::fs::read_to_string("/proc/buddyinfo") else { return 0 };
+    let mut total = 0usize;
+    for line in s.lines() {
+        // "Node 0, zone   Normal  c0 c1 ... c10": counts of free blocks of order 0..
+        let counts: Vec<usize> = line.split_whitespace().skip(4).filter_map(|x| x.parse().ok()).collect();
+        for (order, &c) in counts.iter().enumerate().skip(9) {
+            total += c << (order + 12);
+        }
+    }
+    total
+}
+
+/// Decides once, before the big allocations, whether huge pages are worth requesting.
+pub fn plan_huge(need_bytes: usize) -> bool {
+    let free = free_huge_bytes();
+    let ok = std::env::var_os("NO_HUGE").is_none() && free >= need_bytes + need_bytes / 4;
+    USE_HUGE.store(ok, std::sync::atomic::Ordering::Relaxed);
+    ok
+}
+
 impl<T: Copy> Parts<T> {
     pub fn new(nparts: usize, cap: usize) -> Self {
         assert!(std::mem::size_of::<T>() * 8 % 64 == 0, "item size must tile cache lines in groups of 8");
@@ -138,7 +164,7 @@ pub fn alloc(bytes: usize) -> *mut u8 {
         assert!(p != libc::MAP_FAILED, "mmap of {len} bytes failed");
         let start = (p as usize).div_ceil(HUGE) * HUGE;
         #[cfg(target_os = "linux")]
-        if std::env::var_os("NO_HUGE").is_none() {
+        if USE_HUGE.load(std::sync::atomic::Ordering::Relaxed) {
             libc::madvise(start as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
         }
         start as *mut u8

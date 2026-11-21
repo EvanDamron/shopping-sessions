@@ -1019,6 +1019,11 @@ fn main() {
     let event_files = csv_files(&data.join("events"));
     let click_files = csv_files(&data.join("clicks"));
     let link_files = csv_files(&data.join("links"));
+    // Huge pages only if enough free 2 MB blocks exist for the arenas and link table.
+    let fsize = |v: &[PathBuf]| v.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum::<usize>();
+    let need = (fsize(&event_files) / 80 * 48 + fsize(&click_files) / 50 * 24 + fsize(&link_files) / 20 * 64) * 5 / 4;
+    let huge = parts::plan_huge(need);
+    eprintln!("huge pages: {huge} (need ~{} MB)", need >> 20);
     // Products and campaigns load on their own thread while the links are built.
     let (lk, links) = std::thread::scope(|sc| {
         let h = sc.spawn(|| read_lookups(&data));

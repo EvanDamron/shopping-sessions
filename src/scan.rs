@@ -146,6 +146,7 @@ pub fn for_records<const N: usize>(data: &'static [u8], mut f: impl FnMut(&[&'st
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     /// The byte-loop splitter applied line by line: the plain reading of the dialect.
@@ -234,6 +235,65 @@ mod tests {
             assert_eq!(simd::<2>(d), by_lines::<2>(d), "{:?}", String::from_utf8_lossy(d));
             assert_eq!(simd::<4>(d), by_lines::<4>(d), "{:?}", String::from_utf8_lossy(d));
             assert_eq!(simd::<7>(d), by_lines::<7>(d), "{:?}", String::from_utf8_lossy(d));
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    #[test]
+    #[ignore]
+    fn bench_scan() {
+        let files: Vec<&'static [u8]> = std::fs::read_dir("data/p20/events")
+            .unwrap()
+            .take(8)
+            .map(|e| &*Box::leak(std::fs::read(e.unwrap().path()).unwrap().into_boxed_slice()))
+            .collect();
+        let bytes: usize = files.iter().map(|d| d.len()).sum();
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0u64;
+            for d in &files {
+                let mut o = 0;
+                while o + 64 <= d.len() {
+                    let (c, l, q) = unsafe { super::classify(d.as_ptr().add(o)) };
+                    acc = acc.wrapping_add((c | l).count_ones() as u64 + q.count_ones() as u64);
+                    o += 64;
+                }
+            }
+            eprintln!("classify only: {:.3} ns/byte acc {acc}", t0.elapsed().as_nanos() as f64 / bytes as f64);
+            let t0 = std::time::Instant::now();
+            let mut acc = 0u64;
+            for d in &files {
+                let mut o = 0;
+                while o + 64 <= d.len() {
+                    let (c, l, _q) = unsafe { super::classify(d.as_ptr().add(o)) };
+                    let mut m = c | l;
+                    while m != 0 {
+                        acc = acc.wrapping_add(o as u64 + m.trailing_zeros() as u64);
+                        m &= m - 1;
+                    }
+                    o += 64;
+                }
+            }
+            eprintln!("classify + bit loop: {:.3} ns/byte acc {acc}", t0.elapsed().as_nanos() as f64 / bytes as f64);
+        }
+        for round in 0..6 {
+            let t0 = std::time::Instant::now();
+            let mut n = 0usize;
+            let mut acc = 0usize;
+            for d in &files {
+                super::for_records::<7>(d, |f| {
+                    n += 1;
+                    acc = acc.wrapping_add(f[2].len() + f[6].len());
+                });
+            }
+            let dt = t0.elapsed();
+            eprintln!(
+                "round {round}: {n} lines {:.3} ns/byte {:.1} ns/line acc {acc}",
+                dt.as_nanos() as f64 / bytes as f64,
+                dt.as_nanos() as f64 / n as f64
+            );
         }
     }
 }
