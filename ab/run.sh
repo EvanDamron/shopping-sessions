@@ -14,9 +14,9 @@ run() { # binary dataset [VAR=value ...]: prints wall ms
   env "$@" DATA_DIR=$S/$d OUTPUT_DIR=$S/o $b >/dev/null 2>$S/err
   echo $(( ($(now) - t) / 1000000 ))
 }
-A=""; B=""; A6=""; B6=""; C6=""; D6=""
+A=""; B=""; C=""; A6=""; B6=""; C6=""; D6=""
 for i in 1 2 3; do
-  A="$A$(run /app/sessions_old g20) "; B="$B$(run /app/sessions g20) "
+  A="$A$(run /app/sessions_old g20) "; B="$B$(run /app/sessions g20) "; C="$C$(run /app/sessions g20 GLIBC_TUNABLES=) "
 done
 for i in 1 2 3; do
   A6="$A6$(run /app/sessions_old g60) "; B6="$B6$(run /app/sessions g60) "
@@ -27,7 +27,7 @@ ph=$(grep -E 'links: [0-9]|phase A parsed|stage:|phase B|phase C|wrote' $S/err |
 rm -rf $S/o $S/g20 $S/g60
 cat > $S/rows.txt <<ROWS
 DIAG1 gen20=${g20}ms gen60=${g60}ms free2M=${free2m}MB nproc=$(nproc)
-DIAG2 g20 old56effae=$A new77385d7=$B
+DIAG2 g20 old56effae=$A new77385d7=$B new_noMallocTHP=$C
 DIAG3 g60 old56effae=$A6 new77385d7=$B6
 DIAG4 g60 new_noMallocTHP=$C6 new_SS_HUGE0=$D6
 DIAG5 g60 new phases: $ph
