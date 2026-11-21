@@ -23,6 +23,7 @@ mod pq;
 mod scan;
 #[cfg(test)]
 mod simple;
+mod stage;
 mod ts;
 mod tsfast;
 
@@ -976,18 +977,7 @@ unsafe fn clicks(sh: &Shared, w: &mut Worker, rd: &Reader) {
 // ---------------------------------------------------------------------------
 // Phase C state
 
-/// One thread's user_daily rows, encoded as Parquet PLAIN pages as they are made.
-#[derive(Default)]
-struct Rows {
-    n: usize,
-    names: Vec<u8>,
-    days: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    top_bits: Vec<u8>,
-    tops: Vec<u8>,
-}
+type Rows = pq::UserRows;
 
 struct CS {
     rows: Rows,
@@ -1084,11 +1074,16 @@ fn make_links(
     let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
     let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
     let lbytes: u64 = link_files.iter().map(|f| f.1).sum();
-    // Huge pages: only when the kernel has them free (see mem::free_huge_bytes).
+    // Huge pages for the record arenas when the kernel has free 2 MB blocks for what
+    // they will touch (~28 bytes per event, ~32 per click) with 50% to spare, or when
+    // /proc/buddyinfo cannot be read. On the scorer (THP madvise) a fresh GB costs
+    // 66 ms in 4 KB pages on 8 threads but 28 ms in huge pages; on a host whose free
+    // memory is fragmented, huge faults stall in compaction instead.
     let huge_free = mem::free_huge_bytes();
+    let touched = (ebytes / 72 * 28 + cbytes / 45 * 32) as usize;
     let huge = match envn("SS_HUGE") {
         Some(v) => v == 1,
-        None => huge_free.is_some_and(|f| f >= (ebytes + cbytes) as usize + (2 << 30)),
+        None => huge_free.is_none_or(|f| f >= touched + touched / 2),
     };
     let est = (ebytes / 72).max(1) as usize;
     let ltasks = ranges(link_files, 256 << 10);
@@ -1222,7 +1217,13 @@ fn phase_a<'a>(
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
                 // one more thread fills it meanwhile.
-                sc.spawn(move || fast::build_gt(f, &sh.links, 1));
+                sc.spawn(move || {
+                    let t = Instant::now();
+                    fast::build_gt(f, &sh.links, 1);
+                    if std::env::var_os("SS_TIME").is_some() {
+                        eprintln!("  build_gt took {:?}", t.elapsed());
+                    }
+                });
             }
             for w in workers.iter_mut() {
                 sc.spawn(move || {
@@ -1289,6 +1290,21 @@ fn phase_a<'a>(
 
 fn main() {
     let t0 = Instant::now();
+    // Large malloc allocations (row columns, pass buffers) go on transparent huge pages
+    // when the machine has plenty of free 2 MB blocks, where they halve the page faults;
+    // with few, the kernel would stall compacting memory instead. glibc reads the tunable
+    // only at start, so the process restarts itself once with it set.
+    if std::env::var_os("GLIBC_TUNABLES").is_none()
+        && std::env::var("SS_HUGE").map_or(true, |v| v != "0")
+        && mem::free_huge_bytes().is_some_and(|f| f >= 8 << 30)
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure; then carry on without the tunable.
+        let _ = std::process::Command::new("/proc/self/exe")
+            .args(std::env::args_os().skip(1))
+            .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1")
+            .exec();
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -1322,8 +1338,9 @@ fn main() {
     // The index-order fast path (fast.rs) is used when the data's IDs have the public
     // generator's form; SS_FAST=0 turns it off (SS_FAST=2, a test hook, skips its sample
     // check). Without it the general pipeline runs alone.
-    let mut fast_on = envn("SS_FAST") != Some(0);
-    let (sh, mut workers, pb, db) = loop {
+    // (The event stage keeps a campaign number in 23 bits.)
+    let mut fast_on = envn("SS_FAST") != Some(0) && ncamp < 1 << 23;
+    let (sh, workers, pb, db, mut cs) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
         let fx = if fast_on {
             let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
@@ -1356,18 +1373,35 @@ fn main() {
                         continue;
                     }
                 }
-                break x;
+                let (sh, mut workers, pb, db) = x;
+                let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
+                // ---- Fast path: the event stage (stage.rs) turns the events filed by
+                // number into rows, run by run; what does not fit is filed for phases B
+                // and C below. If the events turn out not to be numbered user by user,
+                // or the ID table fills up, everything starts over.
+                if sh.fx.is_some() {
+                    let ok = stage::run(&sh, &mut workers, &mut cs, &ctx, &log);
+                    let full = sh.links.full.load(Relaxed);
+                    if !ok || full {
+                        log(if full { "stage: ID table full, starting over" } else { "stage: events are not numbered user by user, starting over without the fast path" });
+                        sh.ev.release_part(0, 1);
+                        sh.dk.release_part(0, 1);
+                        sh.ck.release_part(0, 1);
+                        sh.links.release_part(0, 1);
+                        sh.fx.as_ref().unwrap().release_part(0, 1);
+                        if full {
+                            scale *= 4;
+                        } else {
+                            fast_on = false;
+                        }
+                        continue;
+                    }
+                }
+                break (sh, workers, pb, db, cs);
             }
             None => scale *= 4,
         }
     };
-
-    let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
-    // ---- Fast path: the events filed by number are deduplicated, ordered and, run by
-    // run, turned into rows here; what does not fit is filed for phases B and C below.
-    if sh.fx.is_some() {
-        fast::passes(&sh, &mut workers, &mut cs, &ctx, &log);
-    }
 
     // ---- Phase B: dedup on event id. Losing copies are marked dead in their person's records.
     {
@@ -1476,22 +1510,7 @@ fn main() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
                     let tt = Instant::now();
-                    let r = &st.rows;
-                    let cols = [
-                        pq::Raw::Str(&r.names),
-                        pq::Raw::Date(bytes_of(&r.days)),
-                        pq::Raw::I32(bytes_of(&r.sessions)),
-                        pq::Raw::I32(bytes_of(&r.events)),
-                        pq::Raw::I64(bytes_of(&r.revenue)),
-                        pq::Raw::OptStr(&r.top_bits, &r.tops),
-                    ];
-                    pq::write_raw(
-                        &ud.join(format!("part-{ti:05}.parquet")),
-                        &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
-                        &cols,
-                        r.n,
-                    )
-                    .expect("write user_daily");
+                                        pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
                     // Once every thread is done with the records, give their memory back
                     // here, in parallel, rather than leave it to process exit.
                     let tw = tt.elapsed();
@@ -1672,11 +1691,24 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     st.rtmp = rtmp;
 }
 
+/// Starts a person's user_id dictionary entry; `flush` then appends that person's
+/// rows, which must follow consecutively.
+#[inline]
+pub fn begin_person(st: &mut CS, name: Id) {
+    let r = &mut st.rows;
+    let nb = name.bytes();
+    r.dict.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    r.dict.extend_from_slice(nb);
+    r.ndict += 1;
+    r.runs.push(0);
+}
+
 /// One person's sorted events and clicks: sessions, credit, assists, daily rows
 /// (rules.md "Events" steps 5 to 7 and "Clicks" steps 4 to 7).
 #[inline]
 fn person(st: &mut CS, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx) {
     let ndays = ctx.ndays;
+    begin_person(st, name);
     st.starts.clear();
     st.days.clear();
     let mut k = 0;
@@ -1804,9 +1836,8 @@ fn flush(st: &mut CS, name: Id, day: i64, us: u32, ue: u32, ur: u64, ctx: &Ctx) 
     }
     st.catrev.clear();
     let r = &mut st.rows;
-    let nb = name.bytes();
-    r.names.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-    r.names.extend_from_slice(nb);
+    let _ = name;
+    *r.runs.last_mut().unwrap() += 1;
     r.days.push(day as i32);
     r.sessions.push(us as i32);
     r.events.push(ue as i32);
@@ -1816,9 +1847,7 @@ fn flush(st: &mut CS, name: Id, day: i64, us: u32, ue: u32, ur: u64, ctx: &Ctx) 
     }
     if top != u32::MAX {
         *r.top_bits.last_mut().unwrap() |= 1 << (r.n % 8);
-        let c = &ctx.cats[top as usize];
-        r.tops.extend_from_slice(&(c.len() as u32).to_le_bytes());
-        r.tops.extend_from_slice(c);
+        r.tops.push(top as u16);
     }
     r.n += 1;
 }

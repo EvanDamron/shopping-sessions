@@ -14,14 +14,19 @@
 //! validated by the same code as the general pipeline. The numbers are only a perfect
 //! hash: an ID that is not of that exact form, or whose number is out of range, takes
 //! the general path line by line. Persons still come from the link files, and a run is
-//! handled here only when the checks in `pass2` prove it holds every event of exactly
-//! one person; whatever fails a check goes to the general pipeline's buckets, which
-//! run afterwards as usual. If the keys cannot be found, the general pipeline runs alone.
+//! handled by the event stage (stage.rs) only when its checks prove it holds every
+//! event of exactly one person; whatever fails a check goes to the general pipeline's
+//! buckets, which run afterwards as usual. If the keys cannot be found, the general
+//! pipeline runs alone.
+//!
+//! This file: the ID arithmetic, finding the keys, the records phase A files, and the
+//! table of user numbers built from the link files. What happens to the records after
+//! phase A is in stage.rs.
 
 use crate::id::Id;
 use crate::links::Links;
 use crate::mem;
-use crate::{person, sort_events, CRec, Clk, Ctx, PRec, Shared, Worker, CCH, CS};
+use crate::{CRec, Worker, CCH};
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
@@ -173,12 +178,14 @@ pub const XREC: usize = std::mem::size_of::<XRec>();
 #[derive(Clone, Copy)]
 pub struct WcX(pub [u64; 24]);
 
-const COMPLEX: u64 = 1 << 63;
-const EMPTYK: u64 = u64::MAX; // run key of "no record"
+pub const COMPLEX: u64 = 1 << 63;
+/// In `Fx::gt`: the user number has valid events with an odd event ID (set by the
+/// event stage before it starts).
+pub const EXTRA: u64 = 1 << 62;
 
 pub struct Fx {
     ek: u64,
-    uk: u64,
+    pub uk: u64,
     /// Event numbers below this are bucketed; a bucket spans `1 << xsh` numbers.
     limit: u64,
     pub xsh: u32,
@@ -187,18 +194,14 @@ pub struct Fx {
     gmax: u64,
     /// Click buckets are ranges of `gper` user numbers.
     pub cshift: u32,
-    gper: usize,
+    pub gper: usize,
     pub nxc: usize,
     /// Per user number: the person owning it (slot + 1, low 32 bits), which aliases
     /// below 16 that person holds (bits 32..48), and COMPLEX when the user number
     /// cannot be handled here (see `build_gt`).
-    gt: Vec<AtomicU64>,
-    seen: Vec<AtomicU64>,
-    conflict: Vec<AtomicU64>,
-    /// User numbers whose odd-ID events (`OddEv`) have been taken by a run or filed.
-    taken: Vec<AtomicU64>,
-    /// User numbers whose clicks have been filed with the general pipeline.
-    cfiled: Vec<AtomicU64>,
+    pub gt: Vec<AtomicU64>,
+    /// Whether the records' memory asks for huge pages.
+    pub huge: bool,
     pub xe: mem::Arena,
     pub xc: mem::Arena,
 }
@@ -264,33 +267,6 @@ impl Fx {
         at -= 1;
         buf[at] = b'u';
         Id::intern(&buf[at..])
-    }
-
-    #[inline(always)]
-    fn bit(v: &[AtomicU64], g: u64) -> bool {
-        unsafe { v.get_unchecked((g >> 6) as usize).load(Relaxed) & (1 << (g & 63)) != 0 }
-    }
-
-    /// Notes one more run of user number `g`; a second run marks it as in conflict.
-    #[inline(always)]
-    fn mark_run(&self, g: u64) {
-        let (w, b) = ((g >> 6) as usize, 1u64 << (g & 63));
-        if self.seen[w].fetch_or(b, Relaxed) & b != 0 {
-            self.conflict[w].fetch_or(b, Relaxed);
-        }
-    }
-
-    /// Claims the odd-ID events of user number `g`; true for the first caller only.
-    #[inline(always)]
-    fn take(&self, g: u64) -> bool {
-        let (w, b) = ((g >> 6) as usize, 1u64 << (g & 63));
-        self.taken[w].fetch_or(b, Relaxed) & b == 0
-    }
-
-    /// Whether events and clicks of user number `g` must take the general path.
-    #[inline(always)]
-    fn general(&self, g: u64) -> bool {
-        (unsafe { self.gt.get_unchecked(g as usize).load(Relaxed) } & COMPLEX != 0) || Self::bit(&self.conflict, g)
     }
 
     /// (event key, user key, event numbers below this are filed here, user numbers below this are known)
@@ -430,11 +406,13 @@ pub fn setup(
     if check && down * 200 > rows.len() {
         return None;
     }
+    if gmax >= 1 << 27 {
+        return None; // the event stage keeps a user number in 27 bits
+    }
     let nb = (emax >> xsh) as usize + 1;
     let gbits = (gmax as usize).div_ceil(512).next_power_of_two().trailing_zeros();
     let gper = 1usize << gbits;
     let nxc = (gmax as usize).div_ceil(gper);
-    let words = (gmax as usize).div_ceil(64);
     Some(Fx {
         ek,
         uk,
@@ -446,10 +424,7 @@ pub fn setup(
         gper,
         nxc,
         gt: (0..gmax).map(|_| AtomicU64::new(0)).collect(),
-        seen: (0..words).map(|_| AtomicU64::new(0)).collect(),
-        conflict: (0..words).map(|_| AtomicU64::new(0)).collect(),
-        taken: (0..words).map(|_| AtomicU64::new(0)).collect(),
-        cfiled: (0..words).map(|_| AtomicU64::new(0)).collect(),
+        huge,
         xe: mem::Arena::new((ebytes as usize / 34 + (nthreads * nb + 1) * XCH) * XREC, huge, ahead),
         xc: mem::Arena::new(cbytes as usize + nthreads * nxc * CCH * std::mem::size_of::<CRec>(), huge, ahead),
     })
@@ -470,487 +445,57 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                 if lo >= slots {
                     break;
                 }
-                for i in lo..(lo + STEP).min(slots) {
-                    // (Runs beside phase A, which adds IDs no link mentions: an entry
-                    // still being written is such an ID, and it changes nothing here.)
-                    let Some((id, p)) = links.linked_at(i) else { continue };
-                    let un = fx.user_num_of(id);
-                    let pn = if p as usize == i { un } else { fx.user_num_of(links.name(p)) };
-                    if un != NONE && pn != NONE && un >> 9 == pn >> 9 && un & 511 < 16 {
-                        let cell = &fx.gt[(un >> 9) as usize];
-                        let mine = (p + 1) as u64;
-                        let mut cur = cell.load(Relaxed);
-                        loop {
-                            let new = if cur as u32 == 0 || cur & 0xFFFF_FFFF == mine {
-                                cur | mine | (1 << (32 + (un & 511)))
-                            } else {
-                                cur | COMPLEX // two persons under one user number
-                            };
-                            match cell.compare_exchange_weak(cur, new, Relaxed, Relaxed) {
-                                Ok(_) => break,
-                                Err(c) => cur = c,
-                            }
+                // In blocks: read the slots and start loading each person's name and gt
+                // cell, then use them once they have had time to arrive.
+                const B: usize = 32;
+                let hi = (lo + STEP).min(slots);
+                let mut blk = [(0u32, 0u32, 0u64); B];
+                for blo in (lo..hi).step_by(B) {
+                    let mut k = 0;
+                    for i in blo..(blo + B).min(hi) {
+                        // (Runs beside phase A, which adds IDs no link mentions: an entry
+                        // still being written is such an ID, and it changes nothing here.)
+                        let Some((id, p)) = links.linked_at(i) else { continue };
+                        let un = fx.user_num_of(id);
+                        if p as usize != i {
+                            links.prefetch_name(p);
                         }
-                    } else {
                         if un != NONE {
-                            fx.gt[(un >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            unsafe { crate::stage::prefetch_write(&fx.gt[(un >> 9) as usize]) };
                         }
-                        if pn != NONE {
-                            fx.gt[(pn >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                        blk[k] = (i as u32, p, un);
+                        k += 1;
+                    }
+                    for &(i, p, un) in &blk[..k] {
+                        let pn = if p == i { un } else { fx.user_num_of(links.name(p)) };
+                        if un != NONE && pn != NONE && un >> 9 == pn >> 9 && un & 511 < 16 {
+                            let cell = &fx.gt[(un >> 9) as usize];
+                            let mine = (p + 1) as u64;
+                            let mut cur = cell.load(Relaxed);
+                            loop {
+                                let new = if cur as u32 == 0 || cur & 0xFFFF_FFFF == mine {
+                                    cur | mine | (1 << (32 + (un & 511)))
+                                } else {
+                                    cur | COMPLEX // two persons under one user number
+                                };
+                                match cell.compare_exchange_weak(cur, new, Relaxed, Relaxed) {
+                                    Ok(_) => break,
+                                    Err(c) => cur = c,
+                                }
+                            }
+                        } else {
+                            if un != NONE {
+                                fx.gt[(un >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            }
+                            if pn != NONE {
+                                fx.gt[(pn >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            }
                         }
                     }
                 }
             });
         }
     });
-}
-
-/// A slice shared by threads that write disjoint parts of it.
-struct Parts<T>(*mut T);
-unsafe impl<T> Sync for Parts<T> {}
-unsafe impl<T> Send for Parts<T> {}
-
-/// Each bucket's chunks in a fixed order: (base, records).
-struct Lists {
-    ev: Vec<Vec<(usize, u32)>>,
-    cl: Vec<Vec<(usize, u32)>>,
-}
-
-#[inline(always)]
-unsafe fn xrec(l: &[(usize, u32)], j: usize) -> *mut XRec {
-    (l.get_unchecked(j / XCH).0 as *mut XRec).add(j % XCH)
-}
-
-#[inline(always)]
-unsafe fn crec(l: &[(usize, u32)], j: usize) -> *mut CRec {
-    (l.get_unchecked(j / CCH).0 as *mut CRec).add(j % CCH)
-}
-
-#[derive(Default)]
-struct Scratch {
-    ev: Vec<u64>,
-    un: Vec<u64>,
-    cl: Vec<Clk>,
-    rtmp: Vec<u64>,
-    tmp: Vec<XRec>,
-    occ: Vec<u64>,
-    ctmp: Vec<CRec>,
-    cnt: Vec<u32>,
-}
-
-/// After phase A: dedup and order the index buckets, find the runs, sort the click
-/// buckets by user number, then handle every run that passes the checks; the rest is
-/// filed in the general pipeline's buckets (through each thread's `Worker`).
-pub fn passes(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &dyn Fn(&str)) {
-    let fx = sh.fx.as_ref().unwrap();
-    let (nb, nxc, gper) = (fx.nb, fx.nxc, fx.gper);
-    let li = Lists {
-        ev: (0..nb)
-            .map(|b| {
-                let mut v = Vec::new();
-                for w in workers.iter() {
-                    let total = w.xcnt[b] as usize;
-                    v.extend(w.xchunks[b].iter().enumerate().map(|(i, &c)| (c, (total - i * XCH).min(XCH) as u32)));
-                }
-                v
-            })
-            .collect(),
-        cl: (0..nxc)
-            .map(|c| {
-                let mut v = Vec::new();
-                for w in workers.iter() {
-                    let total = w.xccnt[c] as usize;
-                    v.extend(w.xcchunks[c].iter().enumerate().map(|(i, &p)| (p, (total - i * CCH).min(CCH) as u32)));
-                }
-                v
-            })
-            .collect(),
-    };
-    // Events whose ID has no number (a handful): dedup them here by the ID itself.
-    // A survivor with an odd user ID is filed with the general pipeline; the others
-    // wait, sorted by user number, for that user number's run to take them along.
-    let mut odd: Vec<OddEv> = Vec::new();
-    for w in workers.iter_mut() {
-        odd.append(&mut w.odd);
-    }
-    odd.sort_unstable_by_key(|o| (o.key.lo, o.key.hi, o.ing));
-    let mut extras: Vec<(u64, u64)> = Vec::new(); // (user number * 512 + alias, t << 32 | pc)
-    for (i, o) in odd.iter().enumerate() {
-        if (i > 0 && odd[i - 1].key == o.key) || o.a & INVALID != 0 {
-            continue; // a later copy, or the kept copy is invalid
-        }
-        if o.a & ODDU != 0 {
-            let who = o.a as u32;
-            unsafe { workers[0].push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: o.t, pc: o.pc }) };
-        } else {
-            extras.push((o.a, ((o.t as u64) << 32) | o.pc as u64));
-        }
-    }
-    extras.sort_unstable();
-    let extras = &extras[..];
-    let mut nlive = vec![0u32; nb];
-    let mut first = vec![EMPTYK; nb];
-    let mut last = vec![EMPTYK; nb];
-    let mut coff = vec![0u32; nxc * (gper + 1)];
-    let nthreads = workers.len();
-    let mut scratch: Vec<Scratch> = (0..nthreads).map(|_| Scratch::default()).collect();
-
-    // Pass 1: place each bucket's records by event number. Of two records on one
-    // place (copies of one event) the smaller ingest_ts stays. The survivors that are
-    // valid are written back in order, and every run of one user number is noted.
-    // The same threads sort the click buckets by user number, in place, and note each
-    // user number's range.
-    {
-        let next = AtomicUsize::new(0);
-        let (pn, pf, pl) = (Parts(nlive.as_mut_ptr()), Parts(first.as_mut_ptr()), Parts(last.as_mut_ptr()));
-        let pc = Parts(coff.as_mut_ptr());
-        let (next, li, pn, pf, pl, pc) = (&next, &li, &pn, &pf, &pl, &pc);
-        std::thread::scope(|sc| {
-            for s in scratch.iter_mut() {
-                sc.spawn(move || unsafe {
-                    let cap = 1usize << fx.xsh;
-                    s.tmp.resize(cap, XRec { a: 0, t: 0, pc: 0, ing: 0, lo: 0 });
-                    s.occ.resize(cap / 64 + 1, 0);
-                    loop {
-                        let b = next.fetch_add(1, Relaxed);
-                        if b >= nb + nxc {
-                            break;
-                        }
-                        if b >= nb {
-                            let c = b - nb;
-                            let l = &li.cl[c];
-                            if l.is_empty() {
-                                continue;
-                            }
-                            let off = std::slice::from_raw_parts_mut(pc.0.add(c * (gper + 1)), gper + 1);
-                            let g0 = (c * gper) as u32;
-                            s.ctmp.clear();
-                            s.cnt.clear();
-                            s.cnt.resize(gper + 1, 0);
-                            for &(p, n) in l {
-                                let rs = std::slice::from_raw_parts(p as *const CRec, n as usize);
-                                for r in rs {
-                                    s.cnt[(r.who - g0) as usize] += 1;
-                                }
-                                s.ctmp.extend_from_slice(rs);
-                            }
-                            let mut sum = 0u32;
-                            for k in 0..gper {
-                                off[k] = sum;
-                                sum += s.cnt[k];
-                                s.cnt[k] = off[k];
-                            }
-                            off[gper] = sum;
-                            for r in &s.ctmp {
-                                let k = (r.who - g0) as usize;
-                                *crec(l, s.cnt[k] as usize) = *r;
-                                s.cnt[k] += 1;
-                            }
-                            continue;
-                        }
-                        let l = &li.ev[b];
-                        if l.is_empty() {
-                            continue;
-                        }
-                        let (tmp, occ) = (s.tmp.as_mut_ptr(), s.occ.as_mut_ptr());
-                        for &(c, n) in l {
-                            let rs = std::slice::from_raw_parts(c as *const XRec, n as usize);
-                            for (i, r) in rs.iter().enumerate() {
-                                // (The place of a record a few ahead is fetched early.)
-                                prefetch_write(tmp.add(rs.get_unchecked((i + 12).min(rs.len() - 1)).lo as usize));
-                                let at = r.lo as usize;
-                                let (word, bit) = (at >> 6, 1u64 << (at & 63));
-                                if *occ.add(word) & bit == 0 {
-                                    *occ.add(word) |= bit;
-                                    *tmp.add(at) = *r;
-                                } else if r.ing < (*tmp.add(at)).ing {
-                                    *tmp.add(at) = *r;
-                                }
-                            }
-                        }
-                        let (mut j, mut prev, mut f) = (0usize, EMPTYK, EMPTYK);
-                        for word in 0..cap / 64 {
-                            let mut m = *occ.add(word);
-                            *occ.add(word) = 0;
-                            while m != 0 {
-                                let r = *tmp.add(word * 64 + m.trailing_zeros() as usize);
-                                m &= m - 1;
-                                if r.a & INVALID != 0 {
-                                    continue; // the kept copy is invalid: the event is dropped
-                                }
-                                *xrec(l, j) = r;
-                                j += 1;
-                                if r.a & ODDU != 0 {
-                                    continue; // another person's event: runs pass over it
-                                }
-                                let k = r.a >> 9;
-                                if f == EMPTYK {
-                                    f = k; // the bucket's first run may continue the previous bucket's last
-                                } else if k != prev {
-                                    fx.mark_run(k);
-                                }
-                                prev = k;
-                            }
-                        }
-                        *pn.0.add(b) = j as u32;
-                        *pf.0.add(b) = f;
-                        *pl.0.add(b) = prev;
-                    }
-                });
-            }
-        });
-    }
-    // The run key just before each bucket; a bucket's first run is new unless it continues that.
-    let mut before = vec![EMPTYK; nb];
-    let mut prev = EMPTYK;
-    for b in 0..nb {
-        before[b] = prev;
-        if first[b] != EMPTYK {
-            if first[b] != prev {
-                fx.mark_run(first[b]);
-            }
-            prev = last[b];
-        }
-    }
-    log("fast: events placed by number");
-
-    // Pass 2: the runs. Afterwards, the clicks of user numbers that take the general
-    // path and had no run at all (a run files its own user number's clicks along
-    // with it) are filed there too.
-    const GSTEP: usize = 1 << 15;
-    let gtasks = (fx.gmax as usize).div_ceil(GSTEP);
-    {
-        let next = AtomicUsize::new(0);
-        let (next, li, nlive, before, coff) = (&next, &li, &nlive[..], &before[..], &coff[..]);
-        let xg: Vec<u64> = {
-            let mut v: Vec<u64> = extras.iter().map(|e| e.0 >> 9).collect();
-            v.dedup();
-            v
-        };
-        let xg = &xg[..];
-        std::thread::scope(|sc| {
-            for ((s, w), st) in scratch.iter_mut().zip(workers.iter_mut()).zip(cs.iter_mut()) {
-                sc.spawn(move || unsafe {
-                    let t0 = std::time::Instant::now();
-                    loop {
-                        let b = next.fetch_add(1, Relaxed);
-                        if b >= nb + gtasks {
-                            break;
-                        }
-                        if b >= nb {
-                            let (g0, g1) = (((b - nb) * GSTEP) as u64, (((b - nb + 1) * GSTEP) as u64).min(fx.gmax));
-                            for g in g0..g1 {
-                                if fx.general(g) && !Fx::bit(&fx.seen, g) {
-                                    pool_clicks(sh, fx, li, coff, w, g);
-                                }
-                            }
-                            // Odd-ID events of user numbers that had no run at all.
-                            for &g in &xg[xg.partition_point(|&x| x < g0)..xg.partition_point(|&x| x < g1)] {
-                                if !Fx::bit(&fx.seen, g) && fx.take(g) {
-                                    pool_extras(sh, fx, extras, w, g);
-                                    if !fx.general(g) {
-                                        pool_clicks(sh, fx, li, coff, w, g);
-                                    }
-                                }
-                            }
-                        } else if nlive[b] > 0 {
-                            pass2(b, sh, fx, li, nlive, before, coff, extras, st, w, ctx, s);
-                        }
-                    }
-                    w.finish(sh);
-                    if std::env::var_os("SS_TIME").is_some() {
-                        eprintln!("  pass 2 thread busy {:?}", t0.elapsed());
-                    }
-                });
-            }
-        });
-    }
-    log("fast: runs done");
-}
-
-/// The odd-ID events of user number `g`.
-fn extras_of(extras: &[(u64, u64)], g: u64) -> &[(u64, u64)] {
-    &extras[extras.partition_point(|e| e.0 >> 9 < g)..extras.partition_point(|e| e.0 >> 9 <= g)]
-}
-
-/// Files the events `(user, t << 32 | pc)` with the general pipeline.
-unsafe fn pool_events(sh: &Shared, fx: &Fx, w: &mut Worker, evs: impl Iterator<Item = (u64, u64)>) {
-    let (mut pu, mut pw) = (NONE, 0u32);
-    for (un, e) in evs {
-        if un != pu {
-            let id = fx.user_id(un);
-            pw = sh.links.person(id, id.hash(), &mut w.added);
-            pu = un;
-        }
-        w.push_event(sh, (pw >> sh.pshift) as usize, PRec { who: pw, t: (e >> 32) as u32, pc: e as u32 });
-    }
-}
-
-unsafe fn pool_extras(sh: &Shared, fx: &Fx, extras: &[(u64, u64)], w: &mut Worker, g: u64) {
-    pool_events(sh, fx, w, extras_of(extras, g).iter().copied());
-}
-
-/// Files every click of user number `g` with the general pipeline, the first time it is asked.
-unsafe fn pool_clicks(sh: &Shared, fx: &Fx, li: &Lists, coff: &[u32], w: &mut Worker, g: u64) {
-    let (word, bit) = ((g >> 6) as usize, 1u64 << (g & 63));
-    if fx.cfiled[word].fetch_or(bit, Relaxed) & bit != 0 {
-        return;
-    }
-    let c = (g >> fx.cshift) as usize;
-    let k = c * (fx.gper + 1) + (g as usize & (fx.gper - 1));
-    for j in coff[k] as usize..coff[k + 1] as usize {
-        pool_click(sh, fx, w, &*crec(&li.cl[c], j));
-    }
-}
-
-#[inline(always)]
-unsafe fn prefetch_write<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_ET0);
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
-}
-
-/// Files a click of user number `r.who`, alias `r._pad`, with the general pipeline.
-unsafe fn pool_click(sh: &Shared, fx: &Fx, w: &mut Worker, r: &CRec) {
-    let id = fx.user_id(((r.who as u64) << 9) | r._pad as u64);
-    let who = sh.links.person(id, id.hash(), &mut w.added);
-    w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
-}
-
-/// The runs that start in bucket `b`. A run is a maximal stretch of valid events, in
-/// event-number order, with one user number; it may continue through later buckets.
-/// Events with an odd user ID are another person's: each is filed with the general
-/// pipeline by the bucket it lies in, and runs pass over them.
-#[allow(clippy::too_many_arguments)]
-unsafe fn pass2(
-    b: usize,
-    sh: &Shared,
-    fx: &Fx,
-    li: &Lists,
-    nlive: &[u32],
-    before: &[u64],
-    coff: &[u32],
-    extras: &[(u64, u64)],
-    st: &mut CS,
-    w: &mut Worker,
-    ctx: &Ctx,
-    s: &mut Scratch,
-) {
-    let n = nlive[b] as usize;
-    let l = &li.ev[b];
-    let odd_user = |w: &mut Worker, r: &XRec| {
-        // Its person number was looked up in phase A.
-        let who = r.a as u32;
-        w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: r.t, pc: r.pc });
-    };
-    let mut i = 0;
-    // The start of the bucket may belong to a run that started earlier.
-    while i < n {
-        let r = &*xrec(l, i);
-        if r.a & ODDU != 0 {
-            odd_user(w, r);
-        } else if r.a >> 9 != before[b] {
-            break;
-        }
-        i += 1;
-    }
-    while i < n {
-        let r = *xrec(l, i);
-        if r.a & ODDU != 0 {
-            odd_user(w, &r);
-            i += 1;
-            continue;
-        }
-        let g = r.a >> 9;
-        s.ev.clear();
-        s.un.clear();
-        let (mut cb, mut ci, mut cn, mut cl) = (b, i, n, l);
-        let (mut sorted, mut lastt, mut aliases, mut same) = (true, 0u32, 0u64, true);
-        loop {
-            if ci >= cn {
-                cb += 1;
-                while cb < nlive.len() && nlive[cb] == 0 {
-                    cb += 1;
-                }
-                if cb >= nlive.len() {
-                    break;
-                }
-                ci = 0;
-                cn = nlive[cb] as usize;
-                cl = &li.ev[cb];
-            }
-            let r = *xrec(cl, ci);
-            if r.a & ODDU != 0 {
-                if cb == b {
-                    odd_user(w, &r);
-                }
-                ci += 1;
-                continue;
-            }
-            if r.a >> 9 != g {
-                break;
-            }
-            sorted &= r.t >= lastt;
-            lastt = r.t;
-            // Bit 16 stands for every alias from 16 up.
-            aliases |= 1 << (r.a & 511).min(16);
-            same &= r.a == *s.un.first().unwrap_or(&r.a);
-            s.ev.push(((r.t as u64) << 32) | r.pc as u64);
-            s.un.push(r.a);
-            ci += 1;
-        }
-        i = if cb == b { ci } else { n };
-        // Odd-ID events of this user number count as part of the run.
-        let more = if extras.is_empty() { extras } else { extras_of(extras, g) };
-        for &(un, _) in more {
-            aliases |= 1 << (un & 511).min(16);
-            same &= un == s.un[0];
-        }
-
-        let gt = fx.gt.get_unchecked(g as usize).load(Relaxed);
-        let mask = (gt >> 32) & 0xFFFF;
-        let general = gt & COMPLEX != 0 || Fx::bit(&fx.conflict, g);
-        // The run is one whole person when: no other run has this user number (not in
-        // conflict); and either every ID in the run is linked into the one person
-        // that owns this user number, all of whose IDs map to it, or no ID with this
-        // user number is linked at all and the run uses a single ID, a person on its own.
-        let whole = !general && if mask != 0 { aliases & !mask == 0 } else { same };
-        if !whole {
-            pool_events(sh, fx, w, s.un.iter().copied().zip(s.ev.iter().copied()));
-            if !more.is_empty() && fx.take(g) {
-                pool_events(sh, fx, w, more.iter().copied());
-            }
-            // Its clicks go along.
-            pool_clicks(sh, fx, li, coff, w, g);
-            continue;
-        }
-        if !more.is_empty() {
-            fx.take(g);
-            s.ev.extend(more.iter().map(|e| e.1));
-            sorted = false;
-        }
-        if !sorted {
-            sort_events(&mut s.ev, &mut s.rtmp);
-        }
-        // The person's clicks: those of the same user number whose ID is the person's.
-        let c = (g >> fx.cshift) as usize;
-        let k = c * (fx.gper + 1) + (g as usize & (fx.gper - 1));
-        let cll = &li.cl[c];
-        s.cl.clear();
-        for j in coff[k] as usize..coff[k + 1] as usize {
-            let r = &*crec(cll, j);
-            let mine = if mask != 0 { r._pad < 16 && mask & (1 << r._pad) != 0 } else { r._pad as u64 == s.un[0] & 511 };
-            if mine {
-                s.cl.push(Clk { ts: r.ts, camp: r.camp, cid: r.cid });
-            }
-        }
-        if s.cl.len() > 1 {
-            s.cl.sort_unstable_by_key(|x| x.ts);
-        }
-        let name = if mask != 0 { sh.links.name((gt as u32) - 1) } else { fx.user_id(s.un[0]) };
-        person(st, name, &s.ev, &s.cl, ctx);
-    }
 }
 
 /// Counters for the log and for deciding whether the fast path fits the data.
