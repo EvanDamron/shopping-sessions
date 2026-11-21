@@ -69,7 +69,7 @@ impl<T: Copy> Drop for Parts<T> {
 }
 
 /// Anonymous, 2 MB-aligned, lazily backed memory with huge pages requested.
-fn alloc(bytes: usize) -> *mut u8 {
+pub fn alloc(bytes: usize) -> *mut u8 {
     unsafe {
         let len = bytes + HUGE;
         let p = libc::mmap(

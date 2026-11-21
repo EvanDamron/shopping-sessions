@@ -319,24 +319,6 @@ fn populate(d: &[u8]) {
     let _ = d;
 }
 
-/// A vector with room for `cap` items whose pages the kernel may back with huge pages.
-fn big_vec<T>(cap: usize) -> Vec<T> {
-    let v: Vec<T> = Vec::with_capacity(cap);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let bytes = cap * std::mem::size_of::<T>();
-        if bytes >= (2 << 20) && std::env::var_os("NO_HUGE").is_none() {
-            let page = 4096usize;
-            let start = (v.as_ptr() as usize + page - 1) & !(page - 1);
-            let end = (v.as_ptr() as usize + bytes) & !(page - 1);
-            if end > start {
-                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
-            }
-        }
-    }
-    v
-}
-
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
@@ -462,10 +444,15 @@ struct LEntry {
     h2: u32,
 }
 
+/// Linked IDs: one huge-page region holding every shard's open-addressing table
+/// (an entry with name == 0 is empty).
 struct Links {
-    tables: Vec<(Vec<LEntry>, u64)>, // per shard: slots (h == 0 && name == 0 means empty), mask
+    region: *const LEntry,
+    shards: Vec<(usize, u64)>, // per shard: (first slot, mask)
     count: usize,
 }
+unsafe impl Send for Links {}
+unsafe impl Sync for Links {}
 
 #[derive(Clone, Copy)]
 struct Person {
@@ -476,26 +463,22 @@ struct Person {
 impl Links {
     #[inline]
     fn prefetch(&self, h: u64) {
-        let (slots, mask) = &self.tables[(h >> 58) as usize];
-        if !slots.is_empty() {
-            prefetch(unsafe { slots.as_ptr().add((h & mask) as usize) } as *const u8);
-        }
+        let (off, mask) = self.shards[(h >> 58) as usize];
+        prefetch(unsafe { self.region.add(off + (h & mask) as usize) } as *const u8);
     }
     #[inline]
     fn person_h(&self, s: &'static [u8], h: u64, h2: u32) -> Person {
-        let (slots, mask) = &self.tables[(h >> 58) as usize];
-        if !slots.is_empty() {
-            let mut i = (h & mask) as usize;
-            loop {
-                let e = &slots[i];
-                if e.name == 0 {
-                    break;
-                }
-                if e.h == h && e.h2 == h2 {
-                    return Person { ph: e.ph, name: e.name };
-                }
-                i = (i + 1) & *mask as usize;
+        let (off, mask) = self.shards[(h >> 58) as usize];
+        let mut i = (h & mask) as usize;
+        loop {
+            let e = unsafe { &*self.region.add(off + i) };
+            if e.name == 0 {
+                break;
             }
+            if e.h == h && e.h2 == h2 {
+                return Person { ph: e.ph, name: e.name };
+            }
+            i = (i + 1) & mask as usize;
         }
         Person { ph: h, name: pack(s) }
     }
@@ -639,25 +622,26 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             }
         });
     }
-    // Per shard lookup tables holding each linked ID's person.
-    let mut tables: Vec<(Vec<LEntry>, u64)> = (0..LSHARDS).map(|_| (Vec::new(), 0)).collect();
+    // Per shard lookup tables holding each linked ID's person, all in one region.
+    let mut shard_tabs: Vec<(usize, u64)> = Vec::with_capacity(LSHARDS);
+    let mut nslots = 0usize;
+    for sh in &shards {
+        let cap = (sh.names.len() * 2).next_power_of_two().max(16);
+        shard_tabs.push((nslots, (cap - 1) as u64));
+        nslots += cap;
+    }
+    let region = parts::alloc(nslots * std::mem::size_of::<LEntry>()) as *mut LEntry; // zeroed: all empty
     {
-        let tp = SendPtr(tables.as_mut_ptr());
+        let rp = SendPtr(region);
         let shards_ref = &shards;
         let bases_ref = &bases;
         let names_ref = &names;
+        let tabs = &shard_tabs;
         let mut dummy: Vec<()> = (0..nthreads).map(|_| ()).collect();
         par(&mut dummy, LSHARDS, |_, sh| {
             let s = &shards_ref[sh];
-            let n = s.names.len();
-            if n == 0 {
-                return;
-            }
-            let cap = (n * 2).next_power_of_two().max(16);
-            let mask = (cap - 1) as u64;
-            let mut slots: Vec<LEntry> = big_vec(cap);
-            slots.resize(cap, LEntry::default());
-            for i in 0..n {
+            let (off, mask) = tabs[sh];
+            for i in 0..s.names.len() {
                 let id = bases_ref[sh] + i as u32;
                 let r = find(id);
                 let rname = names_ref[r as usize].b();
@@ -665,15 +649,16 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
                 let h = s.hashes[i];
                 let e = LEntry { h, h2: hh(me).1, ph: hh(rname).0, name: pack(rname) };
                 let mut k = (h & mask) as usize;
-                while slots[k].name != 0 {
-                    k = (k + 1) & mask as usize;
+                unsafe {
+                    while (*rp.get().add(off + k)).name != 0 {
+                        k = (k + 1) & mask as usize;
+                    }
+                    rp.get().add(off + k).write(e);
                 }
-                slots[k] = e;
             }
-            unsafe { *tp.get().add(sh) = (slots, mask) };
         });
     }
-    Links { tables, count: total as usize }
+    Links { region, shards: shard_tabs, count: total as usize }
 }
 
 // ---------------------------------------------------------------------------
