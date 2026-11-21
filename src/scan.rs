@@ -104,16 +104,13 @@ pub fn for_records<const N: usize>(data: &'static [u8], mut f: impl FnMut(&[&'st
             let qpos = qbase + (qm & (bit - 1)).count_ones() as u64;
             let qc = qpos - q_fs;
             if nf < N {
-                if qc == 0 {
-                    fields[nf] = unsafe { std::slice::from_raw_parts(base.add(fs), pos - fs) };
-                } else if qc == 2
-                    && pos - fs >= 2
-                    && unsafe { *base.add(fs) == b'"' && *base.add(pos - 1) == b'"' }
-                {
-                    fields[nf] = unsafe { std::slice::from_raw_parts(base.add(fs + 1), pos - fs - 2) };
-                } else {
-                    bad = true;
-                }
+                // Branch-free: a field is plain (no quotes) or wrapped in exactly one pair.
+                let len = pos - fs;
+                let (first, last) = unsafe { (*base.add(fs.min(n - 1)), *base.add(pos.max(1) - 1)) };
+                let quoted = (qc == 2) & (len >= 2) & (first == b'"') & (last == b'"');
+                bad |= (qc != 0) & !quoted;
+                let q = quoted as usize;
+                fields[nf] = unsafe { std::slice::from_raw_parts(base.add(fs + q), len - 2 * q) };
             }
             nf += 1;
             fs = pos + 1;
@@ -145,6 +142,98 @@ pub fn for_records<const N: usize>(data: &'static [u8], mut f: impl FnMut(&[&'st
         nf += 1;
         if !bad && nf == N {
             f(&fields);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The byte-loop splitter applied line by line: the plain reading of the dialect.
+    fn by_lines<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut s = 0;
+        while s < d.len() {
+            let e = d[s..].iter().position(|&c| c == b'\n').map_or(d.len(), |k| s + k);
+            let mut g: [&'static [u8]; N] = [&[]; N];
+            if crate::split::<N>(&d[s..e], &mut g) {
+                out.push(g.iter().map(|x| x.to_vec()).collect());
+            }
+            s = e + 1;
+        }
+        out
+    }
+
+    fn simd<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        super::for_records::<N>(d, |f: &[&'static [u8]; N]| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        out
+    }
+
+    #[test]
+    fn simd_scanner_matches_byte_loop() {
+        let mut x: u64 = 88172645463325252;
+        let mut rnd = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for round in 0..30000 {
+            let mut v = Vec::new();
+            if round % 2 == 0 {
+                // Random bytes heavy in separators and quotes.
+                let len = rnd(300) as usize;
+                for _ in 0..len {
+                    let r = rnd(100);
+                    v.push(match r {
+                        0..=59 => b'a' + (rnd(26) as u8),
+                        60..=74 => b',',
+                        75..=82 => b'"',
+                        83..=90 => b'\n',
+                        91 => b'\r',
+                        _ => b' ',
+                    });
+                }
+            } else {
+                // Structured lines: fields, some quoted, some broken.
+                let lines = rnd(12);
+                for _ in 0..lines {
+                    let pick = rnd(10);
+                    let nf = match pick {
+                        0 => rnd(9) as usize,
+                        1 => 0,
+                        _ => 7,
+                    };
+                    for k in 0..nf {
+                        if k > 0 {
+                            v.push(b',');
+                        }
+                        let cap = if rnd(20) == 0 { 90 } else { 14 };
+                        let flen = rnd(cap) as usize;
+                        let quote = rnd(5) == 0;
+                        if quote {
+                            v.push(b'"');
+                        }
+                        for _ in 0..flen {
+                            let c = b"abcxyz019 -:T\r"[rnd(14) as usize];
+                            v.push(c);
+                        }
+                        if rnd(200) == 0 {
+                            v.push(b'"');
+                        }
+                        if quote && rnd(30) != 0 {
+                            v.push(b'"');
+                        }
+                    }
+                    if rnd(25) != 0 {
+                        v.push(b'\n');
+                    }
+                }
+            }
+            let d: &'static [u8] = Box::leak(v.into_boxed_slice());
+            assert_eq!(simd::<2>(d), by_lines::<2>(d), "{:?}", String::from_utf8_lossy(d));
+            assert_eq!(simd::<4>(d), by_lines::<4>(d), "{:?}", String::from_utf8_lossy(d));
+            assert_eq!(simd::<7>(d), by_lines::<7>(d), "{:?}", String::from_utf8_lossy(d));
         }
     }
 }
