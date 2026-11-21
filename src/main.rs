@@ -1685,6 +1685,18 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
 #[inline]
 fn assist(st: &mut CS, camp: u32, lo: i64, hi: i64, ndays: usize) {
     let s = &st.starts;
+    let n = s.len();
+    if n == 0 || hi < s[0] || lo > s[n - 1] {
+        return;
+    }
+    if n <= 8 {
+        for i in 0..n {
+            if s[i] >= lo && s[i] <= hi {
+                st.camp[camp as usize * ndays + st.days[i] as usize][3] += 1;
+            }
+        }
+        return;
+    }
     let mut i0 = s.partition_point(|&x| x < lo);
     let i1 = s.partition_point(|&x| x <= hi);
     while i0 < i1 {
