@@ -1,10 +1,14 @@
-//! Linked IDs (rules.md "Linked IDs"): every ID that appears in a link line, mapped
-//! to its person's name, the byte-wise smallest ID of its connected component.
+//! Linked IDs (rules.md "Linked IDs") and person numbers.
 //!
-//! One pass over the link files, in parallel: each thread interns both IDs of a line
-//! in a shared open-addressing table and joins them in a lock-free union-find whose
-//! roots are always the smallest name of their set. A second pass writes each entry's
-//! person next to its ID, so a lookup from an event touches one cache line.
+//! One shared open-addressing table holds every user ID. A person is numbered by
+//! the table slot of their name: the byte-wise smallest ID of their connected
+//! component, or the ID itself if no link line mentions it.
+//!
+//! The link files are read in one parallel pass: each thread interns both IDs of a
+//! line and joins them in a lock-free union-find whose roots are always the
+//! smallest name of their set. A second pass writes each entry's person beside its
+//! ID, so a lookup from an event touches one cache line. IDs that no link mentions
+//! are added when an event or click first uses them.
 
 use crate::id::Id;
 use crate::mem;
@@ -16,8 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 struct Entry {
     lo: AtomicU64,
     hi: AtomicU64, // 0 = empty, BUSY = being written
-    plo: AtomicU64,
-    phi: AtomicU64,
+    person: AtomicU32,
+    _pad: [u32; 3],
 }
 
 /// No ID has this high word: its length byte would be 0xFE.
@@ -28,7 +32,12 @@ pub struct Links {
     bytes: usize,
     mask: usize,
     shift: u32,
-    pub count: usize,
+    /// IDs that appear in link lines.
+    pub linked: usize,
+    count: AtomicUsize,
+    limit: usize,
+    /// Set when the table is too full to go on; the run is then redone with a larger one.
+    pub full: AtomicBool,
 }
 unsafe impl Send for Links {}
 unsafe impl Sync for Links {}
@@ -48,6 +57,10 @@ fn prefetch<T>(p: *const T) {
 }
 
 impl Links {
+    pub fn slots(&self) -> usize {
+        self.mask + 1
+    }
+
     /// Returns part `k` of `n` of the table to the kernel (see `Arena::release_part`).
     pub fn release_part(&self, k: usize, n: usize) {
         let lo = (self.bytes / n * k) & !4095;
@@ -63,22 +76,57 @@ impl Links {
         prefetch(unsafe { self.tab.add((h >> self.shift) as usize) });
     }
 
-    /// The person an ID belongs to: its component's name, or the ID itself if no
-    /// link line mentions it.
+    /// The name of person `n`.
     #[inline(always)]
-    pub fn person(&self, id: Id, h: u64) -> Id {
+    pub fn name(&self, n: u32) -> Id {
+        let e = unsafe { &*self.tab.add(n as usize) };
+        Id { lo: e.lo.load(Relaxed), hi: e.hi.load(Relaxed) }
+    }
+
+    /// The person an ID belongs to. An ID no link line mentions is its own person
+    /// and is added to the table here, by whichever thread sees it first.
+    #[inline(always)]
+    pub fn person(&self, id: Id, h: u64, added: &mut u32) -> u32 {
         let mut i = (h >> self.shift) as usize;
         loop {
             let e = unsafe { &*self.tab.add(i) };
-            let hi = e.hi.load(Relaxed);
-            if hi == 0 {
-                return id;
-            }
-            if hi == id.hi && e.lo.load(Relaxed) == id.lo {
-                return Id { lo: e.plo.load(Relaxed), hi: e.phi.load(Relaxed) };
+            let mut hi = e.hi.load(Acquire);
+            loop {
+                if hi == id.hi {
+                    if e.lo.load(Relaxed) == id.lo {
+                        return e.person.load(Relaxed);
+                    }
+                    break;
+                }
+                if hi == 0 {
+                    match e.hi.compare_exchange(0, BUSY, AcqRel, Acquire) {
+                        Ok(_) => {
+                            e.lo.store(id.lo, Relaxed);
+                            e.person.store(i as u32, Relaxed);
+                            e.hi.store(id.hi, Release);
+                            *added += 1;
+                            return i as u32;
+                        }
+                        Err(cur) => hi = cur,
+                    }
+                } else if hi == BUSY {
+                    std::hint::spin_loop();
+                    hi = e.hi.load(Acquire);
+                } else {
+                    break;
+                }
             }
             i = (i + 1) & self.mask;
         }
+    }
+
+    /// Reports IDs a thread has added; flags the table as full past its limit.
+    #[inline]
+    pub fn added(&self, n: &mut u32) {
+        if self.count.fetch_add(*n as usize, Relaxed) + *n as usize > self.limit {
+            self.full.store(true, Relaxed);
+        }
+        *n = 0;
     }
 }
 
@@ -174,11 +222,22 @@ impl Build {
 
 const BATCH: usize = 16;
 
-/// `tasks` are (file, start, end) byte ranges of the link files.
-pub fn build(files: &[File], tasks: &[(usize, u64, u64)], bytes: usize, nthreads: usize, buf: usize, huge: bool) -> Links {
-    // About 15 bytes of link file per distinct ID in practice; sized for 8, and
-    // rebuilt larger in the (pathological) case that the table fills up.
-    let mut slots = (bytes / 8).max(1 << 16).next_power_of_two();
+/// `tasks` are (file, start, end) byte ranges of the link files. `users` estimates
+/// the IDs that events and clicks will add; `floor` is the smallest safe table.
+#[allow(clippy::too_many_arguments)]
+pub fn build(
+    files: &[&File],
+    tasks: &[(usize, u64, u64)],
+    bytes: usize,
+    users: usize,
+    floor: usize,
+    nthreads: usize,
+    buf: usize,
+    huge: bool,
+) -> Links {
+    // About 15 bytes of link file per distinct ID in practice. Sized to end up at
+    // most ~70% full, and rebuilt larger if the link files alone overfill it.
+    let mut slots = floor.max(bytes / 8).max((bytes / 15 + users) / 7 * 10).next_power_of_two();
     loop {
         if let Some(l) = try_build(files, tasks, slots, nthreads, buf, huge) {
             return l;
@@ -187,7 +246,7 @@ pub fn build(files: &[File], tasks: &[(usize, u64, u64)], bytes: usize, nthreads
     }
 }
 
-fn try_build(files: &[File], tasks: &[(usize, u64, u64)], slots: usize, nthreads: usize, buf: usize, huge: bool) -> Option<Links> {
+fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthreads: usize, buf: usize, huge: bool) -> Option<Links> {
     let tab = mem::map(slots * std::mem::size_of::<Entry>() + (2 << 20));
     let tab = ((tab as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
     if huge {
@@ -243,7 +302,7 @@ fn try_build(files: &[File], tasks: &[(usize, u64, u64)], slots: usize, nthreads
                         break;
                     }
                     let (fi, lo, hi) = tasks[t];
-                    rd.run(&files[fi], lo, hi, |rd| unsafe {
+                    rd.run(files[fi], lo, hi, |rd| unsafe {
                         let d = rd.data();
                         rd.lines::<2>(|ip, ls| {
                             if dead {
@@ -285,7 +344,7 @@ fn try_build(files: &[File], tasks: &[(usize, u64, u64)], slots: usize, nthreads
         std::mem::forget(b.parent);
         return None;
     }
-    // Write every entry's person beside it.
+    // Write every entry's person (the slot of its set's root) beside it.
     let next = AtomicUsize::new(0);
     const STEP: usize = 1 << 14;
     std::thread::scope(|sc| {
@@ -304,17 +363,13 @@ fn try_build(files: &[File], tasks: &[(usize, u64, u64)], slots: usize, nthreads
                     while i < hi && n < BATCH {
                         if b.entry(i).hi.load(Relaxed) != 0 {
                             let r = b.find(i as u32);
-                            prefetch(b.entry(r as usize) as *const Entry);
                             pend[n] = (i as u32, r);
                             n += 1;
                         }
                         i += 1;
                     }
                     for &(k, r) in &pend[..n] {
-                        let p = b.id(r);
-                        let e = b.entry(k as usize);
-                        e.plo.store(p.lo, Relaxed);
-                        e.phi.store(p.hi, Relaxed);
+                        b.entry(k as usize).person.store(r, Relaxed);
                     }
                 }
             });
@@ -324,7 +379,16 @@ fn try_build(files: &[File], tasks: &[(usize, u64, u64)], slots: usize, nthreads
     // The parent array is dead: give its pages back in bulk.
     mem::release(b.parent.as_ptr() as *mut u8, pbytes);
     std::mem::forget(b.parent);
-    Some(Links { tab, bytes: slots * std::mem::size_of::<Entry>(), mask: slots - 1, shift: 64 - slots.trailing_zeros(), count })
+    Some(Links {
+        tab,
+        bytes: slots * std::mem::size_of::<Entry>(),
+        mask: slots - 1,
+        shift: 64 - slots.trailing_zeros(),
+        linked: count,
+        count: AtomicUsize::new(count),
+        limit: slots / 20 * 17,
+        full: AtomicBool::new(false),
+    })
 }
 
 unsafe fn libc_unmap(p: *mut u8, bytes: usize) {
