@@ -517,7 +517,7 @@ impl Worker {
 
 /// Lines ahead of the current one whose user ID is hashed early, so its table line
 /// is in cache by the time the line is parsed.
-const AHEAD: usize = 6;
+const AHEAD: usize = 12;
 
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
