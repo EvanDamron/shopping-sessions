@@ -253,9 +253,8 @@ pub fn build(
 fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthreads: usize, buf: usize, huge_free: usize) -> Option<Links> {
     let t0 = std::time::Instant::now();
     // The table is read at random by every event and click: on huge pages those
-    // reads stop missing the TLB and it is built without a fault per 4 KB. Asked for
-    // only when the kernel has twice the table's size free in 2 MB blocks, since a
-    // huge fault that has to compact memory first costs more than it saves.
+    // reads stop missing the TLB and it is built without a fault per 4 KB. The
+    // caller passes how much memory may be assumed free in 2 MB blocks.
     let huge = huge_free >= 2 * slots * (std::mem::size_of::<Entry>() + 4) + (256 << 20);
     let tab = mem::map(slots * std::mem::size_of::<Entry>() + (2 << 20));
     let tab = ((tab as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;

@@ -765,14 +765,11 @@ fn make_links(
         Some(n) if scale == 1 => (0, n),
         _ => ((est / 40).max(1) * scale, floor * scale),
     };
-    // SS_HUGE: 0 = never ask for huge pages, 1 = always, 2 = always for the ID table only.
-    let tab_free = match envn("SS_HUGE") {
-        Some(0) => 0,
-        Some(_) => usize::MAX,
-        // If the free-block counts cannot be read, the table (a few hundred MB at
-        // most) still asks; the records, which are gigabytes, do not.
-        None => huge_free.unwrap_or(usize::MAX),
-    };
+    // The ID table always asks for huge pages (SS_HUGE=0 turns that off; 1 also forces
+    // them for the records). It is small, 128 MB at 20M events and 256 MB at 60M, and
+    // even with almost no free 2 MB blocks the kernel found them quickly in every
+    // measurement, where the records' gigabytes stall in compaction.
+    let tab_free = if envn("SS_HUGE") == Some(0) { 0 } else { usize::MAX };
     let mut links = links::build(&lfiles, &ltasks, lbytes as usize, users, floor, nthreads, bufsz, tab_free);
     if let Some(pct) = envn("SS_FULLPCT") {
         links.limit = links.slots() / 100 * pct.min(85);
