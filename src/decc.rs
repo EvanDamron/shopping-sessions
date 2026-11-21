@@ -16,9 +16,9 @@
 //!                       constants and its date table
 //!   click ID            the 16 bytes at the field, masked to its length
 //!
-//! Rows gather in a batch (struct of arrays); the batch looks up the campaigns,
-//! applies the window, turns user ID values into user numbers and files the clicks
-//! exactly as `clicks_x` does.
+//! Rows gather in a batch (struct of arrays); the batch drops the clicks with no
+//! campaign or outside the window, turns user ID values into user numbers and files
+//! the clicks exactly as `clicks_x` does.
 //!
 //! An acceptor of the common shapes only: a line longer than 64 bytes, a field count
 //! other than four, a quote out of place, a click ID that is empty or longer than 15
@@ -170,7 +170,7 @@ struct Batch {
     ids: [[u64; 4]; B], // [3] user ID value
     camp: [u32; B],     // campaign index, NOTFOUND for none
     cid: [[u64; 2]; B], // the click ID as an Id's two words
-    t: [i64; B], // ts, ms since the click window's start
+    t: [i64; B],        // ts, ms since the click window's start
     line: [u32; B],
 }
 
@@ -233,8 +233,8 @@ unsafe fn row(fx: &Fx, span: u64, bt: &Batch, j: usize) -> (u8, u64, u32) {
     (keep as u8 * (1 + out as u8), u, cp)
 }
 
-/// Finishes a batch: campaigns, the window, user numbers from user ID values, and the
-/// clicks filed under their user numbers.
+/// Finishes a batch: the campaign and window checks, user numbers from user ID
+/// values, and the clicks filed under their user numbers.
 #[inline(never)]
 unsafe fn flush(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
     let span = sh.win.span as u64;
