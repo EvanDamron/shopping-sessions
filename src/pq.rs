@@ -431,12 +431,39 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
                 put(&mut out, TYPE_INT32, None, &d, ENC_PLAIN);
             }
         }
-        // revenue_cents: PLAIN
-        let mut d = Vec::with_capacity(n * 8);
-        for &x in &r.revenue {
-            d.extend_from_slice(&x.to_le_bytes());
+        // revenue_cents: dictionary of the distinct values (most rows are 0)
+        {
+            let cap = (n * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let mut slots: Vec<u32> = vec![u32::MAX; cap];
+            let mut vals: Vec<i64> = Vec::new();
+            let mut idx: Vec<u32> = Vec::with_capacity(n);
+            for &x in &r.revenue {
+                let mut i = ((x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+                loop {
+                    let v = slots[i];
+                    if v == u32::MAX {
+                        slots[i] = vals.len() as u32;
+                        idx.push(vals.len() as u32);
+                        vals.push(x);
+                        break;
+                    }
+                    if vals[v as usize] == x {
+                        idx.push(v);
+                        break;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+            let mut dict = Vec::with_capacity(vals.len() * 8);
+            for &x in &vals {
+                dict.extend_from_slice(&x.to_le_bytes());
+            }
+            let bw = bits_for(vals.len().saturating_sub(1) as u64);
+            let mut d = vec![bw as u8];
+            bitpacked(&mut d, idx.iter().copied(), n, bw);
+            put(&mut out, TYPE_INT64, Some((&dict, vals.len())), &d, ENC_RLE_DICT);
         }
-        put(&mut out, TYPE_INT64, None, &d, ENC_PLAIN);
         // top_category: definition levels, then dictionary indices of present rows
         let mut dict = Vec::new();
         for c in cats {
