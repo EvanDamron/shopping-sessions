@@ -34,6 +34,8 @@ pub struct Links {
     shift: u32,
     /// IDs that appear in link lines.
     pub linked: usize,
+    /// Whether huge pages were asked for.
+    pub huge: bool,
     count: AtomicUsize,
     /// Entries past which the table counts as full.
     pub limit: usize,
@@ -234,21 +236,27 @@ pub fn build(
     floor: usize,
     nthreads: usize,
     buf: usize,
-    huge: bool,
+    huge_free: usize,
 ) -> Links {
     // About 15 bytes of link file per distinct ID in practice. Sized to end up at
     // most ~70% full, and rebuilt larger if the link files alone overfill it.
     // (`users == 0` with a `floor` is a test hook: exactly `floor` slots to start with.)
     let mut slots = if users == 0 { floor } else { floor.max(bytes / 8).max((bytes / 15 + users) / 7 * 10) }.next_power_of_two();
     loop {
-        if let Some(l) = try_build(files, tasks, slots, nthreads, buf, huge) {
+        if let Some(l) = try_build(files, tasks, slots, nthreads, buf, huge_free) {
             return l;
         }
         slots *= 4;
     }
 }
 
-fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthreads: usize, buf: usize, huge: bool) -> Option<Links> {
+fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthreads: usize, buf: usize, huge_free: usize) -> Option<Links> {
+    let t0 = std::time::Instant::now();
+    // The table is read at random by every event and click: on huge pages those
+    // reads stop missing the TLB and it is built without a fault per 4 KB. Asked for
+    // only when the kernel has twice the table's size free in 2 MB blocks, since a
+    // huge fault that has to compact memory first costs more than it saves.
+    let huge = huge_free >= 2 * slots * (std::mem::size_of::<Entry>() + 4) + (256 << 20);
     let tab = mem::map(slots * std::mem::size_of::<Entry>() + (2 << 20));
     let tab = ((tab as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
     if huge {
@@ -256,7 +264,12 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
     }
     let tab = tab as *const Entry;
     let pbytes = slots * 4;
-    let parent = unsafe { Vec::from_raw_parts(mem::map(pbytes) as *mut AtomicU32, slots, slots) };
+    let pmem = mem::map(pbytes + (2 << 20));
+    let pmem = ((pmem as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
+    if huge {
+        mem::hugepages(pmem, pbytes);
+    }
+    let parent = unsafe { Vec::from_raw_parts(pmem as *mut AtomicU32, slots, slots) };
     let b = Build {
         tab,
         parent,
@@ -286,6 +299,14 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
                         s[k] = (a, c);
                         prefetch(&b.parent[a as usize]);
                         prefetch(&b.parent[c as usize]);
+                    }
+                    // Find both roots and start loading their entries (the union compares
+                    // the roots' names), then join: three passes, so the cache misses of a
+                    // batch overlap instead of queueing.
+                    for x in s[..ids.len()].iter_mut() {
+                        *x = (b.find(x.0), b.find(x.1));
+                        prefetch(b.entry(x.0 as usize) as *const Entry);
+                        prefetch(b.entry(x.1 as usize) as *const Entry);
                     }
                     for &(a, c) in &s[..ids.len()] {
                         b.union(a, c);
@@ -346,6 +367,9 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         std::mem::forget(b.parent);
         return None;
     }
+    if std::env::var_os("SS_TIME").is_some() {
+        eprintln!("  links: interned and joined at {:?}", t0.elapsed());
+    }
     // Write every entry's person (the slot of its set's root) beside it.
     let next = AtomicUsize::new(0);
     const STEP: usize = 1 << 14;
@@ -377,6 +401,9 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
             });
         }
     });
+    if std::env::var_os("SS_TIME").is_some() {
+        eprintln!("  links: persons written at {:?}", t0.elapsed());
+    }
     let count = b.count.load(Relaxed);
     // The parent array is dead: give its pages back in bulk.
     mem::release(b.parent.as_ptr() as *mut u8, pbytes);
@@ -387,6 +414,7 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         mask: slots - 1,
         shift: 64 - slots.trailing_zeros(),
         linked: count,
+        huge,
         count: AtomicUsize::new(count),
         limit: slots / 20 * 17,
         full: AtomicBool::new(false),

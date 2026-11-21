@@ -732,31 +732,23 @@ fn sort_events(v: &mut [u64], tmp: &mut Vec<u64>) {
     b.copy_from_slice(a);
 }
 
-/// Links and phase A: every event and click line parsed and filed. None if the ID
-/// table filled up (far more distinct users than estimated): the caller starts over
-/// with a larger one.
-#[allow(clippy::too_many_arguments)]
-fn phase_a<'a>(
-    lk: &'a Lookups,
+/// The ID table from the link files, and whether huge pages are in use.
+fn make_links(
     files: &[Vec<(File, u64)>; 3],
-    ws: i64,
-    we: i64,
     nthreads: usize,
     scale: usize,
     envn: &dyn Fn(&str) -> Option<usize>,
     log: &dyn Fn(&str),
-) -> Option<(Shared<'a>, Vec<Worker>, usize, usize)> {
+) -> (Links, bool) {
     let [event_files, click_files, link_files] = files;
     let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
-    let task = envn("SS_TASK").unwrap_or(1 << 20) as u64;
-    let ahead = envn("SS_AHEAD").unwrap_or(2 << 20);
     let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
     let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
     let lbytes: u64 = link_files.iter().map(|f| f.1).sum();
     // Huge pages: only when the kernel has them free (see mem::free_huge_bytes).
     let huge_free = mem::free_huge_bytes();
     let huge = match envn("SS_HUGE") {
-        Some(v) => v != 0,
+        Some(v) => v == 1,
         None => huge_free.is_some_and(|f| f >= (ebytes + cbytes) as usize + (2 << 30)),
     };
     let est = (ebytes / 72).max(1) as usize;
@@ -771,17 +763,50 @@ fn phase_a<'a>(
         Some(n) if scale == 1 => (0, n),
         _ => ((est / 40).max(1) * scale, floor * scale),
     };
-    let mut links = links::build(&lfiles, &ltasks, lbytes as usize, users, floor, nthreads, bufsz, huge);
+    // SS_HUGE: 0 = never ask for huge pages, 1 = always, 2 = always for the ID table only.
+    let tab_free = match envn("SS_HUGE") {
+        Some(0) => 0,
+        Some(_) => usize::MAX,
+        // If the free-block counts cannot be read, the table (a few hundred MB at
+        // most) still asks; the records, which are gigabytes, do not.
+        None => huge_free.unwrap_or(usize::MAX),
+    };
+    let mut links = links::build(&lfiles, &ltasks, lbytes as usize, users, floor, nthreads, bufsz, tab_free);
     if let Some(pct) = envn("SS_FULLPCT") {
         links.limit = links.slots() / 100 * pct.min(85);
     }
     log(&format!(
-        "links: {} ids in {} slots (huge pages {}, {} MB free in 2 MB blocks)",
+        "links: {} ids in {} slots (huge pages: table {}, records {}; {} MB free in 2 MB blocks)",
         links.linked,
         links.slots(),
+        if links.huge { "on" } else { "off" },
         if huge { "on" } else { "off" },
         huge_free.unwrap_or(0) >> 20
     ));
+    (links, huge)
+}
+
+/// Phase A: every event and click line parsed and filed. None if the ID table
+/// filled up (far more distinct users than estimated): the caller starts over with
+/// a larger one.
+#[allow(clippy::too_many_arguments)]
+fn phase_a<'a>(
+    lk: &'a Lookups,
+    (links, huge): (Links, bool),
+    files: &[Vec<(File, u64)>; 3],
+    ws: i64,
+    we: i64,
+    nthreads: usize,
+    envn: &dyn Fn(&str) -> Option<usize>,
+    log: &dyn Fn(&str),
+) -> Option<(Shared<'a>, Vec<Worker>, usize, usize)> {
+    let [event_files, click_files, _] = files;
+    let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
+    let task = envn("SS_TASK").unwrap_or(1 << 20) as u64;
+    let ahead = envn("SS_AHEAD").unwrap_or(2 << 20);
+    let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
+    let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
+    let est = (ebytes / 72).max(1) as usize;
 
     // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
     // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
@@ -856,9 +881,14 @@ fn main() {
     let log = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
 
     let (ws, we) = read_manifest(&data);
-    let lk = read_lookups(&data);
     let files = [csv_files(&data.join("events")), csv_files(&data.join("clicks")), csv_files(&data.join("links"))];
-    log("lookups");
+    // The product and campaign tables are read on a thread of their own while the
+    // link files are processed.
+    let (lk, first) = std::thread::scope(|sc| {
+        let lk = sc.spawn(|| read_lookups(&data));
+        let links = make_links(&files, nthreads, 1, &envn, &log);
+        (lk.join().expect("lookups"), links)
+    });
 
     // All in-window times are stored as u32 milliseconds since `base`.
     let base = ws - WEEK;
@@ -869,10 +899,12 @@ fn main() {
     let ncamp = lk.channels.len();
     let ctx = Ctx { ndays, dayoff: base - day0 * DAY, organic: ncamp as u32, day0, cats: &lk.categories };
 
-    // ---- Links and phase A: parse events and clicks.
+    // ---- Phase A: parse events and clicks (again, with a larger ID table, if it filled up).
     let mut scale = 1;
+    let mut links = Some(first);
     let (sh, workers, pb, db) = loop {
-        match phase_a(&lk, &files, ws, we, nthreads, scale, &envn, &log) {
+        let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
+        match phase_a(&lk, l, &files, ws, we, nthreads, &envn, &log) {
             Some(x) => break x,
             None => scale *= 4,
         }
