@@ -680,7 +680,8 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             }
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = (cap - 1) as u64;
-            let mut slots = vec![LEntry::default(); cap];
+            let mut slots: Vec<LEntry> = big_vec(cap);
+            slots.resize(cap, LEntry::default());
             for i in 0..n {
                 let id = bases_ref[sh] + i as u32;
                 let r = find(id);

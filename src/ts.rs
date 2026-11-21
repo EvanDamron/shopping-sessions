@@ -13,25 +13,23 @@ fn digits_ok(w: u64, mask: u64) -> bool {
 }
 
 #[inline(always)]
-fn byte(w: u64, i: u32) -> i64 {
-    ((w >> (8 * i)) & 0xff) as i64 - b'0' as i64
-}
-
-#[inline(always)]
 fn load8(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-const CUM: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+/// Days from 1970-01-01 to January 1 of each year 0..=10000.
+static YEAR_START: [i32; 10001] = {
+    let mut t = [0i32; 10001];
+    let mut y = 0;
+    while y <= 10000 {
+        let yy = y as i64 - 1;
+        t[y] = (365 * yy + yy.div_euclid(4) - yy.div_euclid(100) + yy.div_euclid(400) - 719_162) as i32;
+        y += 1;
+    }
+    t
+};
 
-#[inline(always)]
-fn days(y: i64, m: i64, d: i64) -> i64 {
-    // Days since 1970-01-01 for a proleptic Gregorian date (y >= 0).
-    let leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) as i64;
-    let yy = y - 1;
-    let before = 365 * yy + yy.div_euclid(4) - yy.div_euclid(100) + yy.div_euclid(400);
-    before - 719_162 + CUM[m as usize] + (m > 2) as i64 * leap + d - 1
-}
+const CUM: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
 #[inline(always)]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
@@ -47,32 +45,43 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
 fn parse_iso(b: &[u8], n: usize) -> Option<i64> {
     let w0 = load8(b, 0); // YYYY-MM-
     let w1 = load8(b, 8); // DDTHH:MM
-    let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64; // :SSZ or :SS+
-    if !digits_ok(w0, 0x00FF_FF00_FFFF_FFFF) || !digits_ok(w1, 0xFFFF_00FF_FF00_FFFF) || !digits_ok(w2, 0x0000_0000_00FF_FF00)
-    {
+    // Bytes 16..24 for F2 (":SS+HH:MM" minus the last byte), 16..20 padded for F1.
+    let w2 = if n == 25 { load8(b, 16) } else { u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64 };
+    const M0: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const M1: u64 = 0xFFFF_00FF_FF00_FFFF;
+    let m2: u64 = if n == 25 { 0xFF00_FFFF_00FF_FF00 } else { 0x0000_0000_00FF_FF00 };
+    let sep_ok = (w0 & 0xFF00_00FF_0000_0000) == 0x2D00_002D_0000_0000
+        && (w1 & 0x0000_FF00_00FF_0000) == 0x0000_3A00_0054_0000
+        && (w2 & 0xFF) == b':' as u64;
+    if !(sep_ok & digits_ok(w0, M0) & digits_ok(w1, M1) & digits_ok(w2, m2)) {
         return None;
     }
-    if w0 & 0xFF00_00FF_0000_0000 != 0x2D00_002D_0000_0000
-        || w1 & 0x0000_FF00_00FF_0000 != 0x0000_3A00_0054_0000
-        || w2 & 0xFF != b':' as u64
-    {
-        return None;
-    }
-    let y = byte(w0, 0) * 1000 + byte(w0, 1) * 100 + byte(w0, 2) * 10 + byte(w0, 3);
-    let mo = byte(w0, 5) * 10 + byte(w0, 6);
-    let d = byte(w1, 0) * 10 + byte(w1, 1);
-    let h = byte(w1, 3) * 10 + byte(w1, 4);
-    let mi = byte(w1, 6) * 10 + byte(w1, 7);
-    let s = byte(w2, 1) * 10 + byte(w2, 2);
-    if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
-    let dim = match mo {
-        2 => 28 + (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) as i64,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
+    // Digit values with separators zeroed; pair value at byte i = 10 * x[i] + x[i + 1].
+    let p0 = {
+        let x = (w0 ^ ZEROS) & M0;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
     };
-    if d > dim {
+    let p1 = {
+        let x = (w1 ^ ZEROS) & M1;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
+    };
+    let p2 = {
+        let x = (w2 ^ ZEROS) & m2;
+        x.wrapping_mul(10).wrapping_add(x >> 8)
+    };
+    let pick = |p: u64, i: u32| ((p >> (8 * i)) & 0xff) as i64;
+    let y = pick(p0, 0) * 100 + pick(p0, 2);
+    let mo = pick(p0, 5);
+    let d = pick(p1, 0);
+    let h = pick(p1, 3);
+    let mi = pick(p1, 6);
+    let s = pick(p2, 1);
+    let ys = YEAR_START[y as usize] as i64;
+    let leap = YEAR_START[y as usize + 1] as i64 - ys - 365;
+    // Days in month: 30 + (m + m/8) % 2, February 28 + leap.
+    let dim = if mo == 2 { 28 + leap } else { 30 + ((mo + mo / 8) & 1) };
+    let ok = (1..=12).contains(&mo) & (d >= 1) & (d <= dim) & (h <= 23) & (mi <= 59) & (s <= 59);
+    if !ok {
         return None;
     }
     let off = if n == 20 {
@@ -86,18 +95,20 @@ fn parse_iso(b: &[u8], n: usize) -> Option<i64> {
             b'-' => -1,
             _ => return None,
         };
-        let (a, c, e, f) = (b[20].wrapping_sub(b'0'), b[21].wrapping_sub(b'0'), b[23].wrapping_sub(b'0'), b[24].wrapping_sub(b'0'));
-        if a > 9 || c > 9 || e > 9 || f > 9 || b[22] != b':' {
+        // Offset digits are bytes 20,21 (pair at byte 4 of p2) and 23,24; byte 24 is past w2.
+        let e = b[24].wrapping_sub(b'0');
+        if e > 9 || b[22] != b':' {
             return None;
         }
-        let oh = a as i64 * 10 + c as i64;
-        let om = e as i64 * 10 + f as i64;
+        let oh = pick(p2, 4);
+        let om = pick(p2, 7) + e as i64;
         if oh > 23 || om > 59 {
             return None;
         }
         sign * (oh * 60 + om)
     };
-    Some(((days(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) - off * 60) * 1000)
+    let dn = ys + CUM[mo as usize] + (mo > 2) as i64 * leap + d - 1;
+    Some(((dn * 86_400 + h * 3600 + mi * 60 + s) - off * 60) * 1000)
 }
 
 /// Eight ASCII digits (little-endian load) to their value.
@@ -223,5 +234,33 @@ mod tests {
         let d = doy - (153 * mp + 2) / 5 + 1;
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         (yoe + era * 400 + (m <= 2) as i64, m, d)
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    #[test]
+    #[ignore]
+    fn bench_parse() {
+        let data = std::fs::read("data/p20/events/part-00000.csv").unwrap();
+        let mut ts: Vec<&[u8]> = Vec::new();
+        for line in data.split(|&c| c == b'\n').skip(1).take(3_000_000) {
+            let f: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+            if f.len() == 7 {
+                let t = |x: &'static [u8]| x;
+                let _ = t;
+                ts.push(f[3]); // ingest: always F1
+            }
+        }
+        let ts: Vec<&[u8]> = ts.into_iter().filter(|x| x.len() == 20 && x[0] != b'"').collect();
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0i64;
+            for x in &ts {
+                acc = acc.wrapping_add(super::parse_ts(x).unwrap_or(0));
+            }
+            let dt = t0.elapsed();
+            eprintln!("{} parses in {:?} = {:.1} ns/parse (acc {acc})", ts.len(), dt, dt.as_nanos() as f64 / ts.len() as f64);
+        }
     }
 }
