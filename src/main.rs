@@ -639,18 +639,7 @@ unsafe fn clicks(sh: &Shared, w: &mut Worker, rd: &Reader) {
 // ---------------------------------------------------------------------------
 // Phase C state
 
-/// One thread's user_daily rows, encoded as Parquet PLAIN pages as they are made.
-#[derive(Default)]
-struct Rows {
-    n: usize,
-    names: Vec<u8>,
-    days: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    top_bits: Vec<u8>,
-    tops: Vec<u8>,
-}
+type Rows = pq::UserRows;
 
 struct CS {
     rows: Rows,
@@ -1018,22 +1007,7 @@ fn main() {
                         }
                         bucket(st, sh, workers, ctx, order[k]);
                     }
-                    let r = &st.rows;
-                    let cols = [
-                        pq::Raw::Str(&r.names),
-                        pq::Raw::Date(bytes_of(&r.days)),
-                        pq::Raw::I32(bytes_of(&r.sessions)),
-                        pq::Raw::I32(bytes_of(&r.events)),
-                        pq::Raw::I64(bytes_of(&r.revenue)),
-                        pq::Raw::OptStr(&r.top_bits, &r.tops),
-                    ];
-                    pq::write_raw(
-                        &ud.join(format!("part-{ti:05}.parquet")),
-                        &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
-                        &cols,
-                        r.n,
-                    )
-                    .expect("write user_daily");
+                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
                     // Once every thread is done with the records, give their memory back
                     // here, in parallel, rather than leave it to process exit.
                     done.wait();
@@ -1211,6 +1185,15 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
 #[inline]
 fn person(st: &mut CS, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx) {
     let ndays = ctx.ndays;
+    // A new user_id dictionary entry; this person's rows follow consecutively.
+    {
+        let r = &mut st.rows;
+        let nb = name.bytes();
+        r.dict.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+        r.dict.extend_from_slice(nb);
+        r.ndict += 1;
+        r.runs.push(0);
+    }
     st.starts.clear();
     st.days.clear();
     let mut k = 0;
@@ -1338,9 +1321,8 @@ fn flush(st: &mut CS, name: Id, day: i64, us: u32, ue: u32, ur: u64, ctx: &Ctx) 
     }
     st.catrev.clear();
     let r = &mut st.rows;
-    let nb = name.bytes();
-    r.names.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-    r.names.extend_from_slice(nb);
+    let _ = name;
+    *r.runs.last_mut().unwrap() += 1;
     r.days.push(day as i32);
     r.sessions.push(us as i32);
     r.events.push(ue as i32);
@@ -1350,9 +1332,7 @@ fn flush(st: &mut CS, name: Id, day: i64, us: u32, ue: u32, ur: u64, ctx: &Ctx) 
     }
     if top != u32::MAX {
         *r.top_bits.last_mut().unwrap() |= 1 << (r.n % 8);
-        let c = &ctx.cats[top as usize];
-        r.tops.extend_from_slice(&(c.len() as u32).to_le_bytes());
-        r.tops.extend_from_slice(c);
+        r.tops.push(top as u16);
     }
     r.n += 1;
 }
