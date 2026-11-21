@@ -953,6 +953,9 @@ struct CS {
     catrev: Vec<(u16, u64)>,
     evs: Vec<PEv>,
     raw: Vec<PEv>,
+    skeys: Vec<u64>,
+    stmp: Vec<PEv>,
+    ctmp: Vec<PClk>,
     cl: Vec<PClk>,
     table: PTable,
     keys: Vec<u64>,
@@ -1254,6 +1257,9 @@ fn rest(
             catrev: Vec::new(),
             evs: Vec::new(),
             raw: Vec::new(),
+            skeys: Vec::new(),
+            stmp: Vec::new(),
+            ctmp: Vec::new(),
             cl: Vec::new(),
             table: PTable::default(),
             keys: Vec::new(),
@@ -1373,17 +1379,35 @@ fn rest(
                     }
                 }
             }
+            let mut skeys = std::mem::take(&mut st.skeys);
+            let mut stmp = std::mem::take(&mut st.stmp);
+            let mut ctmp = std::mem::take(&mut st.ctmp);
             for i in 0..np {
                 let ev = &mut evs[off[i] as usize..off[i + 1] as usize];
                 if ev.len() > 1 {
-                    ev.sort_unstable_by_key(|e| e.t);
+                    // Sort packed (time, index) keys, then permute: much faster than sorting 24-byte rows.
+                    skeys.clear();
+                    skeys.extend(ev.iter().enumerate().map(|(j, e)| ((e.t as u64) << 32) | j as u64));
+                    skeys.sort_unstable();
+                    stmp.clear();
+                    stmp.extend(skeys.iter().map(|&k| ev[(k & 0xFFFF_FFFF) as usize]));
+                    ev.copy_from_slice(&stmp);
                 }
                 let c = &mut cl[coff[i] as usize..coff[i + 1] as usize];
                 if c.len() > 1 {
-                    c.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                    // Time order only; equal-time ties are broken by click_id when crediting.
+                    skeys.clear();
+                    skeys.extend(c.iter().enumerate().map(|(j, x)| ((x.ts as u64) << 32) | j as u64));
+                    skeys.sort_unstable();
+                    ctmp.clear();
+                    ctmp.extend(skeys.iter().map(|&k| c[(k & 0xFFFF_FFFF) as usize]));
+                    c.copy_from_slice(&ctmp);
                 }
                 person(st, &evs[off[i] as usize..off[i + 1] as usize], &cl[coff[i] as usize..coff[i + 1] as usize], ctx);
             }
+            st.skeys = skeys;
+            st.ctmp = ctmp;
+            st.stmp = stmp;
             st.evs = evs;
             st.raw = raw;
             st.cl = cl;
@@ -1524,7 +1548,18 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
             }
             cj += 1;
         }
-        let camp = if cj > 0 && start - cl[cj - 1].ts as i64 <= WEEK { cl[grp].camp } else { ctx.organic };
+        let camp = if cj > 0 && start - cl[cj - 1].ts as i64 <= WEEK {
+            // Latest click wins; among clicks at that same instant, the smallest click_id.
+            let mut best = grp;
+            for k in grp + 1..cj {
+                if unpack(cl[k].cid) < unpack(cl[best].cid) {
+                    best = k;
+                }
+            }
+            cl[best].camp
+        } else {
+            ctx.organic
+        };
         let c = &mut st.camp[camp as usize * ndays + day as usize];
         c[0] += 1;
         c[1] += purch as u64;
