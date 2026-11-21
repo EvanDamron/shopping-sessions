@@ -23,6 +23,7 @@ mod pq;
 mod scan;
 #[cfg(test)]
 mod simple;
+mod stage;
 mod ts;
 mod tsfast;
 
@@ -1299,8 +1300,9 @@ fn main() {
     // The index-order fast path (fast.rs) is used when the data's IDs have the public
     // generator's form; SS_FAST=0 turns it off (SS_FAST=2, a test hook, skips its sample
     // check). Without it the general pipeline runs alone.
-    let mut fast_on = envn("SS_FAST") != Some(0);
-    let (sh, mut workers, pb, db) = loop {
+    // (The event stage keeps a campaign number in 23 bits.)
+    let mut fast_on = envn("SS_FAST") != Some(0) && ncamp < 1 << 23;
+    let (sh, workers, pb, db, mut cs) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
         let fx = if fast_on {
             let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
@@ -1333,18 +1335,35 @@ fn main() {
                         continue;
                     }
                 }
-                break x;
+                let (sh, mut workers, pb, db) = x;
+                let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
+                // ---- Fast path: the event stage (stage.rs) turns the events filed by
+                // number into rows, run by run; what does not fit is filed for phases B
+                // and C below. If the events turn out not to be numbered user by user,
+                // or the ID table fills up, everything starts over.
+                if sh.fx.is_some() {
+                    let ok = stage::run(&sh, &mut workers, &mut cs, &ctx, &log);
+                    let full = sh.links.full.load(Relaxed);
+                    if !ok || full {
+                        log(if full { "stage: ID table full, starting over" } else { "stage: events are not numbered user by user, starting over without the fast path" });
+                        sh.ev.release_part(0, 1);
+                        sh.dk.release_part(0, 1);
+                        sh.ck.release_part(0, 1);
+                        sh.links.release_part(0, 1);
+                        sh.fx.as_ref().unwrap().release_part(0, 1);
+                        if full {
+                            scale *= 4;
+                        } else {
+                            fast_on = false;
+                        }
+                        continue;
+                    }
+                }
+                break (sh, workers, pb, db, cs);
             }
             None => scale *= 4,
         }
     };
-
-    let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
-    // ---- Fast path: the events filed by number are deduplicated, ordered and, run by
-    // run, turned into rows here; what does not fit is filed for phases B and C below.
-    if sh.fx.is_some() {
-        fast::passes(&sh, &mut workers, &mut cs, &ctx, &log);
-    }
 
     // ---- Phase B: dedup on event id. Losing copies are marked dead in their person's records.
     {
@@ -1634,20 +1653,24 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     st.rtmp = rtmp;
 }
 
+/// Starts a person's user_id dictionary entry; `flush` then appends that person's
+/// rows, which must follow consecutively.
+#[inline]
+pub fn begin_person(st: &mut CS, name: Id) {
+    let r = &mut st.rows;
+    let nb = name.bytes();
+    r.dict.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    r.dict.extend_from_slice(nb);
+    r.ndict += 1;
+    r.runs.push(0);
+}
+
 /// One person's sorted events and clicks: sessions, credit, assists, daily rows
 /// (rules.md "Events" steps 5 to 7 and "Clicks" steps 4 to 7).
 #[inline]
 fn person(st: &mut CS, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx) {
     let ndays = ctx.ndays;
-    // A new user_id dictionary entry; this person's rows follow consecutively.
-    {
-        let r = &mut st.rows;
-        let nb = name.bytes();
-        r.dict.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-        r.dict.extend_from_slice(nb);
-        r.ndict += 1;
-        r.runs.push(0);
-    }
+    begin_person(st, name);
     st.starts.clear();
     st.days.clear();
     let mut k = 0;
