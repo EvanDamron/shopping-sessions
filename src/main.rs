@@ -1075,11 +1075,17 @@ fn main() {
                     return;
                 }
                 let ingest = ts::parse_ingest(f[3]);
-                let mut kind = match f[4] {
-                    b"view" => VIEW,
-                    b"cart" => CART,
-                    b"purchase" => PURCHASE,
-                    _ => INVALID,
+                let et = f[4];
+                let mut kind = if et.len() == 4 {
+                    match u32::from_le_bytes(et.try_into().unwrap()) {
+                        0x7765_6976 => VIEW, // "view"
+                        0x7472_6163 => CART, // "cart"
+                        _ => INVALID,
+                    }
+                } else if et.len() == 8 && u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+                    PURCHASE
+                } else {
+                    INVALID
                 };
                 let mut ts = 0i64;
                 let mut price = 0u32;
