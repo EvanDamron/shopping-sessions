@@ -7,7 +7,6 @@ edition = "2021"
 memchr = "2"
 memmap2 = "0.9"
 libc = "0.2"
-parquet = { version = "60", default-features = false }
 
 [profile.release]
 opt-level = 3

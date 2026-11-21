@@ -1,7 +1,7 @@
 //! Shopping Sessions pipeline: CSV click-stream in, two daily Parquet tables out.
 //! The rules are in rules.md (not checked in); this file implements them directly.
 
-mod parquet_out;
+mod pq;
 mod scan;
 mod ts;
 
@@ -1439,7 +1439,23 @@ fn rest(
             let ud = &ud;
             let cats = &lk.categories;
             sc.spawn(move || {
-                parquet_out::write_user_daily(&ud.join(format!("part-{t:05}.parquet")), &s.rows, cats);
+                let rows = &s.rows;
+                let cols = [
+                    pq::Col::Str(rows.iter().map(|r| unpack(r.name)).collect()),
+                    pq::Col::Date(rows.iter().map(|r| r.day).collect()),
+                    pq::Col::I64(rows.iter().map(|r| r.sessions as i64).collect()),
+                    pq::Col::I64(rows.iter().map(|r| r.events as i64).collect()),
+                    pq::Col::I64(rows.iter().map(|r| r.revenue as i64).collect()),
+                    pq::Col::OptStr(
+                        rows.iter().map(|r| (r.top != u16::MAX).then(|| &cats[r.top as usize][..])).collect(),
+                    ),
+                ];
+                pq::write(
+                    &ud.join(format!("part-{t:05}.parquet")),
+                    &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
+                    &cols,
+                )
+                .expect("write user_daily");
             });
         }
         let mut crow = Vec::new();
@@ -1453,7 +1469,21 @@ fn rest(
                 }
             }
         }
-        parquet_out::write_campaign_daily(&cd.join("part-00000.parquet"), &crow);
+        let cols = [
+            pq::Col::Str(crow.iter().map(|r| r.0).collect()),
+            pq::Col::Str(crow.iter().map(|r| r.1).collect()),
+            pq::Col::Date(crow.iter().map(|r| r.2).collect()),
+            pq::Col::I64(crow.iter().map(|r| r.3[0] as i64).collect()),
+            pq::Col::I64(crow.iter().map(|r| r.3[1] as i64).collect()),
+            pq::Col::I64(crow.iter().map(|r| r.3[2] as i64).collect()),
+            pq::Col::I64(crow.iter().map(|r| r.3[3] as i64).collect()),
+        ];
+        pq::write(
+            &cd.join("part-00000.parquet"),
+            &["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"],
+            &cols,
+        )
+        .expect("write campaign_daily");
     });
     let nrows: usize = cs.iter().map(|s| s.rows.len()).sum();
     log(&format!("wrote {nrows} user rows"));
