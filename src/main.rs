@@ -64,6 +64,58 @@ fn hash(b: &[u8]) -> u64 {
     h
 }
 
+
+const HK1: u64 = 0x9E37_79B9_7F4A_7C15;
+const HK2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+const HK3: u64 = 0x1656_67B1_9E37_79F9;
+const HK4: u64 = 0xD6E8_FEB8_6659_FD93;
+const HK5: u64 = 0xA076_1D64_78BD_642F;
+
+#[inline(always)]
+fn fmix(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// One pass over a string: a 64-bit hash (tables, partitions) and an independent
+/// 32-bit check; the pair identifies the string.
+#[inline(always)]
+fn hh(b: &[u8]) -> (u64, u32) {
+    let n = b.len();
+    let (x, y) = if n <= 16 {
+        if n >= 8 {
+            (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[n - 8..].try_into().unwrap()))
+        } else if n >= 4 {
+            (
+                u32::from_le_bytes(b[..4].try_into().unwrap()) as u64,
+                u32::from_le_bytes(b[n - 4..].try_into().unwrap()) as u64,
+            )
+        } else if n > 0 {
+            (b[0] as u64 | (b[n / 2] as u64) << 8 | (b[n - 1] as u64) << 16, 0)
+        } else {
+            (0, 0)
+        }
+    } else {
+        let (mut x, mut y) = (HK4, HK5);
+        let mut i = 0;
+        while i + 8 <= n {
+            let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+            x = (x ^ w).wrapping_mul(HK1).rotate_left(29);
+            y = (y ^ w).wrapping_mul(HK2).rotate_left(23);
+            i += 8;
+        }
+        let w = u64::from_le_bytes(b[n - 8..].try_into().unwrap());
+        (x ^ w.wrapping_mul(HK3), y.wrapping_add(w).wrapping_mul(HK1))
+    };
+    let nn = n as u64;
+    let u = x.wrapping_mul(HK1) ^ y.wrapping_mul(HK2).rotate_left(31) ^ nn.wrapping_mul(HK3);
+    let v = (x ^ HK4).wrapping_mul(HK5).wrapping_add((y ^ HK3).wrapping_mul(HK4).rotate_left(17)) ^ nn;
+    (fmix(u), (fmix(v) >> 32) as u32)
+}
+
 // ---------------------------------------------------------------------------
 // CSV dialect
 
@@ -408,29 +460,6 @@ pub fn unpack(v: u64) -> &'static [u8] {
     }
 }
 
-/// A second, independent 32-bit hash: (hash, hash2) together identify a string.
-#[inline]
-fn hash2(b: &[u8]) -> u32 {
-    const K: u64 = 0xD6E8_FEB8_6659_FD93;
-    let mut h: u64 = (b.len() as u64).wrapping_mul(0xA076_1D64_78BD_642F) ^ 0x5bd1_e995_7f4a_7c15;
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        h = (h ^ w).wrapping_mul(K).rotate_left(31);
-        i += 8;
-    }
-    if i < b.len() {
-        let mut w = 0u64;
-        for (k, &c) in b[i..].iter().enumerate() {
-            w |= (c as u64) << (8 * k);
-        }
-        h = (h ^ w).wrapping_mul(K).rotate_left(31);
-    }
-    h ^= h >> 32;
-    h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 32) as u32
-}
-
 #[inline(always)]
 fn prefetch(p: *const u8) {
     #[cfg(target_arch = "x86_64")]
@@ -480,12 +509,7 @@ impl Links {
         }
     }
     #[inline]
-    fn person(&self, s: &'static [u8]) -> Person {
-        self.person_h(s, hash(s))
-    }
-    #[inline]
-    fn person_h(&self, s: &'static [u8], h: u64) -> Person {
-        let h2 = hash2(s);
+    fn person_h(&self, s: &'static [u8], h: u64, h2: u32) -> Person {
         let (slots, mask) = &self.tables[(h >> 58) as usize];
         if !slots.is_empty() {
             let mut i = (h & mask) as usize;
@@ -521,7 +545,7 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             let e = s.edges.len() as u32;
             s.edges.push([0, 0]);
             for side in 0..2 {
-                let h = hash(f[side]);
+                let h = hh(f[side]).0;
                 s.sides[(h >> 58) as usize].push((h, Str::new(f[side]), e * 2 + side as u32));
             }
         });
@@ -665,7 +689,8 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
                 let rname = names_ref[r as usize].b();
                 let me = s.names[i].b();
                 let h = s.hashes[i];
-                let e = LEntry { h, h2: hash2(me), ph: hash(rname), ph2: hash2(rname), name: pack(rname) };
+                let (ph, ph2) = hh(rname);
+                let e = LEntry { h, h2: hh(me).1, ph, ph2, name: pack(rname) };
                 let mut k = (h & mask) as usize;
                 while slots[k].name != 0 {
                     k = (k + 1) & mask as usize;
@@ -856,6 +881,7 @@ const BATCH: usize = 16;
 struct Pend {
     user: &'static [u8],
     uh: u64,
+    uh2: u32,
     eh: u64,
     eh2: u32,
     ing: i32,
@@ -866,7 +892,7 @@ struct Pend {
 }
 impl Default for Pend {
     fn default() -> Self {
-        Pend { user: &[], uh: 0, eh: 0, eh2: 0, ing: 0, ts: 0, price: 0, cat: 0, kind: 0 }
+        Pend { user: &[], uh: 0, uh2: 0, eh: 0, eh2: 0, ing: 0, ts: 0, price: 0, cat: 0, kind: 0 }
     }
 }
 
@@ -874,13 +900,14 @@ impl Default for Pend {
 struct CPend {
     user: &'static [u8],
     uh: u64,
+    uh2: u32,
     cid: u64,
     ts: u32,
     camp: u32,
 }
 impl Default for CPend {
     fn default() -> Self {
-        CPend { user: &[], uh: 0, cid: 0, ts: 0, camp: 0 }
+        CPend { user: &[], uh: 0, uh2: 0, cid: 0, ts: 0, camp: 0 }
     }
 }
 
@@ -972,7 +999,7 @@ fn main() {
             let mut np = 0usize;
             let flush = |a: &mut AState, pend: &[Pend]| {
                 for q in pend {
-                    let p = links.person_h(q.user, q.uh);
+                    let p = links.person_h(q.user, q.uh, q.uh2);
                     let part = (p.ph >> PB_SHIFT) as usize;
                     let v = &mut a.pe[part];
                     let r = (tid << 58) | ((part as u64) << 48) | v.len() as u64;
@@ -1012,8 +1039,7 @@ fn main() {
                         None => kind = INVALID,
                     }
                 }
-                let eh = hash(f[0]);
-                let eh2 = hash2(f[0]);
+                let (eh, eh2) = hh(f[0]);
                 let ing = match ingest {
                     Some(i) => (i.div_euclid(1000) - base_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32,
                     None => i32::MAX,
@@ -1022,9 +1048,9 @@ fn main() {
                     a.ek[(eh >> EB_SHIFT) as usize].push(EKey { h: eh, r: u64::MAX, h2: eh2, ingest: ing });
                     return;
                 }
-                let uh = hash(f[1]);
+                let (uh, uh2) = hh(f[1]);
                 links.prefetch(uh);
-                pend[np] = Pend { user: f[1], uh, eh, eh2, ing, ts: (ts - base) as u32, price, cat, kind };
+                pend[np] = Pend { user: f[1], uh, uh2, eh, eh2, ing, ts: (ts - base) as u32, price, cat, kind };
                 np += 1;
                 if np == BATCH {
                     flush(a, &pend);
@@ -1037,7 +1063,7 @@ fn main() {
             let mut np = 0usize;
             let flush = |a: &mut AState, pend: &[CPend]| {
                 for q in pend {
-                    let p = links.person_h(q.user, q.uh);
+                    let p = links.person_h(q.user, q.uh, q.uh2);
                     a.pc[(p.ph >> PB_SHIFT) as usize].push(PClk { ph: p.ph, cid: q.cid, ts: q.ts, ph2: p.ph2, camp: q.camp });
                 }
             };
@@ -1053,9 +1079,9 @@ fn main() {
                     Some(t) if t >= wsc && t < we => t,
                     _ => return,
                 };
-                let uh = hash(f[1]);
+                let (uh, uh2) = hh(f[1]);
                 links.prefetch(uh);
-                pend[np] = CPend { user: f[1], uh, cid: pack(f[0]), ts: (ts - base) as u32, camp };
+                pend[np] = CPend { user: f[1], uh, uh2, cid: pack(f[0]), ts: (ts - base) as u32, camp };
                 np += 1;
                 if np == BATCH {
                     flush(a, &pend);
