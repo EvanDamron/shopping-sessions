@@ -10,5 +10,8 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=x86-64
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /sessions /app/sessions
+# Large malloc allocations (row columns, pass buffers) on transparent huge pages: half
+# the page faults at 60M. The record arenas and the ID table ask for them in the code.
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000
 CMD ["/app/sessions"]
