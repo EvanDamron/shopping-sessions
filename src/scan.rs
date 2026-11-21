@@ -379,6 +379,109 @@ impl Reader {
     }
 }
 
+/// A file mapped read-only, for the per-line decoders: they read straight from the
+/// page cache, with no copy into a buffer. Only the lines that start in the zone
+/// `[lo, hi)` are read from the mapping: a decoder reads a few bytes before a line
+/// and up to 128 after its start, and needs the line's newline, so the first bytes
+/// of the file, its last page and anything after its last newline are left to the
+/// buffered reader.
+pub struct Mapped {
+    p: *const u8,
+    pub lo: u64,
+    pub hi: u64,
+}
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
+impl Mapped {
+    /// None if the file cannot be mapped or is too small to have a zone.
+    pub fn new(f: &File, len: u64) -> Option<Mapped> {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            let len = len as usize;
+            if len < 3 * 4096 {
+                return None;
+            }
+            let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            let p = p as *const u8;
+            // The last newline of the file, if its last page has one.
+            let last = memrchr(b'\n', std::slice::from_raw_parts(p.add(len - 4096), 4096)).map(|k| len - 4096 + k);
+            let hi = last.map_or(len - 4096, |l| l.min(len - 4096)) as u64;
+            Some(Mapped { p, lo: 64, hi })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (f, len);
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn ptr(&self) -> *const u8 {
+        self.p
+    }
+
+    /// The whole lines that start in `[a, b)` and in the zone, as offsets
+    /// `(start, end)`: `start` is a line start, `end` is just past a newline.
+    pub fn span(&self, a: u64, b: u64) -> Option<(usize, usize)> {
+        let (a, b) = (a.max(self.lo) as usize, b.min(self.hi) as usize);
+        if a >= b {
+            return None;
+        }
+        // Every position below `hi` has a newline at or after it (see `new`).
+        unsafe {
+            let nl = |from: usize| -> usize {
+                let mut i = from;
+                loop {
+                    match memchr(b'\n', std::slice::from_raw_parts(self.p.add(i), 4096)) {
+                        Some(k) => return i + k,
+                        None => i += 4096,
+                    }
+                }
+            };
+            let start = nl(a - 1) + 1;
+            if start >= b {
+                return None;
+            }
+            Some((start, nl(b - 1) + 1))
+        }
+    }
+
+    /// The end of a piece of at most about `max` bytes of whole lines starting at
+    /// the line start `x`, within the span ending at `e`.
+    pub fn piece(&self, x: usize, e: usize, max: usize) -> usize {
+        if e - x <= max {
+            return e;
+        }
+        unsafe {
+            let mut i = x + max - 1;
+            while *self.p.add(i) != b'\n' {
+                i += 1;
+            }
+            i + 1
+        }
+    }
+
+    /// Drops the pages that lie wholly inside `[s, e)` from this process's page
+    /// tables (the file stays in the page cache): done by each thread for what it
+    /// has read, so that nothing is left to tear down at exit.
+    pub fn done(&self, s: usize, e: usize) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let (s, e) = (s.div_ceil(4096) * 4096, e / 4096 * 4096);
+            if e > s {
+                libc::madvise(self.p.add(s) as *mut libc::c_void, e - s, libc::MADV_DONTNEED);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (s, e);
+    }
+}
+
 /// The field `[s, e)` without its quotes, on a line whose quotes are well-formed.
 #[inline(always)]
 pub unsafe fn unquote(d: *const u8, s: usize, e: usize) -> (usize, usize) {
