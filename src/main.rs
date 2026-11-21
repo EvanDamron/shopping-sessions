@@ -341,7 +341,7 @@ fn map_file(path: &Path) -> &'static [u8] {
     let m = unsafe { memmap2::MmapOptions::new().map(&f) }
         .unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
-    parts::register(m.as_ptr(), m.len());
+    parts::register(m.as_ptr(), m.len(), true);
     &m[..]
 }
 
@@ -1500,6 +1500,8 @@ fn rest(
         }
     }
     std::thread::scope(|sc| {
+        // The arenas and link table are dead now: release them while the files are written.
+        sc.spawn(|| parts::release(false, 4));
         for (t, s) in cs.iter().enumerate() {
             let ud = &ud;
             let cats = &lk.categories;
@@ -1554,7 +1556,7 @@ fn rest(
     log(&format!("wrote {nrows} user rows"));
     // Outputs are written and closed. Release the big mappings on all threads (the
     // kernel's own teardown at exit is single-threaded), then exit without destructors.
-    parts::release_all(nthreads);
+    parts::release(true, nthreads);
     log("released");
     std::process::exit(0);
 }

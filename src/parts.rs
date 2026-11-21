@@ -24,19 +24,22 @@ const HUGE: usize = 2 << 20;
 
 /// Every large mapping (arenas, link table, input files), so they can be released in
 /// parallel before exit instead of by the kernel's single-threaded teardown.
-static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Each entry: (address, length, is an input file mapping).
+static REGIONS: std::sync::Mutex<Vec<(usize, usize, bool)>> = std::sync::Mutex::new(Vec::new());
 
-pub fn register(ptr: *const u8, len: usize) {
-    REGIONS.lock().unwrap().push((ptr as usize, len));
+pub fn register(ptr: *const u8, len: usize, input: bool) {
+    REGIONS.lock().unwrap().push((ptr as usize, len, input));
 }
 
-/// Drops the pages of every registered mapping, split across `nthreads` threads.
-pub fn release_all(nthreads: usize) {
+/// Drops the pages of the registered mappings of one kind (input files or scratch
+/// arenas), split across `nthreads` threads.
+pub fn release(input: bool, nthreads: usize) {
     #[cfg(target_os = "linux")]
     {
         const PIECE: usize = 8 << 20;
         let mut pieces = Vec::new();
-        for &(p, l) in REGIONS.lock().unwrap().iter() {
+        for &(p, l, kind) in REGIONS.lock().unwrap().iter().filter(|r| r.2 == input) {
+            let _ = kind;
             let start = p & !4095;
             let end = p + l;
             let mut a = start;
@@ -58,7 +61,7 @@ pub fn release_all(nthreads: usize) {
         });
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = nthreads;
+    let _ = (input, nthreads);
 }
 
 /// Whether to ask for transparent huge pages. With little free contiguous memory the
@@ -202,7 +205,7 @@ pub fn alloc(bytes: usize) -> *mut u8 {
         );
         assert!(p != libc::MAP_FAILED, "mmap of {len} bytes failed");
         let start = (p as usize).div_ceil(HUGE) * HUGE;
-        register(start as *const u8, bytes);
+        register(start as *const u8, bytes, false);
         #[cfg(target_os = "linux")]
         if USE_HUGE.load(std::sync::atomic::Ordering::Relaxed) {
             libc::madvise(start as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
