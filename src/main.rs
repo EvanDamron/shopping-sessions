@@ -1112,7 +1112,13 @@ fn phase_a<'a>(
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
                 // one more thread fills it meanwhile.
-                sc.spawn(move || fast::build_gt(f, &sh.links, 1));
+                sc.spawn(move || {
+                    let t = Instant::now();
+                    fast::build_gt(f, &sh.links, 1);
+                    if std::env::var_os("SS_TIME").is_some() {
+                        eprintln!("  build_gt took {:?}", t.elapsed());
+                    }
+                });
             }
             for w in workers.iter_mut() {
                 sc.spawn(move || {

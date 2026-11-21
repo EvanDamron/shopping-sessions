@@ -470,33 +470,51 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                 if lo >= slots {
                     break;
                 }
-                for i in lo..(lo + STEP).min(slots) {
-                    // (Runs beside phase A, which adds IDs no link mentions: an entry
-                    // still being written is such an ID, and it changes nothing here.)
-                    let Some((id, p)) = links.linked_at(i) else { continue };
-                    let un = fx.user_num_of(id);
-                    let pn = if p as usize == i { un } else { fx.user_num_of(links.name(p)) };
-                    if un != NONE && pn != NONE && un >> 9 == pn >> 9 && un & 511 < 16 {
-                        let cell = &fx.gt[(un >> 9) as usize];
-                        let mine = (p + 1) as u64;
-                        let mut cur = cell.load(Relaxed);
-                        loop {
-                            let new = if cur as u32 == 0 || cur & 0xFFFF_FFFF == mine {
-                                cur | mine | (1 << (32 + (un & 511)))
-                            } else {
-                                cur | COMPLEX // two persons under one user number
-                            };
-                            match cell.compare_exchange_weak(cur, new, Relaxed, Relaxed) {
-                                Ok(_) => break,
-                                Err(c) => cur = c,
-                            }
+                // In blocks: read the slots and start loading each person's name and gt
+                // cell, then use them once they have had time to arrive.
+                const B: usize = 32;
+                let hi = (lo + STEP).min(slots);
+                let mut blk = [(0u32, 0u32, 0u64); B];
+                for blo in (lo..hi).step_by(B) {
+                    let mut k = 0;
+                    for i in blo..(blo + B).min(hi) {
+                        // (Runs beside phase A, which adds IDs no link mentions: an entry
+                        // still being written is such an ID, and it changes nothing here.)
+                        let Some((id, p)) = links.linked_at(i) else { continue };
+                        let un = fx.user_num_of(id);
+                        if p as usize != i {
+                            links.prefetch_name(p);
                         }
-                    } else {
                         if un != NONE {
-                            fx.gt[(un >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            unsafe { prefetch_write(&fx.gt[(un >> 9) as usize]) };
                         }
-                        if pn != NONE {
-                            fx.gt[(pn >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                        blk[k] = (i as u32, p, un);
+                        k += 1;
+                    }
+                    for &(i, p, un) in &blk[..k] {
+                        let pn = if p == i { un } else { fx.user_num_of(links.name(p)) };
+                        if un != NONE && pn != NONE && un >> 9 == pn >> 9 && un & 511 < 16 {
+                            let cell = &fx.gt[(un >> 9) as usize];
+                            let mine = (p + 1) as u64;
+                            let mut cur = cell.load(Relaxed);
+                            loop {
+                                let new = if cur as u32 == 0 || cur & 0xFFFF_FFFF == mine {
+                                    cur | mine | (1 << (32 + (un & 511)))
+                                } else {
+                                    cur | COMPLEX // two persons under one user number
+                                };
+                                match cell.compare_exchange_weak(cur, new, Relaxed, Relaxed) {
+                                    Ok(_) => break,
+                                    Err(c) => cur = c,
+                                }
+                            }
+                        } else {
+                            if un != NONE {
+                                fx.gt[(un >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            }
+                            if pn != NONE {
+                                fx.gt[(pn >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                            }
                         }
                     }
                 }
