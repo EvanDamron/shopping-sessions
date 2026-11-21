@@ -1,6 +1,7 @@
 //! Shopping Sessions pipeline: CSV click-stream in, two daily Parquet tables out.
 //! The rules are in rules.md (not checked in); this file implements them directly.
 
+mod parts;
 mod pq;
 mod scan;
 mod ts;
@@ -895,9 +896,9 @@ impl Default for CPend {
 }
 
 struct AState {
-    pe: Vec<Vec<PEv>>,
-    ek: Vec<Vec<EKey>>,
-    pc: Vec<Vec<PClk>>,
+    pe: parts::Parts<PEv>,
+    ek: parts::Parts<EKey>,
+    pc: parts::Parts<PClk>,
 }
 
 /// Open-addressing map from a person hash to a dense local id; grows as needed.
@@ -1022,9 +1023,9 @@ fn main() {
     let pc_cap = cbytes / 40 / nthreads / PB + 64;
     let mut ast: Vec<AState> = (0..nthreads)
         .map(|_| AState {
-            pe: (0..PB).map(|_| big_vec(pe_cap)).collect(),
-            ek: (0..EB).map(|_| big_vec(ek_cap)).collect(),
-            pc: (0..PB).map(|_| big_vec(pc_cap)).collect(),
+            pe: parts::Parts::new(PB, pe_cap + pe_cap / 4),
+            ek: parts::Parts::new(EB, ek_cap + ek_cap / 4),
+            pc: parts::Parts::new(PB, pc_cap + pc_cap / 4),
         })
         .collect();
     let nev = ech.len();
@@ -1039,10 +1040,9 @@ fn main() {
                 for q in pend {
                     let p = links.person_h(q.user, q.uh, q.uh2);
                     let part = (p.ph >> PB_SHIFT) as usize;
-                    let v = &mut a.pe[part];
-                    let r = (tid << 58) | ((part as u64) << 48) | v.len() as u64;
-                    v.push(PEv { ph: p.ph, name: p.name, t: q.ts, pc: q.price | ((q.cat as u32) << 24) });
-                    a.ek[(q.eh >> EB_SHIFT) as usize].push(EKey { h: q.eh, r, h2: q.eh2, ingest: q.ing });
+                    let i = a.pe.push(part, PEv { ph: p.ph, name: p.name, t: q.ts, pc: q.price | ((q.cat as u32) << 24) });
+                    let r = (tid << 58) | ((part as u64) << 48) | i as u64;
+                    a.ek.push((q.eh >> EB_SHIFT) as usize, EKey { h: q.eh, r, h2: q.eh2, ingest: q.ing });
                 }
             };
             scan::for_records::<7>(ech[t], |f| {
@@ -1089,7 +1089,7 @@ fn main() {
                     None => i32::MAX,
                 };
                 if kind == INVALID {
-                    a.ek[(eh >> EB_SHIFT) as usize].push(EKey { h: eh, r: u64::MAX, h2: eh2, ingest: ing });
+                    a.ek.push((eh >> EB_SHIFT) as usize, EKey { h: eh, r: u64::MAX, h2: eh2, ingest: ing });
                     return;
                 }
                 let (uh, uh2) = hh(f[1]);
@@ -1112,7 +1112,7 @@ fn main() {
             let flush = |a: &mut AState, pend: &[CPend]| {
                 for q in pend {
                     let p = links.person_h(q.user, q.uh, q.uh2);
-                    a.pc[(p.ph >> PB_SHIFT) as usize].push(PClk { ph: p.ph, cid: q.cid, ts: q.ts, camp: q.camp });
+                    a.pc.push((p.ph >> PB_SHIFT) as usize, PClk { ph: p.ph, cid: q.cid, ts: q.ts, camp: q.camp });
                 }
             };
             scan::for_records::<4>(cch[t - nev], |f| {
@@ -1165,7 +1165,7 @@ fn par_t<S: Send, F: Fn(&mut S, usize, usize) + Sync>(states: &mut [S], ntasks: 
 
 #[allow(clippy::too_many_arguments)]
 fn rest(
-    mut ast: Vec<AState>,
+    ast: Vec<AState>,
     links: Links,
     lk: Lookups,
     ctx: Ctx,
@@ -1182,22 +1182,22 @@ fn rest(
 
     // ---- Phase B: dedup on event id. Losing copies get `del` set in their PEv.
     {
-        let pe_ptrs: Vec<Vec<SendPtr<PEv>>> =
-            ast.iter_mut().map(|a| a.pe.iter_mut().map(|v| SendPtr(v.as_mut_ptr())).collect()).collect();
-        let ek: Vec<&Vec<Vec<EKey>>> = ast.iter().map(|a| &a.ek).collect();
+        let ek: Vec<&parts::Parts<EKey>> = ast.iter().map(|a| &a.ek).collect();
         let ek = &ek;
-        let pe_ptrs = &pe_ptrs;
+        let pes: Vec<&parts::Parts<PEv>> = ast.iter().map(|a| &a.pe).collect();
+        let pes = &pes;
         let kill = |r: u64| {
             if r != u64::MAX {
                 let t = (r >> 58) as usize;
                 let p = ((r >> 48) & 0x3ff) as usize;
                 let i = (r & 0xffff_ffff_ffff) as usize;
-                unsafe { (*pe_ptrs[t][p].get().add(i)).t |= 1 << 31 };
+                // Disjoint single-field writes after all pushes are done.
+                unsafe { (*pes[t].ptr(p, i)).t |= 1 << 31 };
             }
         };
         let mut dummy: Vec<Vec<u64>> = (0..nthreads).map(|_| Vec::new()).collect();
         par(&mut dummy, EB, |slots, b| {
-            let total: usize = ek.iter().map(|t| t[b].len()).sum();
+            let total: usize = ek.iter().map(|t| t.len(b)).sum();
             if total == 0 {
                 return;
             }
@@ -1210,18 +1210,19 @@ fn rest(
             let mut acc = 0u32;
             for (ti, t) in ek.iter().enumerate() {
                 offs[ti] = acc;
-                acc += t[b].len() as u32;
+                acc += t.len(b) as u32;
             }
             let get = |code: u32| -> &EKey {
                 let mut ti = 0;
                 while ti + 1 < ek.len() && offs[ti + 1] <= code {
                     ti += 1;
                 }
-                &ek[ti][b][(code - offs[ti]) as usize]
+                unsafe { &*ek[ti].ptr(b, (code - offs[ti]) as usize) }
             };
             // Slot = (high 32 bits of the hash) << 32 | (code + 1); 0 = empty.
             for (ti, t) in ek.iter().enumerate() {
-                for (i, e) in t[b].iter().enumerate() {
+                let (s1, s2) = t.slices(b);
+                for (i, e) in s1.iter().chain(s2.iter()).enumerate() {
                     let code = offs[ti] + i as u32;
                     let tag = e.h & 0xFFFF_FFFF_0000_0000;
                     let mine = tag | (code as u64 + 1);
@@ -1249,9 +1250,6 @@ fn rest(
                 }
             }
         });
-    }
-    for a in ast.iter_mut() {
-        a.ek = Vec::new();
     }
     log("phase B dedup");
 
@@ -1281,12 +1279,12 @@ fn rest(
         let ctx = &ctx;
         // Largest partitions first, so a whale's partition never starts last.
         let mut order: Vec<usize> = (0..PB).collect();
-        order.sort_by_key(|&p| std::cmp::Reverse(ast.iter().map(|a| a.pe[p].len() + a.pc[p].len()).sum::<usize>()));
+        order.sort_by_key(|&p| std::cmp::Reverse(ast.iter().map(|a| a.pe.len(p) + a.pc.len(p)).sum::<usize>()));
         let order = &order;
         par(&mut cs, PB, |st, p| {
             let p = order[p];
             // Group by person with a local table, then sort each person's rows by time.
-            let n_ev: usize = ast.iter().map(|a| a.pe[p].len()).sum();
+            let n_ev: usize = ast.iter().map(|a| a.pe.len(p)).sum();
             let mut table = std::mem::take(&mut st.table);
             table.reset((n_ev / 8).max(64));
             let mut keys = std::mem::take(&mut st.keys); // local person -> ph
@@ -1313,7 +1311,8 @@ fn rest(
             let mut raw = std::mem::take(&mut st.raw);
             raw.clear();
             for a in ast.iter() {
-                for e in a.pe[p].iter() {
+                let (s1, s2) = a.pe.slices(p);
+                for e in s1.iter().chain(s2.iter()) {
                     if e.live() {
                         let id = lookup(&mut table, &mut keys, &mut cnt, e.ph, true);
                         cnt[id as usize] += 1;
@@ -1349,7 +1348,8 @@ fn rest(
                 *c = 0;
             }
             for a in ast.iter() {
-                for c in a.pc[p].iter() {
+                let (s1, s2) = a.pc.slices(p);
+                for c in s1.iter().chain(s2.iter()) {
                     let id = lookup(&mut table, &mut keys, &mut cnt, c.ph, false);
                     if id != u32::MAX {
                         cnt[id as usize] += 1;
@@ -1372,7 +1372,8 @@ fn rest(
                 let mut pos: Vec<u32> = coff[..np].to_vec();
                 let mut k = 0;
                 for a in ast.iter() {
-                    for c in a.pc[p].iter() {
+                    let (s1, s2) = a.pc.slices(p);
+                for c in s1.iter().chain(s2.iter()) {
                         let id = cpid[k];
                         k += 1;
                         if id != u32::MAX {
@@ -1406,7 +1407,7 @@ fn rest(
         });
     }
     log("phase C sessions");
-    drop(ast);
+    std::mem::forget(ast);
 
     // ---- Output
     let ud = out.join("user_daily");
