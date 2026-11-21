@@ -22,6 +22,45 @@ unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
 const HUGE: usize = 2 << 20;
 
+/// Every large mapping (arenas, link table, input files), so they can be released in
+/// parallel before exit instead of by the kernel's single-threaded teardown.
+static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn register(ptr: *const u8, len: usize) {
+    REGIONS.lock().unwrap().push((ptr as usize, len));
+}
+
+/// Drops the pages of every registered mapping, split across `nthreads` threads.
+pub fn release_all(nthreads: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        const PIECE: usize = 8 << 20;
+        let mut pieces = Vec::new();
+        for &(p, l) in REGIONS.lock().unwrap().iter() {
+            let start = p & !4095;
+            let end = p + l;
+            let mut a = start;
+            while a < end {
+                let b = (a + PIECE).min(end);
+                pieces.push((a, b - a));
+                a = b;
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..nthreads {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(a, l)) = pieces.get(i) else { break };
+                    unsafe { libc::madvise(a as *mut libc::c_void, l, libc::MADV_DONTNEED) };
+                });
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = nthreads;
+}
+
 /// Whether to ask for transparent huge pages. With little free contiguous memory the
 /// kernel would compact synchronously on every fault, which costs far more than it saves.
 static USE_HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -163,6 +202,7 @@ pub fn alloc(bytes: usize) -> *mut u8 {
         );
         assert!(p != libc::MAP_FAILED, "mmap of {len} bytes failed");
         let start = (p as usize).div_ceil(HUGE) * HUGE;
+        register(start as *const u8, bytes);
         #[cfg(target_os = "linux")]
         if USE_HUGE.load(std::sync::atomic::Ordering::Relaxed) {
             libc::madvise(start as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);

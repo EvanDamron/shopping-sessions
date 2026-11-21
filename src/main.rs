@@ -341,6 +341,7 @@ fn map_file(path: &Path) -> &'static [u8] {
     let m = unsafe { memmap2::MmapOptions::new().map(&f) }
         .unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    parts::register(m.as_ptr(), m.len());
     &m[..]
 }
 
@@ -1551,7 +1552,10 @@ fn rest(
     });
     let nrows: usize = cs.iter().map(|s| s.rows.len()).sum();
     log(&format!("wrote {nrows} user rows"));
-    // Outputs are written and closed; skip freeing gigabytes of buffers.
+    // Outputs are written and closed. Release the big mappings on all threads (the
+    // kernel's own teardown at exit is single-threaded), then exit without destructors.
+    parts::release_all(nthreads);
+    log("released");
     std::process::exit(0);
 }
 
