@@ -948,11 +948,16 @@ fn make_links(
     let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
     let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
     let lbytes: u64 = link_files.iter().map(|f| f.1).sum();
-    // Huge pages: only when the kernel has them free (see mem::free_huge_bytes).
+    // Huge pages for the record arenas when the kernel has free 2 MB blocks for what
+    // they will touch (~28 bytes per event, ~32 per click) with 50% to spare, or when
+    // /proc/buddyinfo cannot be read. On the scorer (THP madvise) a fresh GB costs
+    // 66 ms in 4 KB pages on 8 threads but 28 ms in huge pages; on a host whose free
+    // memory is fragmented, huge faults stall in compaction instead.
     let huge_free = mem::free_huge_bytes();
+    let touched = (ebytes / 72 * 28 + cbytes / 45 * 32) as usize;
     let huge = match envn("SS_HUGE") {
         Some(v) => v == 1,
-        None => huge_free.is_some_and(|f| f >= (ebytes + cbytes) as usize + (2 << 30)),
+        None => huge_free.is_none_or(|f| f >= touched + touched / 2),
     };
     let est = (ebytes / 72).max(1) as usize;
     let ltasks = ranges(link_files, 256 << 10);
