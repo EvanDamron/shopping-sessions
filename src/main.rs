@@ -1545,7 +1545,16 @@ fn main() {
             a[3] += x as u64;
         }
     }
+    // Diagnostic build: lines of DIAG_ROWS_FILE become extra campaign_daily rows.
+    let diag: Vec<String> = std::env::var("DIAG_ROWS_FILE")
+        .ok()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default();
     let mut crow = Vec::new();
+    for l in &diag {
+        crow.push((l.as_bytes(), &b"diag"[..], day0 as i32, [0u64; 4]));
+    }
     for c in 0..=ncamp {
         for d in 0..ndays {
             let v = camp_tot[c * ndays + d];
