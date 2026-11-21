@@ -13,7 +13,7 @@
 //!                 `ingest_ts`, separators and digit ranges checked, digits folded
 //!                 by three multiply-adds; the date part by a small table of the
 //!                 days that can matter for this dataset's window
-//!   event type    word compares
+//!   event type    a table entry by first letter: the word and its length
 //!   product, price  only looked at for a purchase
 //!
 //! The rows gather in a batch (struct of arrays); the batch turns ID values into
@@ -24,12 +24,12 @@
 //! any step (a line longer than 96 bytes, a field count other than seven, a quote
 //! out of place, an ID that is not `e`/`u` + base 36 or whose number is out of
 //! range, a timestamp of another length or with any character out of place, a date
-//! outside the table, an empty product), is handed whole to `cold`, which runs the
+//! outside the table, an unknown event type, an empty product), is handed whole to `cold`, which runs the
 //! general per-line code on that line. So the result is that code's result on every
 //! line; the decoder only decides how fast it is reached.
 
-use crate::fast::{self, unscramble, Fx, XRec};
-use crate::{event_x_line, parse_price, Shared, Worker, CART, DAY, PURCHASE, VIEW, WEEK};
+use crate::fast::{self, Fx, M1I, M2I};
+use crate::{event_x_line, parse_price, Lookups, Shared, Worker, CART, DAY, PURCHASE, VIEW, WEEK};
 use crate::id::Id;
 use core::arch::x86_64::*;
 
@@ -71,6 +71,7 @@ pub(crate) const DAYBITS: u64 = (1 << 32) | (3 << 48) | (0xF << 56);
 
 #[repr(C, align(64))]
 pub struct Dec {
+    // (All plain data: built zeroed and filled in by `new`.)
     pub(crate) forms: [Form; 4],
     /// Form of a `ts` field by 2 * raw length + quoted.
     pub(crate) tsform: [u8; 128],
@@ -85,10 +86,30 @@ pub struct Dec {
     idw1: [u8; 32],
     idw2: [i16; 16],
     idw3: [u32; 8],
+    /// What the event type must be, by the low five bits of its first letter.
+    ty: [Ty; 32],
+    /// Category by product number (`pcat_len` of them), for products named `p` +
+    /// their number; NOCAT elsewhere. (The table lives as long as the process.)
+    pcat: *const u8,
+    pcat_len: usize,
     base: i64,
     base_s: i64,
     evspan: u64,
 }
+
+/// An event type: the first eight bytes of the field under `m` must be `w`, and its
+/// length `len`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ty {
+    w: u64,
+    m: u64,
+    len: u64,
+    purchase: u64,
+}
+
+const MASK40: u64 = (1 << 40) - 1;
+const NOCAT: u8 = 255;
 
 fn civil(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
@@ -109,9 +130,26 @@ fn daykey(w1: u64) -> usize {
 impl Dec {
     /// `base` is the start of the click window, `end` the window's end (ms), `evspan`
     /// the length of the event window.
-    pub fn new(base: i64, end: i64, evspan: u64) -> Box<Dec> {
+    pub fn new(base: i64, end: i64, evspan: u64, lk: &Lookups) -> Box<Dec> {
         let base_s = base.div_euclid(1000);
         let mut dec: Box<Dec> = unsafe { Box::new(std::mem::zeroed()) };
+        // ---- Products named `p` + a number without a leading zero (at most 7
+        // digits), with a category that fits a byte: their category by that number.
+        // A field of that form names exactly the product `p<its number>`.
+        let mut pcat = Vec::new();
+        for (id, cat) in lk.products.entries() {
+            let b = id.bytes();
+            if b.len() < 2 || b.len() > 8 || b[0] != b'p' || b[1] == b'0' || !b[1..].iter().all(u8::is_ascii_digit) || cat >= NOCAT as u32 {
+                continue;
+            }
+            let n = b[1..].iter().fold(0usize, |n, &c| n * 10 + (c - b'0') as usize);
+            if n >= pcat.len() {
+                pcat.resize(n + 1, NOCAT);
+            }
+            pcat[n] = cat as u8;
+        }
+        let pcat: &'static [u8] = Box::leak(pcat.into_boxed_slice());
+        (dec.pcat, dec.pcat_len) = (pcat.as_ptr(), pcat.len());
         dec.base = base;
         dec.base_s = base_s;
         dec.evspan = evspan;
@@ -241,6 +279,14 @@ impl Dec {
             dec.idw3[4 * lane + 2] = 1_679_616;
         }
 
+        // ---- Event types. (An entry no type uses asks for an impossible length.)
+        for i in 0..32 {
+            dec.ty[i] = Ty { w: 0, m: 0, len: u64::MAX, purchase: 0 };
+        }
+        dec.ty[(b'v' & 31) as usize] = Ty { w: VIEW as u64, m: 0xFFFF_FFFF, len: 4, purchase: 0 };
+        dec.ty[(b'c' & 31) as usize] = Ty { w: CART as u64, m: 0xFFFF_FFFF, len: 4, purchase: 0 };
+        dec.ty[(b'p' & 31) as usize] = Ty { w: PURCHASE, m: u64::MAX, len: 8, purchase: 1 };
+
         // ---- Dates. A `ts` in the click window has a local date within a day of it;
         // an `ingest_ts` is usually within a week after. A day that is not here (or
         // that would share a key with one that is) is simply left to `cold`.
@@ -269,12 +315,19 @@ impl Dec {
 
 #[repr(C, align(64))]
 struct Batch {
-    ids: [[u64; 4]; B], // [1] event ID value, [3] user ID value
-    t: [i64; B],        // ts, ms since the click window's start
+    ids: [[u64; 2]; B], // event ID value, user ID value
+    t: [i64; B],        // ts, ms since the click window's start (i64::MIN: a purchase with a bad price)
     ing: [i64; B],      // ingest_ts, seconds since the click window's start
-    pc: [u32; B],
+    pc: [u64; B],       // price and category, in the high 32 bits
     line: [u32; B],
-    kind: [u8; B], // 1: a known type (and, for a purchase, a good price)
+    // Filled by `flush`:
+    ix: [u64; B], // event number, u64::MAX if either ID's number is out of range
+    un: [u64; B], // user number
+    // The record's three words: user number or INVALID; t and price/category;
+    // ingest key and event number within the bucket.
+    a: [u64; B],
+    w1: [u64; B],
+    w2: [u64; B],
 }
 
 #[inline(always)]
@@ -290,22 +343,6 @@ unsafe fn ld2(a: *const u8, b: *const u8) -> __m256i {
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
     (p as *const u64).read_unaligned()
-}
-
-/// Bit masks of the commas, newlines and quotes in the 96 bytes at `p`: the first
-/// 64 bytes and the last 32 of each.
-#[inline(always)]
-unsafe fn masks(p: *const u8) -> [u64; 6] {
-    let (v0, v1, v2) = (ld(p), ld(p.add(32)), ld(p.add(64)));
-    let m = |ch: u8| -> (u64, u64) {
-        let x = _mm256_set1_epi8(ch as i8);
-        let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, x)) as u32 as u64;
-        let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, x)) as u32 as u64;
-        let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, x)) as u32 as u64;
-        (a | (b << 32), c)
-    };
-    let (c, n, q) = (m(b','), m(b'\n'), m(b'"'));
-    [c.0, c.1, n.0, n.1, q.0, q.1]
 }
 
 /// The general per-line code on the line `[ls, le)` (`le` is its newline).
@@ -329,46 +366,154 @@ unsafe fn cold_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) -> usi
     le + 1
 }
 
+/// Price and category of the purchase on the well-formed line `[ls, le)`, as
+/// `price | category << 24`; None for a price the rules do not accept. (About 3% of
+/// lines: the fields are found again the plain way rather than kept in the loop.)
+#[inline(never)]
+unsafe fn purchase(sh: &Shared, dec: &Dec, d: *const u8, le: usize) -> Option<u32> {
+    let (mut c, mut i) = ([0usize; 2], le);
+    for k in 0..2 {
+        i -= 1;
+        while *d.add(i) != b',' {
+            i -= 1;
+        }
+        c[k] = i;
+    }
+    // price_cents is after the last comma, product_id before it.
+    let (mut s6, mut e6) = (c[0] + 1, le);
+    if e6 > s6 && *d.add(s6) == b'"' {
+        (s6, e6) = (s6 + 1, e6 - 1);
+    }
+    let (mut s5, mut e5) = (c[1] + 1, c[0]);
+    if *d.add(s5) == b'"' {
+        (s5, e5) = (s5 + 1, e5 - 1);
+    }
+    let price = parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6))?;
+    // The category: from the table by product number for `p` + a number that is
+    // there, from the lookup map for anything else.
+    let (mut n, mut i) = (0usize, s5 + 1);
+    if e5 - s5 >= 2 && e5 - s5 <= 8 && *d.add(s5) == b'p' && *d.add(i) != b'0' {
+        while i < e5 && (*d.add(i)).wrapping_sub(b'0') < 10 {
+            n = n * 10 + (*d.add(i) - b'0') as usize;
+            i += 1;
+        }
+        if i == e5 && n < dec.pcat_len && *dec.pcat.add(n) != NOCAT {
+            return Some(price | ((*dec.pcat.add(n) as u32) << 24));
+        }
+    }
+    Some(price | (sh.lk.products.get(Id::field(d, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24))
+}
+
+/// `a * m` modulo 2^40 in each 64-bit lane, for `a` below 2^40; `mlo` and `mhi` hold
+/// the low 32 bits and the next 8 bits of `m`.
+#[inline(always)]
+unsafe fn mul40(a: __m256i, mlo: __m256i, mhi: __m256i, mask: __m256i) -> __m256i {
+    let cross = _mm256_add_epi64(_mm256_mul_epu32(a, mhi), _mm256_mul_epu32(_mm256_srli_epi64(a, 32), mlo));
+    _mm256_and_si256(_mm256_add_epi64(_mm256_mul_epu32(a, mlo), _mm256_slli_epi64(cross, 32)), mask)
+}
+
 /// Finishes a batch: numbers from ID values, the window and lateness rules, and the
 /// records filed under their event numbers.
 #[inline(never)]
-unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
+unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, bt: &mut Batch, n: usize) {
     let (ek, uk, limit, gmax) = fx.keys();
-    let mut a = [0u64; B];
-    let mut ix = [0u64; B];
-    for j in 0..n {
-        let (ne, nu) = (bt.ids[j][1], bt.ids[j][3]);
-        let idx = unscramble(ne, ek);
-        let un = unscramble(nu, uk);
-        let out = (((ne | nu) >> 40) != 0) | (idx >= limit) | ((un >> 9) >= gmax);
-        let t = bt.t[j];
-        let ing_ms = (bt.ing[j] + dec.base_s) * 1000;
-        let ok = (bt.kind[j] != 0) & ((t.wrapping_sub(WEEK) as u64) < dec.evspan) & (ing_ms.wrapping_sub(t.wrapping_add(dec.base)) <= DAY);
-        a[j] = if ok { un } else { fast::INVALID };
-        ix[j] = if out { u64::MAX } else { idx };
+    // ---- Two rows at a time: (event ID value, user ID value) -> (event number, user
+    // number), as fast::unscramble does; a row with either number out of range gets
+    // event number u64::MAX.
+    let lane = |x: u64, y: u64| _mm256_set_epi64x(y as i64, x as i64, y as i64, x as i64);
+    let mask = _mm256_set1_epi64x(MASK40 as i64);
+    let (m2lo, m2hi) = (_mm256_set1_epi64x((M2I & 0xFFFF_FFFF) as i64), _mm256_set1_epi64x(((M2I >> 32) & 0xFF) as i64));
+    let (m1lo, m1hi) = (_mm256_set1_epi64x((M1I & 0xFFFF_FFFF) as i64), _mm256_set1_epi64x(((M1I >> 32) & 0xFF) as i64));
+    let keys = lane(ek, uk);
+    let top = lane(limit.min(MASK40 + 1) - 1, (gmax << 9).min(MASK40 + 1) - 1);
+    let mut j = 0;
+    while j < n {
+        let v = ld(bt.ids.as_ptr().add(j) as *const u8);
+        let m = mul40(_mm256_and_si256(v, mask), m2lo, m2hi, mask);
+        let m = _mm256_xor_si256(_mm256_xor_si256(m, _mm256_srli_epi64(m, 17)), _mm256_srli_epi64(m, 34));
+        let x = mul40(_mm256_xor_si256(m, keys), m1lo, m1hi, mask);
+        // (values are below 2^63, so the signed compares are the unsigned ones)
+        let out = _mm256_or_si256(_mm256_cmpgt_epi64(v, mask), _mm256_cmpgt_epi64(x, top));
+        let out = _mm256_or_si256(out, _mm256_shuffle_epi32(out, 0b01_00_11_10));
+        let r = _mm256_permute4x64_epi64(_mm256_or_si256(x, _mm256_and_si256(out, lane(u64::MAX, 0))), 0b11_01_10_00);
+        _mm_storeu_si128(bt.ix.as_mut_ptr().add(j) as *mut __m128i, _mm256_castsi256_si128(r));
+        _mm_storeu_si128(bt.un.as_mut_ptr().add(j) as *mut __m128i, _mm256_extracti128_si256(r, 1));
+        j += 2;
     }
-    let lomask = (1u64 << fx.xsh) - 1;
+    // ---- Four rows at a time: in the event window and not late -> the user number,
+    // otherwise INVALID.
+    const BIAS: i64 = 2 * 86_400; // ingest seconds are at least minus one day: made positive for the multiply
+    let week = _mm256_set1_epi64x(WEEK);
+    let span = _mm256_set1_epi64x(dec.evspan.min(i64::MAX as u64) as i64);
+    let c = _mm256_set1_epi64x(dec.base_s * 1000 - dec.base - BIAS * 1000);
+    let low32 = _mm256_set1_epi64x(0xFFFF_FFFF);
+    let lomask = _mm256_set1_epi64x(((1u64 << fx.xsh) - 1) as i64);
+    let mut j = 0;
+    while j < n {
+        let t = ld(bt.t.as_ptr().add(j) as *const u8);
+        let tw = _mm256_sub_epi64(t, week);
+        let inwin = _mm256_and_si256(_mm256_cmpgt_epi64(tw, _mm256_set1_epi64x(-1)), _mm256_cmpgt_epi64(span, tw));
+        let ing0 = ld(bt.ing.as_ptr().add(j) as *const u8);
+        let ing = _mm256_add_epi64(ing0, _mm256_set1_epi64x(BIAS));
+        let ing_ms = _mm256_add_epi64(_mm256_mul_epu32(ing, _mm256_set1_epi64x(1000)), c);
+        let late = _mm256_cmpgt_epi64(_mm256_sub_epi64(ing_ms, t), _mm256_set1_epi64x(DAY));
+        let ok = _mm256_andnot_si256(late, inwin);
+        let a = _mm256_blendv_epi8(_mm256_set1_epi64x(fast::INVALID as i64), ld(bt.un.as_ptr().add(j) as *const u8), ok);
+        _mm256_storeu_si256(bt.a.as_mut_ptr().add(j) as *mut __m256i, a);
+        let w1 = _mm256_or_si256(_mm256_and_si256(t, low32), ld(bt.pc.as_ptr().add(j) as *const u8));
+        _mm256_storeu_si256(bt.w1.as_mut_ptr().add(j) as *mut __m256i, w1);
+        let lo = _mm256_slli_epi64(_mm256_and_si256(ld(bt.ix.as_ptr().add(j) as *const u8), lomask), 32);
+        let w2 = _mm256_or_si256(_mm256_xor_si256(_mm256_and_si256(ing0, low32), _mm256_set1_epi64x(0x8000_0000)), lo);
+        _mm256_storeu_si256(bt.w2.as_mut_ptr().add(j) as *mut __m256i, w2);
+        j += 4;
+    }
     if sh.deccheck {
-        check(sh, fx, w, d, bt, n, &a, &ix);
+        check(sh, w, d, bt, n);
     }
+    // ---- The records, filed as `Worker::push_x` files them (the same buffers and
+    // chunks; written out here so that nothing is re-read from the worker per row).
+    let xsh = fx.xsh;
+    let (cnt, cur, wc) = (w.xcnt.as_mut_ptr(), w.xcur.as_mut_ptr(), w.xwc.as_mut_ptr() as *mut u64);
     for j in 0..n {
-        let idx = ix[j];
+        let idx = *bt.ix.get_unchecked(j);
         if idx == u64::MAX {
             cold_from(sh, w, d, bt.line[j] as usize);
             continue;
         }
-        let r = XRec { a: a[j], t: bt.t[j] as u32, pc: bt.pc[j], ing: (bt.ing[j] as i32 as u32) ^ 0x8000_0000, lo: (idx & lomask) as u32 };
-        w.push_x(fx, (idx >> fx.xsh) as usize, r);
+        let b = (idx >> xsh) as usize;
+        let nrec = *cnt.add(b);
+        let off = nrec as usize & (fast::XCH - 1);
+        if off == 0 {
+            new_chunk(fx, w, b);
+        }
+        *cnt.add(b) = nrec + 1;
+        let k = (nrec & 7) as usize;
+        let buf = wc.add(b * 24);
+        let slot = buf.add(k * 3);
+        *slot = *bt.a.get_unchecked(j);
+        *slot.add(1) = *bt.w1.get_unchecked(j);
+        *slot.add(2) = *bt.w2.get_unchecked(j);
+        if k == 7 {
+            crate::mem::stream((*cur.add(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 3);
+        }
     }
+}
+
+/// A new chunk for event-number bucket `b`.
+#[cold]
+#[inline(never)]
+unsafe fn new_chunk(fx: &Fx, w: &mut Worker, b: usize) {
+    let c = fx.xe.alloc(fast::XCH * fast::XREC) as usize;
+    *w.xcur.get_unchecked_mut(b) = c;
+    w.xchunks.get_unchecked_mut(b).push(c);
 }
 
 /// Test hook: every row of the batch against the plain reading of its line.
 #[cold]
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn check(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, n: usize, a: &[u64; B], ix: &[u64; B]) {
+unsafe fn check(sh: &Shared, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
     for j in 0..n {
-        if ix[j] == u64::MAX {
+        if bt.ix[j] == u64::MAX {
             continue;
         }
         let ls = bt.line[j] as usize;
@@ -376,10 +521,11 @@ unsafe fn check(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, 
         while *d.add(le) != b'\n' {
             le += 1;
         }
-        let mine = (ix[j], a[j], (bt.ing[j] as i32 as u32) ^ 0x8000_0000, (ix[j] & ((1u64 << fx.xsh) - 1)) as u32);
+        // (the three words exactly as they are filed)
+        let mine = (bt.ix[j], bt.a[j], (bt.w2[j] as u32, (bt.w2[j] >> 32) as u32));
         let same = match crate::event_x_plain(sh, w, d, ls, le) {
             Some((idx, r)) => {
-                (idx, r.a, r.ing, r.lo) == mine && (r.a == fast::INVALID || (r.t == bt.t[j] as u32 && r.pc == bt.pc[j]))
+                (idx, r.a, (r.ing, r.lo)) == mine && (r.a == fast::INVALID || (r.t == bt.w1[j] as u32 && r.pc == (bt.w1[j] >> 32) as u32))
             }
             None => false,
         };
@@ -400,61 +546,74 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
     let mut nb = 0usize;
     let mut pos = start;
     let zero = _mm256_set1_epi8(b'0' as i8);
+    let (comma, newline, quote) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
     let (idt, idlow, idrng) = (ld(dec.idt.as_ptr()), ld(dec.idlow.as_ptr()), ld(dec.idrng.as_ptr()));
     let (idw1, idw2, idw3) = (ld(dec.idw1.as_ptr()), ld(dec.idw2.as_ptr() as *const u8), ld(dec.idw3.as_ptr() as *const u8));
     let (c39, c10) = (_mm256_set1_epi8(39), _mm256_set1_epi8(10));
     let tens = _mm256_set1_epi16(0x010A); // bytes 10, 1
     while pos < end {
         let p = d.add(pos);
-        let [cm, ch, nm, nh, qm, qh] = masks(p);
+        // ---- Masks of the commas, newlines and quotes of the 96 bytes at p: the
+        // first 64 bytes and the last 32 of each.
+        let (v0, v1, v2) = (ld(p), ld(p.add(32)), ld(p.add(64)));
+        let m64 = |x: __m256i| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, x)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, x)) as u32 as u64) << 32)
+        };
+        let m32 = |x: __m256i| -> u64 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, x)) as u32 as u64 };
+        let (nm, nh) = (m64(newline), m32(newline));
         if (nm | nh) == 0 {
             pos = cold_from(sh, w, d, pos); // a line longer than 96 bytes
             continue;
         }
-        let nl = if nm != 0 { nm.trailing_zeros() as u64 } else { 64 + nh.trailing_zeros() as u64 };
+        let nl = if nm != 0 { _tzcnt_u64(nm) } else { 64 + _tzcnt_u64(nh) };
         let next = pos + nl as usize + 1;
+        let (cm, ch, qm, qh) = (m64(comma), m32(comma), m64(quote), m32(quote));
 
         // ---- Where the commas are. Fields 0..2 end in the first 64 bytes; the rest
         // of the line is looked at from the byte after the third comma.
         let m1 = _blsr_u64(cm);
         let m2 = _blsr_u64(m1);
-        let m3 = _blsr_u64(m2);
         let (c1, c2, c3) = (_tzcnt_u64(cm), _tzcnt_u64(m1), _tzcnt_u64(m2));
+        let sa = cm ^ _blsr_u64(m2);
+        let qa = _bzhi_u64(qm, c3 as u32);
         let c3s = (c3 & 63) as u32;
-        let tsh = 63 - c3s;
-        let t = ((cm >> c3s) >> 1) | (ch << tsh);
-        let qt = ((qm >> c3s) >> 1) | (qh << tsh);
         let nlr = nl.wrapping_sub(c3).wrapping_sub(1);
-        let tl = _bzhi_u64(t, nlr as u32);
+        let tl = _bzhi_u64(((cm >> c3s) >> 1) | (ch << (63 - c3s)), nlr as u32);
+        let qb = _bzhi_u64(((qm >> c3s) >> 1) | (qh << (63 - c3s)), nlr as u32);
         let t1 = _blsr_u64(tl);
         let t2 = _blsr_u64(t1);
-        let t3 = _blsr_u64(t2);
         let (c4, c5, c6) = (_tzcnt_u64(tl), _tzcnt_u64(t1), _tzcnt_u64(t2));
         // Three commas in the first 64 bytes, three more and the newline in the next 64.
-        if ((c3 | nlr | c6) >> 6) | t3 != 0 {
+        if ((c3 | nlr | c6) >> 6) | _blsr_u64(t2) != 0 {
             cold(sh, w, d, pos, next - 1);
             pos = next;
             continue;
         }
 
-        // ---- Quotes: `o` has a bit per field that starts with one. Every quote must
-        // be one of those or the last character of such a field, and each of those
-        // must be there.
-        let qa = _bzhi_u64(qm, c3 as u32);
-        let sa = cm ^ m3;
-        let fa = sa.wrapping_mul(2) | 1;
-        let oa = _pext_u64(qa, fa);
-        let mut bad = (qa & !fa) ^ _pdep_u64(oa, sa >> 1);
-        let qb = _bzhi_u64(qt, nlr as u32);
+        // ---- The second half of the line: ingest_ts, type, product, price.
+        // Quotes: `o` has a bit per field that starts with one. Every quote must be
+        // one of those or the last character of such a field, and each of those must
+        // be there.
         let sb = tl | (1u64 << nlr);
         let fb = sb.wrapping_mul(2) | 1;
         let ob = _pext_u64(qb, fb);
-        bad |= (qb & !fb) ^ _pdep_u64(ob, sb >> 1);
-        let (q0, q1, q2) = (oa & 1, (oa >> 1) & 1, oa >> 2);
-        let (q3, q4, q5, q6) = (ob & 1, (ob >> 1) & 1, (ob >> 2) & 1, ob >> 3);
-        let q = c3 + 1; // where `ingest_ts` starts
+        let mut bad = (qb & !fb) ^ _pdep_u64(ob, sb >> 1);
+        let (q3, q4, q5) = (ob & 1, (ob >> 1) & 1, (ob >> 2) & 1);
+        let tail = p.add(c3 as usize + 1); // where `ingest_ts` starts
+        let inp = tail.add(q3 as usize);
+        bad |= c4.wrapping_sub(2 * q3) ^ 20;
+        // Type: the entry for its first letter says what the word and its length must be.
+        let tw = load8(tail.add((c4 + 1 + q4) as usize));
+        let ty = &*dec.ty.as_ptr().add((tw & 31) as usize);
+        bad |= ((tw ^ ty.w) & ty.m) | ((c5 - c4 - 1).wrapping_sub(2 * q4) ^ ty.len);
+        let is_purchase = ty.purchase;
+        bad |= ((c6 - c5 - 1) == 2 * q5) as u64; // an empty product
 
-        // ---- Both IDs.
+        // ---- The first half: both IDs and ts.
+        let fa = sa.wrapping_mul(2) | 1;
+        let oa = _pext_u64(qa, fa);
+        bad |= (qa & !fa) ^ _pdep_u64(oa, sa >> 1);
+        let (q0, q1, q2) = (oa & 1, (oa >> 1) & 1, oa >> 2);
         let sh0 = dec.idsh.get_unchecked((2 * c1 + q0) as usize).as_ptr();
         let sh1 = dec.idsh.get_unchecked((2 * (c2 - c1 - 1) + q1) as usize).as_ptr();
         let v = ld2(p.add(c1 as usize).sub(16), p.add(c2 as usize).sub(16));
@@ -472,8 +631,7 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         // ---- Both timestamps.
         let form = &*dec.forms.as_ptr().add(*dec.tsform.get_unchecked((2 * (c3 - c2 - 1) + q2) as usize) as usize);
         let tsp = p.add((c2 + 1 + q2) as usize);
-        let inp = p.add((q + q3) as usize);
-        bad |= form.bad | (c4.wrapping_sub(2 * q3) ^ 20);
+        bad |= form.bad;
         let v = ld2(tsp.offset(form.off), inp.add(10));
         let y = _mm256_and_si256(_mm256_sub_epi8(v, ld(form.lo.as_ptr())), ld(form.mk.as_ptr()));
         let vbad = _mm256_or_si256(vbad, _mm256_subs_epu8(y, ld(form.rg.as_ptr())));
@@ -488,7 +646,7 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         let dt = &*dec.days.as_ptr().add(_pext_u64(w1, DAYBITS) as usize);
         bad |= ((load8(tsp) ^ dt.w0) | (w1 ^ dt.w1)) & form.dmask;
         let kb = *form.kb.get_unchecked(((*tsp.add(19) >> 1) & 1) as usize);
-        let tms = (dt.tms & form.dmask as i64)
+        let mut tms = (dt.tms & form.dmask as i64)
             .wrapping_add(form.c0)
             .wrapping_add((ab as u32 as i64).wrapping_mul(form.k0))
             .wrapping_add(((ab >> 32) as i64).wrapping_mul(kb));
@@ -497,41 +655,34 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         bad |= (load8(inp) ^ di.w0) | (w1 ^ di.w1);
         let ing = di.isec + isec;
 
-        // ---- Type, product.
-        let tw = load8(p.add((q + c4 + 1 + q4) as usize));
-        let tl4 = (c5 - c4 - 1).wrapping_sub(2 * q4);
-        let purchase = (tl4 == 8) & (tw == PURCHASE);
-        let typed = purchase | ((tl4 == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
-        bad |= ((c6 - c5 - 1) == 2 * q5) as u64; // an empty product
-
-        if (bad != 0) | (_mm256_testz_si256(vbad, vbad) == 0) {
+        if bad != 0 {
             cold(sh, w, d, pos, next - 1);
             pos = next;
             continue;
         }
-        let mut kind = typed as u8;
-        let mut pc = 0u32;
-        if purchase {
-            let base = pos + q as usize;
-            let (s5, e5) = (base + (c5 + 1 + q5) as usize, base + (c6 - q5) as usize);
-            let (s6, e6) = (base + (c6 + 1 + q6) as usize, base + (nlr - q6) as usize);
-            match parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6)) {
-                Some(price) => pc = price | (sh.lk.products.get(Id::field(d, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24),
-                None => kind = 0,
+        if _mm256_testz_si256(vbad, vbad) == 0 {
+            cold(sh, w, d, pos, next - 1);
+            pos = next;
+            continue;
+        }
+        let mut pc = 0u64;
+        if is_purchase != 0 {
+            match purchase(sh, dec, d, next - 1) {
+                Some(x) => pc = (x as u64) << 32,
+                None => tms = i64::MIN, // outside every window: the copy is invalid
             }
         }
-        _mm256_storeu_si256(bt.ids.as_mut_ptr().add(nb) as *mut __m256i, idv);
+        _mm_storeu_si128(bt.ids.as_mut_ptr().add(nb) as *mut __m128i, _mm256_castsi256_si128(_mm256_permute4x64_epi64(idv, 0b11_01_11_01)));
         *bt.t.get_unchecked_mut(nb) = tms;
         *bt.ing.get_unchecked_mut(nb) = ing;
         *bt.pc.get_unchecked_mut(nb) = pc;
         *bt.line.get_unchecked_mut(nb) = pos as u32;
-        *bt.kind.get_unchecked_mut(nb) = kind;
         nb += 1;
         if nb == B {
-            flush(sh, fx, dec, w, d, &bt, nb);
+            flush(sh, fx, dec, w, d, &mut bt, nb);
             nb = 0;
         }
         pos = next;
     }
-    flush(sh, fx, dec, w, d, &bt, nb);
+    flush(sh, fx, dec, w, d, &mut bt, nb);
 }

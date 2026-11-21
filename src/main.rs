@@ -163,6 +163,11 @@ impl IdMap {
             i = (i + 1) & self.mask;
         }
     }
+    /// Every (key, value) of the map.
+    #[allow(dead_code)]
+    fn entries(&self) -> impl Iterator<Item = (Id, u32)> + '_ {
+        self.slots.iter().copied().filter(|e| e.0 != Id::EMPTY)
+    }
     /// Inserts unless present; returns true if inserted. The empty ID is never a key.
     fn insert(&mut self, k: Id, v: u32) -> bool {
         if k == Id::EMPTY || self.get(k).is_some() {
@@ -341,6 +346,11 @@ struct WcE([u32; 48]); // 16 event records
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct WcC([u64; 32]); // 8 click records
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe impl Sync for dec::Dec {}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe impl Send for dec::Dec {}
 
 /// What phases A to C share.
 struct Shared<'a> {
@@ -1156,7 +1166,7 @@ fn phase_a<'a>(
         dk: mem::Arena::new(ebytes as usize / 3 + nthreads * db * DCH * 16, huge, ahead),
         ck: mem::Arena::new(cbytes as usize + nthreads * pb * CCH * CREC, huge, ahead),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-        dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64)),
+        dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64, lk)),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         decc: (fx.is_some() && envn("SS_DEC") != Some(0) && envn("SS_DECC") != Some(0)).then(|| decc::DecC::new(lk)),
         deccheck: envn("SS_DECCHECK") == Some(1),
