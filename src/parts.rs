@@ -138,7 +138,9 @@ pub fn alloc(bytes: usize) -> *mut u8 {
         assert!(p != libc::MAP_FAILED, "mmap of {len} bytes failed");
         let start = (p as usize).div_ceil(HUGE) * HUGE;
         #[cfg(target_os = "linux")]
-        libc::madvise(start as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        if std::env::var_os("NO_HUGE").is_none() {
+            libc::madvise(start as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        }
         start as *mut u8
     }
 }
