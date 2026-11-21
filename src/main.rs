@@ -153,11 +153,12 @@ impl IdMap {
         let mut i = k.hash() as usize & self.mask;
         loop {
             let (s, v) = unsafe { *self.slots.get_unchecked(i) };
-            if s == k {
-                return Some(v);
-            }
+            // (A free slot first: the empty ID is never a key, so looking it up finds nothing.)
             if s == Id::EMPTY {
                 return None;
+            }
+            if s == k {
+                return Some(v);
             }
             i = (i + 1) & self.mask;
         }
