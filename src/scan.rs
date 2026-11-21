@@ -1,5 +1,17 @@
-//! SIMD CSV scanning: finds commas, newlines and quotes 64 bytes at a time and
-//! hands each well-formed line's unquoted fields to a callback (rules.md "CSV dialect").
+//! CSV scanning (rules.md "CSV dialect"), in two stages over a small reusable buffer.
+//!
+//! Stage 1 (`Reader::index`) classifies 64 bytes at a time into comma, newline and
+//! quote bit masks, validates every quote with bit arithmetic, and flattens the
+//! separator positions into an index. Stage 2 (`Reader::lines`) walks that index a
+//! line at a time and hands each well-formed line to the caller, which reads the
+//! fields it needs straight from the buffer.
+//!
+//! Files are read with `pread` into the buffer rather than mapped: the buffer stays
+//! in cache, no page tables are built for the input, and nothing has to be torn
+//! down at exit.
+
+use memchr::{memchr, memrchr};
+use std::fs::File;
 
 /// (comma, newline, quote) bit masks for the 64 bytes at p.
 #[inline(always)]
@@ -69,93 +81,312 @@ unsafe fn classify(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
-/// Calls `f` with the N unquoted fields of every well-formed line in `data`
-/// ('\n'-terminated lines; a final unterminated line counts). Malformed lines
-/// (wrong field count, a quote anywhere except around a whole field, empty lines)
-/// are skipped.
-#[inline(always)]
-pub fn for_records<const N: usize>(data: &'static [u8], mut f: impl FnMut(&[&'static [u8]; N])) {
-    let n = data.len();
-    let base = data.as_ptr();
-    let mut fields: [&'static [u8]; N] = [&[]; N];
-    let mut nf = 0usize; // fields seen in the current line
-    let mut bad = false;
-    let mut fs = 0usize; // current field start
-    let mut q_fs = 0u64; // quotes before fs
-    let mut qbase = 0u64; // quotes before the current block
-    let mut line_start = 0usize;
-    let mut tail = [0u8; 64];
-    let mut o = 0usize;
-    while o < n {
-        let (cm, nm, qm) = unsafe {
-            if o + 64 <= n {
-                classify(base.add(o))
-            } else {
-                tail[..n - o].copy_from_slice(&data[o..]);
-                classify(tail.as_ptr())
-            }
-        };
-        let mut seps = cm | nm;
-        while seps != 0 {
-            let tz = seps.trailing_zeros();
-            let bit = 1u64 << tz;
-            seps &= seps - 1;
-            let pos = o + tz as usize;
-            let qpos = qbase + (qm & (bit - 1)).count_ones() as u64;
-            let qc = qpos - q_fs;
-            if nf < N {
-                // Branch-free: a field is plain (no quotes) or wrapped in exactly one pair.
-                let len = pos - fs;
-                let (first, last) = unsafe { (*base.add(fs.min(n - 1)), *base.add(pos.max(1) - 1)) };
-                let quoted = (qc == 2) & (len >= 2) & (first == b'"') & (last == b'"');
-                bad |= (qc != 0) & !quoted;
-                let q = quoted as usize;
-                fields[nf] = unsafe { std::slice::from_raw_parts(base.add(fs + q), len - 2 * q) };
-            }
-            nf += 1;
-            fs = pos + 1;
-            q_fs = qpos;
-            if nm & bit != 0 {
-                if !bad && nf == N {
-                    f(&fields);
-                }
-                nf = 0;
-                bad = false;
-                line_start = fs;
-            }
-        }
-        qbase += qm.count_ones() as u64;
-        o += 64;
-    }
-    if line_start < n {
-        // Final line without a newline.
-        let qc = qbase - q_fs;
-        if nf < N {
-            if qc == 0 {
-                fields[nf] = &data[fs..n];
-            } else if qc == 2 && n - fs >= 2 && data[fs] == b'"' && data[n - 1] == b'"' {
-                fields[nf] = &data[fs + 1..n - 1];
-            } else {
-                bad = true;
-            }
-        }
-        nf += 1;
-        if !bad && nf == N {
-            f(&fields);
+const FRONT: usize = 64;
+const BACK: usize = 192;
+/// Index entries past the last separator that are safe to read (look-ahead).
+pub const SLACK: usize = 512;
+
+pub struct Reader {
+    buf: Vec<u8>,
+    cap: usize,
+    idx: Vec<u32>,
+    nlp: Vec<u32>,
+    bad: Vec<u32>,
+    nsep: usize,
+    nnl: usize,
+    start: usize,
+}
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], pos: u64) -> usize {
+    use std::os::unix::fs::FileExt;
+    loop {
+        match f.read_at(buf, pos) {
+            Ok(n) => return n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read: {e}"),
         }
     }
 }
 
+#[cfg(not(unix))]
+fn read_at(f: &File, buf: &mut [u8], pos: u64) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = f;
+    f.seek(SeekFrom::Start(pos)).expect("seek");
+    f.read(buf).expect("read")
+}
+
+impl Reader {
+    pub fn new(cap: usize) -> Reader {
+        let cap = cap.max(64);
+        Reader {
+            buf: vec![0u8; FRONT + cap + BACK],
+            cap,
+            idx: vec![0u32; cap + SLACK],
+            nlp: vec![0u32; cap + 8],
+            bad: vec![0u32; cap + 72],
+            nsep: 0,
+            nnl: 0,
+            start: 0,
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let cap = self.cap * 2;
+        self.buf.resize(FRONT + cap + BACK, 0);
+        self.idx.resize(cap + SLACK, 0);
+        self.nlp.resize(cap + 8, 0);
+        self.bad.resize(cap + 72, 0);
+        self.cap = cap;
+    }
+
+    /// The current batch of lines starts at `data()`; field positions index into it.
+    #[inline(always)]
+    pub fn data(&self) -> *const u8 {
+        unsafe { self.buf.as_ptr().add(FRONT) }
+    }
+
+    /// Feeds the lines of `f` that start in the byte range `[a, b)` (after the
+    /// header line when `a == 0`) to `go`, a batch of whole lines at a time. A line
+    /// that starts before `b` is read to its end; one that starts before `a` belongs
+    /// to the previous range. A final line without a newline counts.
+    pub fn run(&mut self, f: &File, a: u64, b: u64, mut go: impl FnMut(&Reader)) {
+        let mut pos = a.saturating_sub(1);
+        let mut boff = pos;
+        let mut fill = 0usize;
+        let mut start = 0usize;
+        let mut skipping = true;
+        loop {
+            if fill == self.cap {
+                self.grow();
+            }
+            let cap = self.cap;
+            let got = read_at(f, &mut self.buf[FRONT + fill..FRONT + cap], pos);
+            pos += got as u64;
+            fill += got;
+            let eof = got == 0;
+            if skipping {
+                // Skip through the first newline: the header, or the end of a line
+                // that started in the previous range.
+                match memchr(b'\n', &self.buf[FRONT..FRONT + fill]) {
+                    Some(q) => {
+                        start = q + 1;
+                        skipping = false;
+                    }
+                    None => {
+                        boff += fill as u64;
+                        fill = 0;
+                        if eof || boff >= b {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if boff + start as u64 >= b {
+                return;
+            }
+            let mut n = match memrchr(b'\n', &self.buf[FRONT + start..FRONT + fill]) {
+                Some(k) => start + k + 1,
+                None => start,
+            };
+            let mut done = false;
+            if eof {
+                if fill > n {
+                    self.buf[FRONT + fill] = b'\n';
+                    fill += 1;
+                    n = fill;
+                }
+                done = true;
+            } else if n == start {
+                continue; // no whole line yet: read more (growing the buffer if full)
+            }
+            if boff + n as u64 > b {
+                // Stop at the first newline at or after file position b - 1.
+                let from = (b - 1 - boff) as usize;
+                n = from + memchr(b'\n', &self.buf[FRONT + from..FRONT + n]).unwrap() + 1;
+                done = true;
+            }
+            if n > start {
+                unsafe { self.index(start, n) };
+                go(self);
+            }
+            if done {
+                return;
+            }
+            self.buf.copy_within(FRONT + n..FRONT + fill, FRONT);
+            boff += n as u64;
+            fill -= n;
+            start = 0;
+        }
+    }
+
+    /// Stage 1 over `data[start..n]`, which starts at a line start and ends with a newline.
+    #[inline(never)]
+    unsafe fn index(&mut self, start: usize, n: usize) {
+        let d = self.buf.as_ptr().add(FRONT);
+        let idx = self.idx.as_mut_ptr();
+        let nlp = self.nlp.as_mut_ptr();
+        let (mut ns, mut nn, mut nb) = (0usize, 0usize, 0usize);
+        let masks = |o: usize| -> (u64, u64, u64) {
+            let (c, nl, q) = classify(d.add(o));
+            if n - o >= 64 {
+                (c, nl, q)
+            } else {
+                let v = (1u64 << (n - o)) - 1;
+                (c & v, nl & v, q & v)
+            }
+        };
+        let mut o = start;
+        let mut cur = masks(o);
+        // Carries between blocks: the bit that falls off the top of each mask.
+        let (mut s_top, mut q_top, mut cl_top, mut carry) = (1u64, 0u64, 0u64, 0u64);
+        loop {
+            let next = if o + 64 < n { masks(o + 64) } else { (0, 0, 0) };
+            let (c, nl, q) = cur;
+            let s = c | nl;
+            // A quote may only open a field (right after a separator) or close one
+            // (right before a separator), and a field has both or neither.
+            let open = q & ((s << 1) | s_top);
+            let close = q & ((s >> 1) | ((next.0 | next.1) << 63));
+            // Carry each opening quote up to the separator that ends its field.
+            let (x, c1) = (!s).overflowing_add(open);
+            let (x, c2) = x.overflowing_add(carry);
+            carry = (c1 | c2) as u64;
+            let ends_open = x & s;
+            let after_close = (close << 1) | cl_top;
+            let after_quote = (q << 1) | q_top;
+            let badm = (q & !(open | close)) | (open & close) | (ends_open & !after_quote) | (after_close & !ends_open);
+            s_top = s >> 63;
+            q_top = q >> 63;
+            cl_top = close >> 63;
+            if badm != 0 {
+                let mut m = badm;
+                while m != 0 {
+                    *self.bad.as_mut_ptr().add(nb) = (o as u32) + m.trailing_zeros();
+                    nb += 1;
+                    m &= m - 1;
+                }
+            }
+            // Flatten separator positions, eight at a time.
+            {
+                let cnt = s.count_ones() as usize;
+                let out = idx.add(ns);
+                let mut m = s;
+                let base = o as u32;
+                for i in 0..8 {
+                    *out.add(i) = base + m.trailing_zeros();
+                    m &= m.wrapping_sub(1);
+                }
+                if cnt > 8 {
+                    for i in 8..16 {
+                        *out.add(i) = base + m.trailing_zeros();
+                        m &= m.wrapping_sub(1);
+                    }
+                    let mut i = 16;
+                    while m != 0 {
+                        *out.add(i) = base + m.trailing_zeros();
+                        m &= m - 1;
+                        i += 1;
+                    }
+                }
+                ns += cnt;
+            }
+            {
+                let cnt = nl.count_ones() as usize;
+                let out = nlp.add(nn);
+                let base = o as u32;
+                let mut m = nl;
+                *out = base + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+                *out.add(1) = base + m.trailing_zeros();
+                if cnt > 2 {
+                    m &= m - 1;
+                    let mut i = 2;
+                    while m != 0 {
+                        *out.add(i) = base + m.trailing_zeros();
+                        m &= m - 1;
+                        i += 1;
+                    }
+                }
+                nn += cnt;
+            }
+            o += 64;
+            if o >= n {
+                break;
+            }
+            cur = next;
+        }
+        // Sentinels: `n` is past every real position and safe to read from.
+        for i in 0..SLACK {
+            *idx.add(ns + i) = n as u32;
+        }
+        *self.bad.as_mut_ptr().add(nb) = u32::MAX;
+        self.nsep = ns;
+        self.nnl = nn;
+        self.start = start;
+    }
+
+    /// Stage 2: calls `f(ip, ls)` for each line of the batch that has exactly `N`
+    /// separators (N - 1 commas and its newline) and well-formed quotes. `ls` is the
+    /// line's start and `ip` points at its separator positions; `ip[N..]` are the
+    /// following lines' (or `n`, a safe position, past the end).
+    #[inline(always)]
+    pub unsafe fn lines<const N: usize>(&self, mut f: impl FnMut(*const u32, usize)) {
+        let idx = self.idx.as_ptr();
+        let nlp = self.nlp.as_ptr();
+        let bad = self.bad.as_ptr();
+        let mut b = 0usize;
+        let mut bi = 0usize;
+        let mut ls = self.start;
+        for k in 0..self.nnl {
+            let le = *nlp.add(k);
+            let isbad = *bad.add(bi) <= le;
+            if *idx.add(b + N - 1) == le {
+                if !isbad {
+                    f(idx.add(b), ls);
+                }
+                b += N;
+            } else {
+                while *idx.add(b) != le {
+                    b += 1;
+                }
+                b += 1;
+            }
+            if isbad {
+                while *bad.add(bi) <= le {
+                    bi += 1;
+                }
+            }
+            ls = le as usize + 1;
+        }
+    }
+}
+
+/// The field `[s, e)` without its quotes, on a line whose quotes are well-formed.
+#[inline(always)]
+pub unsafe fn unquote(d: *const u8, s: usize, e: usize) -> (usize, usize) {
+    let q = (*d.add(s) == b'"') as usize;
+    (s + q, e - q)
+}
 
 #[cfg(test)]
 mod tests {
-    /// The byte-loop splitter applied line by line: the plain reading of the dialect.
-    fn by_lines<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+    use super::*;
+
+    /// The byte-loop splitter applied line by line to everything after the header:
+    /// the plain reading of the dialect.
+    fn by_lines<const N: usize>(d: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        let mut s = 0;
+        let mut s = match d.iter().position(|&c| c == b'\n') {
+            Some(k) => k + 1,
+            None => return out,
+        };
         while s < d.len() {
             let e = d[s..].iter().position(|&c| c == b'\n').map_or(d.len(), |k| s + k);
-            let mut g: [&'static [u8]; N] = [&[]; N];
+            let mut g: [&[u8]; N] = [&[]; N];
             if crate::split::<N>(&d[s..e], &mut g) {
                 out.push(g.iter().map(|x| x.to_vec()).collect());
             }
@@ -164,14 +395,36 @@ mod tests {
         out
     }
 
-    fn simd<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+    /// The same through the reader, with the file cut into byte ranges at `cuts`.
+    fn via_reader<const N: usize>(f: &File, len: u64, cuts: &[u64], cap: usize) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        super::for_records::<N>(d, |f: &[&'static [u8]; N]| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        let mut rd = Reader::new(cap);
+        let mut a = 0;
+        for &b in cuts.iter().chain(std::iter::once(&len)) {
+            if b > a {
+                rd.run(f, a, b, |rd| unsafe {
+                    let d = rd.data();
+                    rd.lines::<N>(|ip, ls| {
+                        let mut s = ls;
+                        let mut row = Vec::new();
+                        for j in 0..N {
+                            let e = *ip.add(j) as usize;
+                            let (fs, fe) = unquote(d, s, e);
+                            row.push(std::slice::from_raw_parts(d.add(fs), fe - fs).to_vec());
+                            s = e + 1;
+                        }
+                        out.push(row);
+                    });
+                });
+                a = b;
+            }
+        }
         out
     }
 
     #[test]
-    fn simd_scanner_matches_byte_loop() {
+    fn reader_matches_byte_loop() {
+        use std::io::Write;
         let mut x: u64 = 88172645463325252;
         let mut rnd = move |m: u64| {
             x ^= x << 13;
@@ -179,11 +432,18 @@ mod tests {
             x ^= x << 17;
             x % m
         };
-        for round in 0..30000 {
+        let path = std::env::temp_dir().join(format!("ss-scan-test-{}", std::process::id()));
+        for round in 0..20000 {
             let mut v = Vec::new();
+            // A header line (sometimes missing its newline, sometimes absent).
+            match rnd(12) {
+                0 => {}
+                1 => v.extend_from_slice(b"a,b"),
+                _ => v.extend_from_slice(b"a,b,c\n"),
+            }
             if round % 2 == 0 {
                 // Random bytes heavy in separators and quotes.
-                let len = rnd(300) as usize;
+                let len = rnd(400) as usize;
                 for _ in 0..len {
                     let r = rnd(100);
                     v.push(match r {
@@ -197,13 +457,14 @@ mod tests {
                 }
             } else {
                 // Structured lines: fields, some quoted, some broken.
-                let lines = rnd(12);
+                let lines = rnd(14);
+                let width = [2usize, 4, 7][rnd(3) as usize];
                 for _ in 0..lines {
                     let pick = rnd(10);
                     let nf = match pick {
                         0 => rnd(9) as usize,
                         1 => 0,
-                        _ => 7,
+                        _ => width,
                     };
                     for k in 0..nf {
                         if k > 0 {
@@ -231,69 +492,17 @@ mod tests {
                     }
                 }
             }
-            let d: &'static [u8] = Box::leak(v.into_boxed_slice());
-            assert_eq!(simd::<2>(d), by_lines::<2>(d), "{:?}", String::from_utf8_lossy(d));
-            assert_eq!(simd::<4>(d), by_lines::<4>(d), "{:?}", String::from_utf8_lossy(d));
-            assert_eq!(simd::<7>(d), by_lines::<7>(d), "{:?}", String::from_utf8_lossy(d));
+            std::fs::File::create(&path).unwrap().write_all(&v).unwrap();
+            let f = File::open(&path).unwrap();
+            let len = v.len() as u64;
+            let mut cuts: Vec<u64> = (0..rnd(5)).map(|_| rnd(len + 1)).collect();
+            cuts.sort();
+            let cap = [64usize, 128, 4096][rnd(3) as usize];
+            let shown = String::from_utf8_lossy(&v).into_owned();
+            assert_eq!(via_reader::<2>(&f, len, &cuts, cap), by_lines::<2>(&v), "{shown:?} cuts {cuts:?} cap {cap}");
+            assert_eq!(via_reader::<4>(&f, len, &cuts, cap), by_lines::<4>(&v), "{shown:?} cuts {cuts:?} cap {cap}");
+            assert_eq!(via_reader::<7>(&f, len, &cuts, cap), by_lines::<7>(&v), "{shown:?} cuts {cuts:?} cap {cap}");
         }
-    }
-}
-
-#[cfg(test)]
-mod bench {
-    #[test]
-    #[ignore]
-    fn bench_scan() {
-        let files: Vec<&'static [u8]> = std::fs::read_dir("data/p20/events")
-            .unwrap()
-            .take(8)
-            .map(|e| &*Box::leak(std::fs::read(e.unwrap().path()).unwrap().into_boxed_slice()))
-            .collect();
-        let bytes: usize = files.iter().map(|d| d.len()).sum();
-        for _ in 0..2 {
-            let t0 = std::time::Instant::now();
-            let mut acc = 0u64;
-            for d in &files {
-                let mut o = 0;
-                while o + 64 <= d.len() {
-                    let (c, l, q) = unsafe { super::classify(d.as_ptr().add(o)) };
-                    acc = acc.wrapping_add((c | l).count_ones() as u64 + q.count_ones() as u64);
-                    o += 64;
-                }
-            }
-            eprintln!("classify only: {:.3} ns/byte acc {acc}", t0.elapsed().as_nanos() as f64 / bytes as f64);
-            let t0 = std::time::Instant::now();
-            let mut acc = 0u64;
-            for d in &files {
-                let mut o = 0;
-                while o + 64 <= d.len() {
-                    let (c, l, _q) = unsafe { super::classify(d.as_ptr().add(o)) };
-                    let mut m = c | l;
-                    while m != 0 {
-                        acc = acc.wrapping_add(o as u64 + m.trailing_zeros() as u64);
-                        m &= m - 1;
-                    }
-                    o += 64;
-                }
-            }
-            eprintln!("classify + bit loop: {:.3} ns/byte acc {acc}", t0.elapsed().as_nanos() as f64 / bytes as f64);
-        }
-        for round in 0..6 {
-            let t0 = std::time::Instant::now();
-            let mut n = 0usize;
-            let mut acc = 0usize;
-            for d in &files {
-                super::for_records::<7>(d, |f| {
-                    n += 1;
-                    acc = acc.wrapping_add(f[2].len() + f[6].len());
-                });
-            }
-            let dt = t0.elapsed();
-            eprintln!(
-                "round {round}: {n} lines {:.3} ns/byte {:.1} ns/line acc {acc}",
-                dt.as_nanos() as f64 / bytes as f64,
-                dt.as_nanos() as f64 / n as f64
-            );
-        }
+        let _ = std::fs::remove_file(&path);
     }
 }
