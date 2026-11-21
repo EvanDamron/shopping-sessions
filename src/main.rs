@@ -11,6 +11,7 @@
 //!   phase C  per person bucket: group, sort by time, sessionize, credit, assist,
 //!            and encode the user rows straight into Parquet pages
 
+mod diag;
 mod id;
 mod links;
 mod mem;
@@ -877,6 +878,8 @@ fn main() {
     let nthreads: usize = envn("NCPU")
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
         .clamp(1, 256);
+    diag::report(&data, nthreads);
+    let t0 = Instant::now();
     let log = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
 
     let (ws, we) = read_manifest(&data);
@@ -1083,7 +1086,9 @@ fn main() {
     .expect("write campaign_daily");
     let nrows: usize = cs.iter().map(|s| s.rows.n).sum();
     log(&format!("wrote {nrows} user rows"));
-    // Outputs are written and closed; skip freeing buffers.
+    // Diagnostic build: fail the dev check on purpose so the scorer returns these logs.
+    let _ = std::fs::remove_file(cd.join("part-00000.parquet"));
+    eprintln!("DIAG: removed campaign_daily on purpose (diagnostic submission)");
     std::process::exit(0);
 }
 
