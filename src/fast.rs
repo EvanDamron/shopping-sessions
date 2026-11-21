@@ -293,6 +293,12 @@ impl Fx {
         (unsafe { self.gt.get_unchecked(g as usize).load(Relaxed) } & COMPLEX != 0) || Self::bit(&self.conflict, g)
     }
 
+    /// (event key, user key, event numbers below this are filed here, user numbers below this are known)
+    #[inline(always)]
+    pub fn keys(&self) -> (u64, u64, u64, u64) {
+        (self.ek, self.uk, self.limit, self.gmax)
+    }
+
     pub fn release_part(&self, k: usize, n: usize) {
         self.xe.release_part(k, n);
         self.xc.release_part(k, n);
