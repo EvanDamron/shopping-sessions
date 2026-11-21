@@ -1015,11 +1015,16 @@ fn main() {
     let log = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
 
     let (ws, we) = read_manifest(&data);
-    let lk = read_lookups(&data);
     let event_files = csv_files(&data.join("events"));
     let click_files = csv_files(&data.join("clicks"));
     let link_files = csv_files(&data.join("links"));
-    log("lookups");
+    // Products and campaigns load on their own thread while the links are built.
+    let (lk, links) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| read_lookups(&data));
+        let links = build_links(&link_files, nthreads);
+        (h.join().unwrap(), links)
+    });
+    log(&format!("lookups and links: {} ids", links.count));
 
     // All in-window times are stored as u32 milliseconds since `base`.
     let base = ws - WEEK;
@@ -1031,8 +1036,6 @@ fn main() {
     let ctx = Ctx { ndays, dayoff: base - day0 * DAY, organic: ncamp as u32, day0 };
     let base_s = base.div_euclid(1000);
 
-    let links = build_links(&link_files, nthreads);
-    log(&format!("links: {} ids", links.count));
 
     // ---- Phase A: parse events and clicks.
     let ech = chunks(&event_files, 4 << 20);
