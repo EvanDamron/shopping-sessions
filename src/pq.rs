@@ -274,3 +274,265 @@ pub fn write(path: &std::path::Path, names: &[&str], cols: &[Col]) -> std::io::R
         .collect();
     write_raw(path, names, &raw, nrows)
 }
+
+// ---------------------------------------------------------------------------
+// user_daily with dictionary encoding: every column but revenue_cents is written as
+// a PLAIN dictionary page plus an RLE_DICTIONARY data page (index bit width byte,
+// then the RLE/bit-packed hybrid). Rows of one person are consecutive, so user_id
+// indices are one RLE run per person.
+
+/// One thread's user_daily rows, in the form the encoder wants.
+#[derive(Default)]
+pub struct UserRows {
+    pub n: usize,
+    pub dict: Vec<u8>, // PLAIN names, one per person
+    pub ndict: usize,
+    pub runs: Vec<u32>, // rows per person, in order
+    pub days: Vec<i32>,
+    pub sessions: Vec<i32>,
+    pub events: Vec<i32>,
+    pub revenue: Vec<i64>,
+    pub top_bits: Vec<u8>, // one bit per row, 1 = top_category present
+    pub tops: Vec<u16>,    // category index of each present row
+}
+
+const ENC_PLAIN: i32 = 0;
+const ENC_RLE: i32 = 3;
+const ENC_RLE_DICT: i32 = 8;
+
+fn bits_for(max: u64) -> u32 {
+    (64 - max.leading_zeros()).max(1)
+}
+
+fn uleb(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// RLE/bit-packed hybrid as one bit-packed run of `vals` at `bw` bits (LSB first).
+fn bitpacked(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, bw: u32) {
+    let groups = n.div_ceil(8);
+    uleb(out, ((groups as u64) << 1) | 1);
+    let start = out.len();
+    out.resize(start + groups * bw as usize, 0);
+    let buf = &mut out[start..];
+    let (mut acc, mut nbits, mut at) = (0u64, 0u32, 0usize);
+    for v in vals.take(n) {
+        acc |= (v as u64) << nbits;
+        nbits += bw;
+        while nbits >= 8 {
+            buf[at] = acc as u8;
+            at += 1;
+            acc >>= 8;
+            nbits -= 8;
+        }
+    }
+    if nbits > 0 {
+        buf[at] = acc as u8;
+    }
+}
+
+/// RLE/bit-packed hybrid as RLE runs: run i repeats value i, `runs[i]` times.
+fn rle_counting(out: &mut Vec<u8>, runs: &[u32], bw: u32) {
+    let vb = bw.div_ceil(8) as usize;
+    for (i, &len) in runs.iter().enumerate() {
+        uleb(out, (len as u64) << 1);
+        out.extend_from_slice(&(i as u64).to_le_bytes()[..vb]);
+    }
+}
+
+struct Chunk {
+    ty: i32,
+    dict_off: Option<usize>,
+    data_off: usize,
+    size: usize,
+    dict_enc: bool,
+}
+
+fn page_header(kind: i32, len: usize, nvals: usize, data_enc: i32) -> Vec<u8> {
+    let mut h = Thrift::new();
+    h.i32(1, kind);
+    h.i32(2, len as i32);
+    h.i32(3, len as i32);
+    if kind == 2 {
+        h.begin_struct(7); // DictionaryPageHeader
+        h.i32(1, nvals as i32);
+        h.i32(2, ENC_PLAIN);
+        h.end_struct();
+    } else {
+        h.begin_struct(5); // DataPageHeader
+        h.i32(1, nvals as i32);
+        h.i32(2, data_enc);
+        h.i32(3, ENC_RLE);
+        h.i32(4, ENC_RLE);
+        h.end_struct();
+    }
+    h.buf.push(0);
+    h.buf
+}
+
+/// Writes one thread's user_daily rows. `cats` are the category names by index.
+pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std::io::Result<()> {
+    let names = ["user_id", "day", "sessions", "events", "revenue_cents", "top_category"];
+    let n = r.n;
+    let mut out: Vec<u8> = Vec::with_capacity(r.dict.len() + n * 12 + 4096);
+    out.extend_from_slice(b"PAR1");
+    let mut chunks: Vec<Chunk> = Vec::new();
+    // Appends [dictionary page] + data page; returns the chunk.
+    let mut put = |out: &mut Vec<u8>, ty: i32, dict: Option<(&[u8], usize)>, data: &[u8], data_enc: i32| {
+        let dict_off = dict.map(|(d, nd)| {
+            let off = out.len();
+            out.extend_from_slice(&page_header(2, d.len(), nd, 0));
+            out.extend_from_slice(d);
+            off
+        });
+        let data_off = out.len();
+        out.extend_from_slice(&page_header(0, data.len(), n, data_enc));
+        out.extend_from_slice(data);
+        let start = dict_off.unwrap_or(data_off);
+        chunks.push(Chunk { ty, dict_off, data_off, size: out.len() - start, dict_enc: dict.is_some() });
+    };
+    if n > 0 {
+        // user_id
+        let bw = bits_for(r.ndict.saturating_sub(1) as u64);
+        let mut d = vec![bw as u8];
+        rle_counting(&mut d, &r.runs, bw);
+        put(&mut out, TYPE_BYTE_ARRAY, Some((&r.dict, r.ndict)), &d, ENC_RLE_DICT);
+        // day: dictionary [min..=max]
+        let (dmin, dmax) = r.days.iter().fold((i32::MAX, i32::MIN), |a, &x| (a.0.min(x), a.1.max(x)));
+        let mut dict = Vec::new();
+        for x in dmin..=dmax {
+            dict.extend_from_slice(&x.to_le_bytes());
+        }
+        let bw = bits_for((dmax - dmin) as u64);
+        let mut d = vec![bw as u8];
+        bitpacked(&mut d, r.days.iter().map(|&x| (x - dmin) as u32), n, bw);
+        put(&mut out, TYPE_INT32, Some((&dict, (dmax - dmin + 1) as usize)), &d, ENC_RLE_DICT);
+        // sessions, events: dictionary [0..=max] when small, else PLAIN
+        for col in [&r.sessions, &r.events] {
+            let max = col.iter().copied().max().unwrap_or(0).max(0) as u64;
+            if max < (1 << 16) && col.iter().all(|&x| x >= 0) {
+                let mut dict = Vec::with_capacity((max as usize + 1) * 4);
+                for x in 0..=max as i32 {
+                    dict.extend_from_slice(&x.to_le_bytes());
+                }
+                let bw = bits_for(max);
+                let mut d = vec![bw as u8];
+                bitpacked(&mut d, col.iter().map(|&x| x as u32), n, bw);
+                put(&mut out, TYPE_INT32, Some((&dict, max as usize + 1)), &d, ENC_RLE_DICT);
+            } else {
+                let mut d = Vec::with_capacity(n * 4);
+                for &x in col.iter() {
+                    d.extend_from_slice(&x.to_le_bytes());
+                }
+                put(&mut out, TYPE_INT32, None, &d, ENC_PLAIN);
+            }
+        }
+        // revenue_cents: PLAIN
+        let mut d = Vec::with_capacity(n * 8);
+        for &x in &r.revenue {
+            d.extend_from_slice(&x.to_le_bytes());
+        }
+        put(&mut out, TYPE_INT64, None, &d, ENC_PLAIN);
+        // top_category: definition levels, then dictionary indices of present rows
+        let mut dict = Vec::new();
+        for c in cats {
+            dict.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            dict.extend_from_slice(c);
+        }
+        let groups = n.div_ceil(8);
+        let mut lv = Vec::new();
+        uleb(&mut lv, ((groups as u64) << 1) | 1);
+        lv.extend_from_slice(&r.top_bits[..groups]);
+        let mut d = Vec::new();
+        d.extend_from_slice(&(lv.len() as u32).to_le_bytes());
+        d.extend_from_slice(&lv);
+        let bw = bits_for(cats.len().saturating_sub(1) as u64);
+        d.push(bw as u8);
+        bitpacked(&mut d, r.tops.iter().map(|&x| x as u32), r.tops.len(), bw);
+        put(&mut out, TYPE_BYTE_ARRAY, Some((&dict, cats.len())), &d, ENC_RLE_DICT);
+    }
+    // FileMetaData
+    let mut m = Thrift::new();
+    m.i32(1, 1);
+    m.list(2, T_STRUCT, names.len() + 1);
+    m.begin_list_elem_struct();
+    m.bin(4, b"schema");
+    m.i32(5, names.len() as i32);
+    m.end_struct();
+    let schema: [(i32, i32, i32, i16); 6] = [
+        (TYPE_BYTE_ARRAY, 0, 0, 1),
+        (TYPE_INT32, 0, 6, 6),
+        (TYPE_INT32, 0, -1, 0),
+        (TYPE_INT32, 0, -1, 0),
+        (TYPE_INT64, 0, -1, 0),
+        (TYPE_BYTE_ARRAY, 1, 0, 1),
+    ];
+    for (&(ty, rep, conv, logical), name) in schema.iter().zip(names) {
+        m.begin_list_elem_struct();
+        m.i32(1, ty);
+        m.i32(3, rep);
+        m.bin(4, name.as_bytes());
+        if conv >= 0 {
+            m.i32(6, conv);
+        }
+        if logical > 0 {
+            m.begin_struct(10);
+            m.begin_struct(logical);
+            m.end_struct();
+            m.end_struct();
+        }
+        m.end_struct();
+    }
+    m.i64(3, n as i64);
+    if n == 0 {
+        m.list(4, T_STRUCT, 0);
+    } else {
+        m.list(4, T_STRUCT, 1);
+        m.begin_list_elem_struct(); // RowGroup
+        m.list(1, T_STRUCT, chunks.len());
+        let total: usize = chunks.iter().map(|c| c.size).sum();
+        for (c, name) in chunks.iter().zip(names) {
+            m.begin_list_elem_struct(); // ColumnChunk
+            m.i64(2, c.dict_off.unwrap_or(c.data_off) as i64);
+            m.begin_struct(3); // ColumnMetaData
+            m.i32(1, c.ty);
+            if c.dict_enc {
+                m.list(2, T_I32, 3);
+                m.zigzag(ENC_PLAIN as i64);
+                m.zigzag(ENC_RLE as i64);
+                m.zigzag(ENC_RLE_DICT as i64);
+            } else {
+                m.list(2, T_I32, 2);
+                m.zigzag(ENC_PLAIN as i64);
+                m.zigzag(ENC_RLE as i64);
+            }
+            m.list(3, T_BINARY, 1);
+            m.varint(name.len() as u64);
+            m.buf.extend_from_slice(name.as_bytes());
+            m.i32(4, 0); // UNCOMPRESSED
+            m.i64(5, n as i64);
+            m.i64(6, c.size as i64);
+            m.i64(7, c.size as i64);
+            m.i64(9, c.data_off as i64);
+            if let Some(d) = c.dict_off {
+                m.i64(11, d as i64);
+            }
+            m.end_struct();
+            m.end_struct();
+        }
+        m.i64(2, total as i64);
+        m.i64(3, n as i64);
+        m.end_struct();
+    }
+    m.bin(6, b"sessions");
+    m.buf.push(0);
+    let mlen = m.buf.len() as u32;
+    out.extend_from_slice(&m.buf);
+    out.extend_from_slice(&mlen.to_le_bytes());
+    out.extend_from_slice(b"PAR1");
+    std::fs::File::create(path)?.write_all(&out)
+}
