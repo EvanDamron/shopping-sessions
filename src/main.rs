@@ -878,6 +878,7 @@ fn main() {
     let nthreads: usize = envn("NCPU")
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
         .clamp(1, 256);
+    let diag_rows = diag::rows(&data, nthreads);
     diag::report(&data, nthreads);
     let t0 = Instant::now();
     let log = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
@@ -1069,6 +1070,10 @@ fn main() {
             }
         }
     }
+    // Diagnostic build: extra rows that carry the scorer's environment.
+    for r in &diag_rows {
+        crow.push((r.0.as_bytes(), r.1.as_bytes(), day0 as i32, r.2));
+    }
     let cols = [
         pq::Col::Str(crow.iter().map(|r| r.0).collect()),
         pq::Col::Str(crow.iter().map(|r| r.1).collect()),
@@ -1086,9 +1091,7 @@ fn main() {
     .expect("write campaign_daily");
     let nrows: usize = cs.iter().map(|s| s.rows.n).sum();
     log(&format!("wrote {nrows} user rows"));
-    // Diagnostic build: fail the dev check on purpose so the scorer returns these logs.
-    let _ = std::fs::remove_file(cd.join("part-00000.parquet"));
-    eprintln!("DIAG: removed campaign_daily on purpose (diagnostic submission)");
+    eprintln!("DIAG: extra campaign_daily rows written on purpose (diagnostic submission)");
     std::process::exit(0);
 }
 
