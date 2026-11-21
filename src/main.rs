@@ -1240,6 +1240,21 @@ fn phase_a<'a>(
 
 fn main() {
     let t0 = Instant::now();
+    // Large malloc allocations (row columns, pass buffers) go on transparent huge pages
+    // when the machine has plenty of free 2 MB blocks, where they halve the page faults;
+    // with few, the kernel would stall compacting memory instead. glibc reads the tunable
+    // only at start, so the process restarts itself once with it set.
+    if std::env::var_os("GLIBC_TUNABLES").is_none()
+        && std::env::var("SS_HUGE").map_or(true, |v| v != "0")
+        && mem::free_huge_bytes().is_some_and(|f| f >= 8 << 30)
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure; then carry on without the tunable.
+        let _ = std::process::Command::new("/proc/self/exe")
+            .args(std::env::args_os().skip(1))
+            .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1")
+            .exec();
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
