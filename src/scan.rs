@@ -153,6 +153,18 @@ impl Reader {
     /// that starts before `b` is read to its end; one that starts before `a` belongs
     /// to the previous range. A final line without a newline counts.
     pub fn run(&mut self, f: &File, a: u64, b: u64, mut go: impl FnMut(&Reader)) {
+        self.feed(f, a, b, true, |rd, _, _| go(rd));
+    }
+
+    /// As `run`, without the separator index: `go(data, start, end)` gets each batch
+    /// of whole lines as `data[start..end]`, with 64 readable bytes before it and
+    /// 192 after it.
+    pub fn run_raw(&mut self, f: &File, a: u64, b: u64, mut go: impl FnMut(*const u8, usize, usize)) {
+        self.feed(f, a, b, false, |rd, s, n| go(rd.data(), s, n));
+    }
+
+    #[inline(always)]
+    fn feed(&mut self, f: &File, a: u64, b: u64, index: bool, mut go: impl FnMut(&Reader, usize, usize)) {
         let mut pos = a.saturating_sub(1);
         let mut boff = pos;
         let mut fill = 0usize;
@@ -210,8 +222,10 @@ impl Reader {
                 done = true;
             }
             if n > start {
-                unsafe { self.index(start, n) };
-                go(self);
+                if index {
+                    unsafe { self.index(start, n) };
+                }
+                go(self, start, n);
             }
             if done {
                 return;

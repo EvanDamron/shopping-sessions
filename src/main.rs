@@ -11,6 +11,9 @@
 //!   phase C  per person bucket: group, sort by time, sessionize, credit, assist,
 //!            and encode the user rows straight into Parquet pages
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod dec;
+mod fast;
 mod id;
 mod links;
 mod mem;
@@ -347,6 +350,10 @@ struct Shared<'a> {
     ev: mem::Arena, // event records, addressed by slot
     dk: mem::Arena, // dedup keys
     ck: mem::Arena, // click records
+    fx: Option<fast::Fx>, // the index-order fast path (fast.rs), when the data's IDs allow it
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    dec: Option<Box<dec::Dec>>, // the per-line decoder's tables (dec.rs), with the fast path
+    deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
 }
 
 /// Per bucket: records so far, and where the current chunk starts.
@@ -370,10 +377,23 @@ struct Worker {
     ccur: Vec<usize>,
     cchunks: Vec<Vec<usize>>,
     added: u32, // user IDs this thread has added to the table and not yet reported
+    // Fast path (fast.rs): events by event-number bucket, clicks by user-number bucket.
+    xcnt: Vec<u32>,
+    xwc: Vec<fast::WcX>,
+    xcur: Vec<usize>,
+    xchunks: Vec<Vec<usize>>,
+    xccnt: Vec<u32>,
+    xcwc: Vec<WcC>,
+    xccur: Vec<usize>,
+    xcchunks: Vec<Vec<usize>>,
+    xdone: bool,    // the fast path's buffers have been written out
+    odd: Vec<fast::OddEv>, // event lines whose event ID has no number
+    nodd: u64,      // lines whose IDs took the general path
+    ncold: u64,     // event lines the per-line decoder handed to the plain reading
 }
 
 impl Worker {
-    fn new(pb: usize, db: usize) -> Worker {
+    fn new(pb: usize, db: usize, nb: usize, nxc: usize) -> Worker {
         Worker {
             pfill: vec![Fill::default(); pb],
             pwc: vec![WcE([0; 48]); pb],
@@ -387,6 +407,56 @@ impl Worker {
             ccur: vec![0; pb],
             cchunks: (0..pb).map(|_| Vec::new()).collect(),
             added: 0,
+            xcnt: vec![0; nb],
+            xwc: vec![fast::WcX([0; 24]); nb],
+            xcur: vec![0; nb],
+            xchunks: (0..nb).map(|_| Vec::new()).collect(),
+            xccnt: vec![0; nxc],
+            xcwc: vec![WcC([0; 32]); nxc],
+            xccur: vec![0; nxc],
+            xcchunks: (0..nxc).map(|_| Vec::new()).collect(),
+            xdone: false,
+            odd: Vec::new(),
+            nodd: 0,
+            ncold: 0,
+        }
+    }
+
+    /// Files an event under event-number bucket `b` (fast path).
+    #[inline(always)]
+    unsafe fn push_x(&mut self, fx: &fast::Fx, b: usize, r: fast::XRec) {
+        let n = *self.xcnt.get_unchecked(b);
+        let off = n as usize & (fast::XCH - 1);
+        if off == 0 {
+            let c = fx.xe.alloc(fast::XCH * fast::XREC) as usize;
+            *self.xcur.get_unchecked_mut(b) = c;
+            self.xchunks.get_unchecked_mut(b).push(c);
+        }
+        *self.xcnt.get_unchecked_mut(b) = n + 1;
+        let k = (n & 7) as usize;
+        let w = self.xwc.as_mut_ptr().add(b) as *mut fast::XRec;
+        w.add(k).write(r);
+        if k == 7 {
+            mem::stream((*self.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), w as *const u8, 3);
+        }
+    }
+
+    /// Files a click under user-number bucket `c` (fast path).
+    #[inline(always)]
+    unsafe fn push_xclick(&mut self, fx: &fast::Fx, c: usize, r: CRec) {
+        let n = *self.xccnt.get_unchecked(c);
+        let off = n as usize & (CCH - 1);
+        if off == 0 {
+            let p = fx.xc.alloc(CCH * CREC) as usize;
+            *self.xccur.get_unchecked_mut(c) = p;
+            self.xcchunks.get_unchecked_mut(c).push(p);
+        }
+        *self.xccnt.get_unchecked_mut(c) = n + 1;
+        let k = (n & 7) as usize;
+        let w = self.xcwc.as_mut_ptr().add(c) as *mut CRec;
+        w.add(k).write(r);
+        if k == 7 {
+            mem::stream((*self.xccur.get_unchecked(c) as *mut u8).add((off - 7) * CREC), w as *const u8, 4);
         }
     }
 
@@ -474,6 +544,28 @@ impl Worker {
                 let off = (n - k) & (DCH - 1);
                 let dst = (self.dcur[d] as *mut u8).add(off * 16);
                 std::ptr::copy_nonoverlapping(self.dwc.as_ptr().add(d) as *const u8, dst, k * 16);
+            }
+        }
+        if !self.xdone {
+            // Once only: the fast path rewrites its buckets in place afterwards.
+            self.xdone = true;
+            for b in 0..self.xcnt.len() {
+                let n = self.xcnt[b] as usize;
+                let k = n & 7;
+                if k != 0 {
+                    let off = (n - k) & (fast::XCH - 1);
+                    let dst = (self.xcur[b] as *mut u8).add(off * fast::XREC);
+                    std::ptr::copy_nonoverlapping(self.xwc.as_ptr().add(b) as *const u8, dst, k * fast::XREC);
+                }
+            }
+            for c in 0..self.xccnt.len() {
+                let n = self.xccnt[c] as usize;
+                let k = n & 7;
+                if k != 0 {
+                    let off = (n - k) & (CCH - 1);
+                    let dst = (self.xccur[c] as *mut u8).add(off * CREC);
+                    std::ptr::copy_nonoverlapping(self.xcwc.as_ptr().add(c) as *const u8, dst, k * CREC);
+                }
             }
         }
         mem::stream_done();
@@ -592,6 +684,185 @@ unsafe fn events(sh: &Shared, w: &mut Worker, rd: &Reader) {
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
         let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: t as u32, pc });
         w.push_key(sh, bucket, kid, ((ing_key as u64) << 32) | slot as u64);
+    });
+    if w.added >= 256 {
+        sh.links.added(&mut w.added);
+    }
+}
+
+/// What becomes of one event line with the fast path on.
+enum XOut {
+    /// Nothing: an empty event_id.
+    Drop,
+    /// An event ID of another form than the generator's: kept aside, matched by the ID itself later.
+    Odd(fast::OddEv),
+    /// Filed under its event number.
+    Rec(u64, fast::XRec),
+}
+
+/// One event line with the fast path on, given its seven fields without their
+/// quotes: the same parsing and validation as `events`.
+#[inline(always)]
+unsafe fn event_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u8, f: &[(usize, usize); 7]) -> XOut {
+    let win = &sh.win;
+    let (s0, e0) = f[0];
+    if s0 == e0 {
+        return XOut::Drop; // empty event_id: dropped before dedup
+    }
+    let (s1, e1) = f[1];
+    let (s2, e2) = f[2];
+    let t = win.ts(d, s2, e2);
+    let (s3, e3) = f[3];
+    let (ing_ms, ing_key) = win.ingest(d, s3, e3);
+    let (s4, e4) = f[4];
+    let tw = (d.add(s4) as *const u64).read_unaligned();
+    let tl = e4 - s4;
+    let purchase = (tl == 8) & (tw == PURCHASE);
+    let typed = purchase | ((tl == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
+    let (s5, e5) = f[5];
+    let mut ok = typed
+        & (e1 > s1)
+        & (e5 > s5)
+        & ((t.wrapping_sub(WEEK) as u64) < sh.evspan)
+        & (ing_ms.wrapping_sub(t.wrapping_add(win.base)) <= DAY);
+    let mut pc = 0u32;
+    if purchase & ok {
+        let (s6, e6) = f[6];
+        match parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6)) {
+            Some(p) => pc = p | (sh.lk.products.get(Id::field(d, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24),
+            None => ok = false,
+        }
+    }
+    let idx = fx.event_index(d, s0, e0);
+    let a = if !ok {
+        fast::INVALID
+    } else {
+        let un = fx.user_num(d, s1, e1);
+        if un != fast::NONE {
+            un
+        } else {
+            w.nodd += 1;
+            let uid = Id::field(d, s1, e1);
+            fast::ODDU | sh.links.person(uid, uid.hash(), &mut w.added) as u64
+        }
+    };
+    if idx == fast::NONE {
+        w.nodd += 1;
+        return XOut::Odd(fast::OddEv { key: Id::key(d, s0, e0), ing: ing_key, a, t: t as u32, pc });
+    }
+    let lo = (idx & ((1 << fx.xsh) - 1)) as u32;
+    XOut::Rec(idx, fast::XRec { a, t: t as u32, pc, ing: ing_key, lo })
+}
+
+/// `event_x_decide`, and the line filed accordingly.
+#[inline(always)]
+unsafe fn event_x_fields(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u8, f: &[(usize, usize); 7]) {
+    match event_x_decide(sh, fx, w, d, f) {
+        XOut::Drop => {}
+        XOut::Odd(o) => w.odd.push(o),
+        XOut::Rec(idx, r) => w.push_x(fx, (idx >> fx.xsh) as usize, r),
+    }
+}
+
+/// Phase A for one batch of event lines with the fast path on, through the
+/// separator index (`event_x_fields` for each well-formed line).
+#[inline(never)]
+unsafe fn events_x(sh: &Shared, w: &mut Worker, rd: &Reader) {
+    if sh.links.full.load(Relaxed) {
+        return;
+    }
+    let fx = sh.fx.as_ref().unwrap_unchecked();
+    let d = rd.data();
+    rd.lines::<7>(|ip, ls| {
+        let mut f = [(0usize, 0usize); 7];
+        let mut s = ls;
+        for (k, g) in f.iter_mut().enumerate() {
+            let e = *ip.add(k) as usize;
+            *g = unquote(d, s, e);
+            s = e + 1;
+        }
+        event_x_fields(sh, fx, w, d, &f);
+    });
+    if w.added >= 256 {
+        sh.links.added(&mut w.added);
+    }
+}
+
+/// The seven fields of the line `d[ls..le]` (without its newline), read the plain
+/// way (`split`); None for a malformed line.
+#[allow(dead_code)]
+unsafe fn plain_fields(d: *const u8, ls: usize, le: usize) -> Option<[(usize, usize); 7]> {
+    let line = std::slice::from_raw_parts(d.add(ls), le - ls);
+    let mut g: [&[u8]; 7] = [&[]; 7];
+    if !split::<7>(line, &mut g) {
+        return None;
+    }
+    let mut f = [(0usize, 0usize); 7];
+    for k in 0..7 {
+        let s = g[k].as_ptr() as usize - d as usize;
+        f[k] = (s, s + g[k].len());
+    }
+    Some(f)
+}
+
+/// The line `d[ls..le]` with the fast path on, read the plain way and filed by
+/// `event_x_fields`. The per-line decoder (dec.rs) hands every line it does not
+/// take to this.
+#[allow(dead_code)]
+#[inline(never)]
+unsafe fn event_x_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) {
+    if let Some(f) = plain_fields(d, ls, le) {
+        event_x_fields(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &f);
+    }
+}
+
+/// Test hook (SS_DECCHECK=1): what the plain reading makes of a line the decoder took.
+#[allow(dead_code)]
+#[inline(never)]
+unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<(u64, fast::XRec)> {
+    match event_x_decide(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &plain_fields(d, ls, le)?) {
+        XOut::Rec(idx, r) => Some((idx, r)),
+        _ => None,
+    }
+}
+
+/// Phase A for one batch of click lines with the fast path on: as `clicks`, but a
+/// click whose user ID has the generator's form is filed under its user number.
+#[inline(never)]
+unsafe fn clicks_x(sh: &Shared, w: &mut Worker, rd: &Reader) {
+    if sh.links.full.load(Relaxed) {
+        return;
+    }
+    let fx = sh.fx.as_ref().unwrap_unchecked();
+    let d = rd.data();
+    let win = &sh.win;
+    rd.lines::<4>(|ip, ls| {
+        let (p0, p1, p2, p3) = (*ip as usize, *ip.add(1) as usize, *ip.add(2) as usize, *ip.add(3) as usize);
+        let (s0, e0) = unquote(d, ls, p0);
+        let (s1, e1) = unquote(d, p0 + 1, p1);
+        if s0 == e0 || s1 == e1 {
+            return;
+        }
+        let (s2, e2) = unquote(d, p1 + 1, p2);
+        let camp = match sh.lk.campaigns.get(Id::field(d, s2, e2)) {
+            Some(c) => c,
+            None => return,
+        };
+        let (s3, e3) = unquote(d, p2 + 1, p3);
+        let t = win.ts(d, s3, e3);
+        if t as u64 >= win.span as u64 {
+            return;
+        }
+        let cid = Id::field(d, s0, e0);
+        let un = fx.user_num(d, s1, e1);
+        if un != fast::NONE {
+            let g = un >> 9;
+            w.push_xclick(fx, (g >> fx.cshift) as usize, CRec { who: g as u32, ts: t as u32, camp, _pad: (un & 511) as u32, cid });
+        } else {
+            let uid = Id::field(d, s1, e1);
+            let who = sh.links.person(uid, uid.hash(), &mut w.added);
+            w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid });
+        }
     });
     if w.added >= 256 {
         sh.links.added(&mut w.added);
@@ -786,6 +1057,7 @@ fn make_links(
 fn phase_a<'a>(
     lk: &'a Lookups,
     (links, huge): (Links, bool),
+    fx: Option<fast::Fx>,
     files: &[Vec<(File, u64)>; 3],
     ws: i64,
     we: i64,
@@ -821,16 +1093,33 @@ fn phase_a<'a>(
         ev: mem::Arena::new((ebytes as usize / 34 + (nthreads * pb + 1) * PCH) * PREC, huge, ahead),
         dk: mem::Arena::new(ebytes as usize / 3 + nthreads * db * DCH * 16, huge, ahead),
         ck: mem::Arena::new(cbytes as usize + nthreads * pb * CCH * CREC, huge, ahead),
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64)),
+        deccheck: envn("SS_DECCHECK") == Some(1),
+        fx,
     };
     assert!((ebytes / 34 + ((nthreads * pb + 1) * PCH) as u64) < u32::MAX as u64);
     let mut tasks: Vec<(bool, usize, u64, u64)> = Vec::new();
     tasks.extend(ranges(event_files, task).into_iter().map(|(f, a, b)| (true, f, a, b)));
     tasks.extend(ranges(click_files, task).into_iter().map(|(f, a, b)| (false, f, a, b)));
-    let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db)).collect();
+    let (nb, nxc) = sh.fx.as_ref().map_or((0, 0), |f| (f.nb, f.nxc));
+    let fast = sh.fx.is_some();
+    let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc)).collect();
     {
         let next = AtomicUsize::new(0);
         let (sh, tasks, next) = (&sh, &tasks, &next);
         std::thread::scope(|sc| {
+            if let Some(f) = &sh.fx {
+                // The fast path's table of user numbers is only needed after phase A:
+                // one more thread fills it meanwhile.
+                sc.spawn(move || {
+                    let t = Instant::now();
+                    fast::build_gt(f, &sh.links, 1);
+                    if std::env::var_os("SS_TIME").is_some() {
+                        eprintln!("  build_gt took {:?}", t.elapsed());
+                    }
+                });
+            }
             for w in workers.iter_mut() {
                 sc.spawn(move || {
                     let mut rd = Reader::new(bufsz);
@@ -840,10 +1129,22 @@ fn phase_a<'a>(
                             break;
                         }
                         let (is_event, f, a, b) = tasks[t];
-                        if is_event {
-                            rd.run(&event_files[f].0, a, b, |rd| unsafe { events(sh, w, rd) });
-                        } else {
-                            rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) });
+                        match (is_event, fast) {
+                            (true, false) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events(sh, w, rd) }),
+                            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+                            (true, true) if sh.dec.is_some() => {
+                                rd.run_raw(&event_files[f].0, a, b, |d, s, n| unsafe {
+                                    if !sh.links.full.load(Relaxed) {
+                                        dec::events(sh, w, d, s, n);
+                                        if w.added >= 256 {
+                                            sh.links.added(&mut w.added);
+                                        }
+                                    }
+                                })
+                            }
+                            (true, true) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events_x(sh, w, rd) }),
+                            (false, false) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) }),
+                            (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
                         }
                     }
                     unsafe { w.finish(sh) };
@@ -857,9 +1158,15 @@ fn phase_a<'a>(
         sh.dk.release_part(0, 1);
         sh.ck.release_part(0, 1);
         sh.links.release_part(0, 1);
+        if let Some(f) = &sh.fx {
+            f.release_part(0, 1);
+        }
         return None;
     }
     log(&format!("phase A parsed ({pb} person buckets, {db} key buckets)"));
+    if envn("SS_STOP") == Some(1) {
+        std::process::exit(0); // test hook: time the parse alone
+    }
     Some((sh, workers, pb, db))
 }
 
@@ -895,13 +1202,53 @@ fn main() {
     // ---- Phase A: parse events and clicks (again, with a larger ID table, if it filled up).
     let mut scale = 1;
     let mut links = Some(first);
-    let (sh, workers, pb, db) = loop {
+    // The index-order fast path (fast.rs) is used when the data's IDs have the public
+    // generator's form; SS_FAST=0 turns it off (SS_FAST=2, a test hook, skips its sample
+    // check). Without it the general pipeline runs alone.
+    let mut fast_on = envn("SS_FAST") != Some(0);
+    let (sh, mut workers, pb, db) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
-        match phase_a(&lk, l, &files, ws, we, nthreads, &envn, &log) {
-            Some(x) => break x,
+        let fx = if fast_on {
+            let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
+            let fx = fast::setup(&files[0], eb, cb, nthreads, l.1, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32, envn("SS_FAST") != Some(2));
+            if fx.is_some() {
+                log("fast: keys found");
+            }
+            fx
+        } else {
+            None
+        };
+        match phase_a(&lk, l, fx, &files, ws, we, nthreads, &envn, &log) {
+            Some(x) => {
+                if x.0.fx.is_some() {
+                    // If many lines did not fit the fast path after all, it is not worth
+                    // its two layers: start over with the general pipeline alone.
+                    let (fit, odd) = fast::stats(&x.1);
+                    log(&format!("fast: {fit} event lines by number, {odd} lines the general way"));
+                    let cold: u64 = x.1.iter().map(|w| w.ncold).sum();
+                    log(&format!("decoder: {cold} event lines read the plain way"));
+                    if odd * 20 > fit {
+                        x.0.ev.release_part(0, 1);
+                        x.0.dk.release_part(0, 1);
+                        x.0.ck.release_part(0, 1);
+                        x.0.links.release_part(0, 1);
+                        x.0.fx.as_ref().unwrap().release_part(0, 1);
+                        fast_on = false;
+                        continue;
+                    }
+                }
+                break x;
+            }
             None => scale *= 4,
         }
     };
+
+    let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
+    // ---- Fast path: the events filed by number are deduplicated, ordered and, run by
+    // run, turned into rows here; what does not fit is filed for phases B and C below.
+    if sh.fx.is_some() {
+        fast::passes(&sh, &mut workers, &mut cs, &ctx, &log);
+    }
 
     // ---- Phase B: dedup on event id. Losing copies are marked dead in their person's records.
     {
@@ -978,7 +1325,7 @@ fn main() {
             }
         });
     }
-    log("phase B dedup");
+    log(&format!("phase B dedup ({} events, {} clicks in the general buckets)", workers.iter().map(|w| (0..pb).map(|p| w.event_count(p)).sum::<usize>()).sum::<usize>(), workers.iter().map(|w| (0..pb).map(|p| w.click_count(p)).sum::<usize>()).sum::<usize>()));
 
     // ---- Phase C: sessions, attribution, aggregation per person bucket; each thread
     // then writes its rows as one user_daily file.
@@ -986,7 +1333,6 @@ fn main() {
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
-    let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
     {
         let (sh, workers, ctx, ud) = (&sh, &workers, &ctx, &ud);
         // Largest buckets first, so a whale's bucket never starts last.
@@ -1007,18 +1353,30 @@ fn main() {
                         }
                         bucket(st, sh, workers, ctx, order[k]);
                     }
-                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
+                    if std::env::var_os("SS_TIME").is_some() {
+                        eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
+                    }
+                    let tt = Instant::now();
+                                        pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
                     // Once every thread is done with the records, give their memory back
                     // here, in parallel, rather than leave it to process exit.
+                    let tw = tt.elapsed();
                     done.wait();
+                    let tr = Instant::now();
                     sh.ev.release_part(ti, nthreads);
                     sh.ck.release_part(ti, nthreads);
                     sh.links.release_part(ti, nthreads);
+                    if let Some(f) = &sh.fx {
+                        f.release_part(ti, nthreads);
+                    }
                     let (credit, assist, n) = (std::mem::take(&mut st.credit), std::mem::take(&mut st.assist), st.rows.n);
                     *st = CS::new(0);
                     st.credit = credit;
                     st.assist = assist;
                     st.rows.n = n;
+                    if std::env::var_os("SS_TIME").is_some() {
+                        eprintln!("  thread {ti}: rows written in {tw:?}, memory returned in {:?}", tr.elapsed());
+                    }
                 });
             }
         });

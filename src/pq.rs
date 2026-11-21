@@ -313,6 +313,7 @@ fn uleb(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// RLE/bit-packed hybrid as one bit-packed run of `vals` at `bw` bits (LSB first).
+/// Every value must fit in `bw` bits, and `bw` is at most 32.
 fn bitpacked(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, bw: u32) {
     let groups = n.div_ceil(8);
     uleb(out, ((groups as u64) << 1) | 1);
@@ -323,15 +324,19 @@ fn bitpacked(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, bw: u
     for v in vals.take(n) {
         acc |= (v as u64) << nbits;
         nbits += bw;
-        while nbits >= 8 {
-            buf[at] = acc as u8;
-            at += 1;
-            acc >>= 8;
-            nbits -= 8;
+        if nbits >= 32 {
+            // at + 4 bytes hold only bits already produced, so this stays in `buf`.
+            buf[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
+            at += 4;
+            acc >>= 32;
+            nbits -= 32;
         }
     }
-    if nbits > 0 {
+    while nbits > 0 {
         buf[at] = acc as u8;
+        at += 1;
+        acc >>= 8;
+        nbits = nbits.saturating_sub(8);
     }
 }
 
@@ -413,8 +418,9 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
         put(&mut out, TYPE_INT32, Some((&dict, (dmax - dmin + 1) as usize)), &d, ENC_RLE_DICT);
         // sessions, events: dictionary [0..=max] when small, else PLAIN
         for col in [&r.sessions, &r.events] {
-            let max = col.iter().copied().max().unwrap_or(0).max(0) as u64;
-            if max < (1 << 16) && col.iter().all(|&x| x >= 0) {
+            let (min, max) = col.iter().fold((0i32, 0i32), |a, &x| (a.0.min(x), a.1.max(x)));
+            let max = max as u64;
+            if max < (1 << 16) && min >= 0 {
                 let mut dict = Vec::with_capacity((max as usize + 1) * 4);
                 for x in 0..=max as i32 {
                     dict.extend_from_slice(&x.to_le_bytes());
@@ -431,21 +437,39 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
                 put(&mut out, TYPE_INT32, None, &d, ENC_PLAIN);
             }
         }
-        // revenue_cents: dictionary of the distinct values (most rows are 0)
+        // revenue_cents: dictionary of the distinct values. Most rows are 0, which is
+        // entry 0; the rest go through a small table that doubles at half load.
         {
-            let cap = (n * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
+            let mut cap = 4096usize;
             let mut slots: Vec<u32> = vec![u32::MAX; cap];
-            let mut vals: Vec<i64> = Vec::new();
+            let mut vals: Vec<i64> = vec![0];
             let mut idx: Vec<u32> = Vec::with_capacity(n);
+            let slot = |x: i64, mask: usize| ((x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
             for &x in &r.revenue {
-                let mut i = ((x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+                if x == 0 {
+                    idx.push(0);
+                    continue;
+                }
+                let mask = cap - 1;
+                let mut i = slot(x, mask);
                 loop {
                     let v = slots[i];
                     if v == u32::MAX {
                         slots[i] = vals.len() as u32;
                         idx.push(vals.len() as u32);
                         vals.push(x);
+                        if vals.len() * 2 > cap {
+                            cap *= 2;
+                            let mask = cap - 1;
+                            slots = vec![u32::MAX; cap];
+                            for (k, &y) in vals.iter().enumerate().skip(1) {
+                                let mut j = slot(y, mask);
+                                while slots[j] != u32::MAX {
+                                    j = (j + 1) & mask;
+                                }
+                                slots[j] = k as u32;
+                            }
+                        }
                         break;
                     }
                     if vals[v as usize] == x {
