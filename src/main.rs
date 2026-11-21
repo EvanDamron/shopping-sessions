@@ -37,32 +37,6 @@ impl Str {
     }
 }
 
-#[inline]
-fn hash(b: &[u8]) -> u64 {
-    const K: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h: u64 = (b.len() as u64).wrapping_mul(K) ^ 0x1234_5678_9abc_def1;
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        h = (h ^ w).wrapping_mul(K);
-        h ^= h >> 29;
-        i += 8;
-    }
-    if i < b.len() {
-        let mut w = 0u64;
-        for (k, &c) in b[i..].iter().enumerate() {
-            w |= (c as u64) << (8 * k);
-        }
-        h = (h ^ w).wrapping_mul(K);
-        h ^= h >> 29;
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^= h >> 33;
-    h
-}
 
 
 const HK1: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -705,7 +679,7 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
 // A small insert-only string map (products, campaigns) with the fast hash.
 
 struct StrMap<V: Copy> {
-    slots: Vec<Option<(u64, &'static [u8], V)>>,
+    slots: Vec<Option<(u64, u32, V)>>,
     mask: usize,
     len: usize,
 }
@@ -714,15 +688,16 @@ impl<V: Copy> StrMap<V> {
     fn new() -> Self {
         StrMap { slots: vec![None; 16], mask: 15, len: 0 }
     }
+    /// Keys are identified by their 96-bit (hh) hash pair.
     #[inline]
     fn get(&self, k: &[u8]) -> Option<V> {
-        let h = hash(k);
+        let (h, h2) = hh(k);
         let mut i = h as usize & self.mask;
         loop {
             match &self.slots[i] {
                 None => return None,
-                Some((eh, ek, v)) => {
-                    if *eh == h && *ek == k {
+                Some((eh, eh2, v)) => {
+                    if *eh == h && *eh2 == h2 {
                         return Some(*v);
                     }
                 }
@@ -735,24 +710,24 @@ impl<V: Copy> StrMap<V> {
         if self.get(k).is_some() {
             return false;
         }
-        if (self.len + 1) * 2 > self.slots.len() {
+        if (self.len + 1) * 4 > self.slots.len() {
             let n2 = self.slots.len() * 2;
             let old = std::mem::replace(&mut self.slots, vec![None; n2]);
             self.mask = self.slots.len() - 1;
-            for (h, k, v) in old.into_iter().flatten() {
+            for (h, h2, v) in old.into_iter().flatten() {
                 let mut i = h as usize & self.mask;
                 while self.slots[i].is_some() {
                     i = (i + 1) & self.mask;
                 }
-                self.slots[i] = Some((h, k, v));
+                self.slots[i] = Some((h, h2, v));
             }
         }
-        let h = hash(k);
+        let (h, h2) = hh(k);
         let mut i = h as usize & self.mask;
         while self.slots[i].is_some() {
             i = (i + 1) & self.mask;
         }
-        self.slots[i] = Some((h, k, v));
+        self.slots[i] = Some((h, h2, v));
         self.len += 1;
         true
     }
@@ -1119,14 +1094,18 @@ fn main() {
                 }
                 let (uh, uh2) = hh(f[1]);
                 links.prefetch(uh);
-                pend[np] = Pend { user: f[1], uh, uh2, eh, eh2, ing, ts: (ts - base) as u32, price, cat };
-                np += 1;
-                if np == BATCH {
-                    flush(a, &pend);
-                    np = 0;
+                // Ring: resolve the entry pushed BATCH lines ago, whose prefetch has landed.
+                let k = np & (BATCH - 1);
+                if np >= BATCH {
+                    flush(a, &pend[k..k + 1]);
                 }
+                pend[k] = Pend { user: f[1], uh, uh2, eh, eh2, ing, ts: (ts - base) as u32, price, cat };
+                np += 1;
             });
-            flush(a, &pend[..np]);
+            for i in np.saturating_sub(BATCH)..np {
+                let k = i & (BATCH - 1);
+                flush(a, &pend[k..k + 1]);
+            }
         } else {
             let mut pend: [CPend; BATCH] = [CPend::default(); BATCH];
             let mut np = 0usize;
@@ -1150,14 +1129,17 @@ fn main() {
                 };
                 let (uh, uh2) = hh(f[1]);
                 links.prefetch(uh);
-                pend[np] = CPend { user: f[1], uh, uh2, cid: pack(f[0]), ts: (ts - base) as u32, camp };
-                np += 1;
-                if np == BATCH {
-                    flush(a, &pend);
-                    np = 0;
+                let k = np & (BATCH - 1);
+                if np >= BATCH {
+                    flush(a, &pend[k..k + 1]);
                 }
+                pend[k] = CPend { user: f[1], uh, uh2, cid: pack(f[0]), ts: (ts - base) as u32, camp };
+                np += 1;
             });
-            flush(a, &pend[..np]);
+            for i in np.saturating_sub(BATCH)..np {
+                let k = i & (BATCH - 1);
+                flush(a, &pend[k..k + 1]);
+            }
         }
     });
     log("phase A parsed");
