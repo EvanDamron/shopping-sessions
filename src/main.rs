@@ -3,6 +3,7 @@
 
 mod parquet_out;
 mod scan;
+mod ts;
 
 use memchr::memchr;
 use std::collections::HashMap;
@@ -983,7 +984,7 @@ fn main() {
                 if f[0].is_empty() {
                     return;
                 }
-                let ingest = parse_ts(f[3]);
+                let ingest = ts::parse_ts(f[3]);
                 let mut kind = match f[4] {
                     b"view" => VIEW,
                     b"cart" => CART,
@@ -997,7 +998,7 @@ fn main() {
                     kind = INVALID;
                 }
                 if kind != INVALID {
-                    match parse_ts(f[2]) {
+                    match ts::parse_ts(f[2]) {
                         Some(t) if t >= ws && t < we && ingest.unwrap() - t <= DAY => ts = t,
                         _ => kind = INVALID,
                     }
@@ -1048,7 +1049,7 @@ fn main() {
                     Some(c) => c,
                     None => return,
                 };
-                let ts = match parse_ts(f[3]) {
+                let ts = match ts::parse_ts(f[3]) {
                     Some(t) if t >= wsc && t < we => t,
                     _ => return,
                 };
