@@ -1,0 +1,9 @@
+target
+data
+bin
+files
+starter
+out*
+fixtures
+reference
+.git
