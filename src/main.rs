@@ -846,9 +846,9 @@ fn read_manifest(data: &Path) -> (i64, i64) {
 }
 
 const EB: usize = 256; // event-id buckets
-const PB: usize = 256; // person partitions
+const PB: usize = 512; // person partitions
 const EB_SHIFT: u32 = 56;
-const PB_SHIFT: u32 = 56;
+const PB_SHIFT: u32 = 55;
 
 const BATCH: usize = 16;
 
