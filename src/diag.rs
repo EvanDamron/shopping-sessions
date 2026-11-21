@@ -53,15 +53,15 @@ pub fn rows(data: &std::path::Path, nthreads: usize) -> Vec<Row> {
     let has = |f: &str| flags.split_whitespace().any(|x| x == f) as u64;
     let nproc = cpu.matches("processor\t").count() as u64;
     let mhz = cpu.lines().find(|l| l.starts_with("cpu MHz")).and_then(|l| l.split(':').nth(1)).and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0) as u64;
-    out.push((format!("DIAG1 cpu={model}"), format!("mhz={mhz}"), [nproc, mhz, has("avx512f"), has("avx512bw")]));
+    out.push((format!("DIAG6 cpu={model}"), format!("mhz={mhz}"), [nproc, mhz, has("avx512f"), has("avx512bw")]));
     let thp = format!("{}/{}", read1("/sys/kernel/mm/transparent_hugepage/enabled"), read1("/sys/kernel/mm/transparent_hugepage/defrag"));
     let thp_code = if thp.starts_with("[always]") { 1 } else if thp.contains("[madvise]") { 2 } else if thp.contains("[never]") { 3 } else { 0 };
-    out.push((format!("DIAG2 thp={thp}"), "thp".into(), [thp_code, 0, 0, 0]));
+    out.push((format!("DIAG7 thp={thp}"), "thp".into(), [thp_code, 0, 0, 0]));
     let f1 = touch_ms(1 << 30, 1, false);
     let f8 = touch_ms(1 << 30, nthreads, false);
     let h1 = touch_ms(1 << 30, 1, true);
     let h8 = touch_ms(1 << 30, nthreads, true);
-    out.push((format!("DIAG3 fault_1GB_ms 1t={f1} {nthreads}t={f8} huge1t={h1} huge{nthreads}t={h8}"), "fault".into(), [f1, f8, h1, h8]));
+    out.push((format!("DIAG8 fault_1GB_ms 1t={f1} {nthreads}t={f8} huge1t={h1} huge{nthreads}t={h8}"), "fault".into(), [f1, f8, h1, h8]));
     out.push((
         format!("DIAG4 flags avx2:{} avx512f:{} bw:{} vbmi2:{} bmi2:{}", has("avx2"), has("avx512f"), has("avx512bw"), has("avx512_vbmi2"), has("bmi2")),
         "flags".into(),
@@ -83,10 +83,10 @@ pub fn rows(data: &std::path::Path, nthreads: usize) -> Vec<Row> {
         }
     }
     let memfree = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("MemFree")).map(|l| l.to_string())).unwrap_or_default();
-    out.push((format!("DIAG6 buddyinfo={} free2M={free2m} {memfree}", bi.is_ok() as u8), "mem".into(), [bi.is_ok() as u64, free2m, 0, 0]));
+    out.push((format!("DIAG2 buddyinfo={} free2M={free2m} {memfree}", bi.is_ok() as u8), "mem".into(), [bi.is_ok() as u64, free2m, 0, 0]));
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     let fs = |m: &str| mounts.lines().find(|l| l.split_whitespace().nth(1) == Some(m)).and_then(|l| l.split_whitespace().nth(2)).unwrap_or("NA").to_string();
-    out.push((format!("DIAG7 fs data={} out={} scratch={} root={}", fs("/data"), fs("/output"), fs("/scratch"), fs("/")), "fs".into(), [0; 4]));
+    out.push((format!("DIAG1 fs data={} out={} scratch={} root={}", fs("/data"), fs("/output"), fs("/scratch"), fs("/")), "fs".into(), [0; 4]));
     let t0 = Instant::now();
     let mut total = 0u64;
     let mut buf = vec![0u8; 64 << 10];
@@ -106,11 +106,79 @@ pub fn rows(data: &std::path::Path, nthreads: usize) -> Vec<Row> {
     let kver = read1("/proc/sys/kernel/osrelease");
     let init = read1("/proc/cmdline");
     let ioa = init.split_whitespace().find(|x| x.starts_with("init_on_alloc")).unwrap_or("init_on_alloc=NA").to_string();
-    out.push((format!("DIAG8 read_dev_ms={rd_ms} bytes={total} kernel={kver} {ioa}"), "io".into(), [rd_ms, total, 0, 0]));
+    out.push((format!("DIAG3 read_dev_ms={rd_ms} bytes={total} kernel={kver} {ioa}"), "io".into(), [rd_ms, total, 0, 0]));
+    // AVX2 (256-bit) vs AVX-512BW (512-bit) byte classification over the event files.
+    let mut buf: Vec<u8> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(data.join("events")) {
+        for e in rd.flatten() {
+            if let Ok(b) = std::fs::read(e.path()) {
+                buf.extend_from_slice(&b);
+            }
+            if buf.len() > (64 << 20) {
+                break;
+            }
+        }
+    }
+    let (a2, a5) = simd_bench(&buf);
+    out.push((format!("DIAG4 classify_ps_per_byte avx2={a2} avx512={a5} over {} MB", buf.len() >> 20), "simd".into(), [a2, a5, 0, 0]));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     for r in &out {
         eprintln!("{} | {} | {:?}", r.0, r.1, r.2);
     }
     out
+}
+
+/// Picoseconds per byte to classify `buf` into comma/newline/quote masks, best of 5,
+/// with AVX2 and with AVX-512BW (0 where unavailable).
+fn simd_bench(buf: &[u8]) -> (u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        #[target_feature(enable = "avx2")]
+        unsafe fn run2(b: &[u8]) -> u64 {
+            let (c, n, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+            let mut acc = 0u64;
+            let mut o = 0;
+            while o + 64 <= b.len() {
+                let x = _mm256_loadu_si256(b.as_ptr().add(o) as *const __m256i);
+                let y = _mm256_loadu_si256(b.as_ptr().add(o + 32) as *const __m256i);
+                let m = |v: __m256i, w: __m256i| (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, v)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, w)) as u32 as u64) << 32);
+                acc = acc.wrapping_add((m(c, c) | m(n, n)).count_ones() as u64 + m(q, q).count_ones() as u64);
+                o += 64;
+            }
+            acc
+        }
+        #[target_feature(enable = "avx512bw")]
+        unsafe fn run5(b: &[u8]) -> u64 {
+            let (c, n, q) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b'"' as i8));
+            let mut acc = 0u64;
+            let mut o = 0;
+            while o + 64 <= b.len() {
+                let x = _mm512_loadu_si512(b.as_ptr().add(o) as *const _);
+                let m = _mm512_cmpeq_epi8_mask(x, c) | _mm512_cmpeq_epi8_mask(x, n);
+                acc = acc.wrapping_add(m.count_ones() as u64 + _mm512_cmpeq_epi8_mask(x, q).count_ones() as u64);
+                o += 64;
+            }
+            acc
+        }
+        let time = |f: &dyn Fn() -> u64| -> u64 {
+            let mut best = u128::MAX;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                std::hint::black_box(f());
+                best = best.min(t.elapsed().as_nanos());
+            }
+            (best * 1000 / buf.len().max(1) as u128) as u64
+        };
+        let a2 = if is_x86_feature_detected!("avx2") { time(&|| unsafe { run2(buf) }) } else { 0 };
+        let a5 = if is_x86_feature_detected!("avx512bw") { time(&|| unsafe { run5(buf) }) } else { 0 };
+        (a2, a5)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = buf;
+        (0, 0)
+    }
 }
 
 pub fn report(data: &std::path::Path, nthreads: usize) {
