@@ -559,9 +559,18 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
         bases.push(total);
         total += s.names.len() as u32;
     }
-    let mut names = Vec::with_capacity(total as usize);
-    for s in &shards {
-        names.extend_from_slice(&s.names);
+    // Concatenate the shards' names in parallel (disjoint ranges of one vector).
+    let mut names: Vec<Str> = Vec::with_capacity(total as usize);
+    {
+        let np = SendPtr(names.as_mut_ptr());
+        let shards_ref = &shards;
+        let bases_ref = &bases;
+        let mut dummy: Vec<()> = (0..nthreads).map(|_| ()).collect();
+        par(&mut dummy, LSHARDS, |_, sh| {
+            let src = &shards_ref[sh].names;
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), np.get().add(bases_ref[sh] as usize), src.len()) };
+        });
+        unsafe { names.set_len(total as usize) };
     }
     // Fill edge endpoints with global ids.
     {
