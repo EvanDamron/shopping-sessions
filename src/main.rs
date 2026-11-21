@@ -1043,15 +1043,27 @@ fn main() {
     let ebytes: usize = ech.iter().map(|c| c.len()).sum();
     let cbytes: usize = cch.iter().map(|c| c.len()).sum();
     log(&format!("mapped: {} event chunks, {} click chunks", ech.len(), cch.len()));
-    // Reserve generously (untouched capacity costs no memory): ~60 bytes per event line, ~40 per click.
-    let pe_cap = ebytes / 60 / nthreads / PB + 64;
-    let ek_cap = ebytes / 60 / nthreads / EB + 64;
-    let pc_cap = cbytes / 40 / nthreads / PB + 64;
+    // Size the arenas from the real line length, sampled from a few chunks: with huge
+    // pages, every touched 2 MB is zeroed by the kernel, so slack costs time.
+    let est_lines = |ch: &[&'static [u8]], total: usize| -> usize {
+        let step = (ch.len() / 8).max(1);
+        let (mut b, mut l) = (0usize, 0usize);
+        for c in ch.iter().step_by(step).take(8) {
+            b += c.len();
+            l += memchr::memchr_iter(b'\n', c).count();
+        }
+        if l == 0 { total / 20 + 1 } else { (total as f64 * l as f64 / b as f64) as usize + 1 }
+    };
+    let ev_lines = est_lines(&ech, ebytes);
+    let ck_lines = est_lines(&cch, cbytes);
+    let pe_cap = ev_lines * 5 / 4 / nthreads / PB + 64;
+    let ek_cap = ev_lines * 5 / 4 / nthreads / EB + 64;
+    let pc_cap = ck_lines * 5 / 4 / nthreads / PB + 64;
     let mut ast: Vec<AState> = (0..nthreads)
         .map(|_| AState {
-            pe: parts::Parts::new(PB, pe_cap + pe_cap / 4),
-            ek: parts::Parts::new(EB, ek_cap + ek_cap / 4),
-            pc: parts::Parts::new(PB, pc_cap + pc_cap / 4),
+            pe: parts::Parts::new(PB, pe_cap),
+            ek: parts::Parts::new(EB, ek_cap),
+            pc: parts::Parts::new(PB, pc_cap),
         })
         .collect();
     let nev = ech.len();
