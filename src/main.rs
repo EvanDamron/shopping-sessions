@@ -984,6 +984,7 @@ struct CS {
     evs: Vec<PEv>,
     raw: Vec<PEv>,
     skeys: Vec<u64>,
+    rtmp: Vec<u64>,
     stmp: Vec<PEv>,
     ctmp: Vec<PClk>,
     cl: Vec<PClk>,
@@ -1310,6 +1311,7 @@ fn rest(
             evs: Vec::new(),
             raw: Vec::new(),
             skeys: Vec::new(),
+            rtmp: Vec::new(),
             stmp: Vec::new(),
             ctmp: Vec::new(),
             cl: Vec::new(),
@@ -1432,6 +1434,7 @@ fn rest(
                 }
             }
             let mut skeys = std::mem::take(&mut st.skeys);
+            let mut rtmp = std::mem::take(&mut st.rtmp);
             let mut stmp = std::mem::take(&mut st.stmp);
             let mut ctmp = std::mem::take(&mut st.ctmp);
             for i in 0..np {
@@ -1440,7 +1443,7 @@ fn rest(
                     // Sort packed (time, index) keys, then permute: much faster than sorting 24-byte rows.
                     skeys.clear();
                     skeys.extend(ev.iter().enumerate().map(|(j, e)| ((e.t as u64) << 32) | j as u64));
-                    skeys.sort_unstable();
+                    sort_keys(&mut skeys, &mut rtmp);
                     stmp.clear();
                     stmp.extend(skeys.iter().map(|&k| ev[(k & 0xFFFF_FFFF) as usize]));
                     ev.copy_from_slice(&stmp);
@@ -1450,7 +1453,7 @@ fn rest(
                     // Time order only; equal-time ties are broken by click_id when crediting.
                     skeys.clear();
                     skeys.extend(c.iter().enumerate().map(|(j, x)| ((x.ts as u64) << 32) | j as u64));
-                    skeys.sort_unstable();
+                    sort_keys(&mut skeys, &mut rtmp);
                     ctmp.clear();
                     ctmp.extend(skeys.iter().map(|&k| c[(k & 0xFFFF_FFFF) as usize]));
                     c.copy_from_slice(&ctmp);
@@ -1458,6 +1461,7 @@ fn rest(
                 person(st, &evs[off[i] as usize..off[i + 1] as usize], &cl[coff[i] as usize..coff[i + 1] as usize], ctx);
             }
             st.skeys = skeys;
+            st.rtmp = rtmp;
             st.ctmp = ctmp;
             st.stmp = stmp;
             st.evs = evs;
@@ -1704,6 +1708,33 @@ fn assist(st: &mut CS, camp: u32, lo: i64, hi: i64, ndays: usize) {
         let j = i0 + st.days[i0..i1].partition_point(|&x| x <= d);
         st.camp[camp as usize * ndays + d as usize][3] += (j - i0) as u64;
         i0 = j;
+    }
+}
+
+/// Sorts (time << 32 | index) keys by time. Large inputs use a 3-pass LSD radix sort on
+/// the 31-bit time (the index order within equal times does not matter).
+fn sort_keys(k: &mut Vec<u64>, tmp: &mut Vec<u64>) {
+    if k.len() < 4096 {
+        k.sort_unstable();
+        return;
+    }
+    tmp.clear();
+    tmp.resize(k.len(), 0);
+    for pass in 0..3 {
+        let shift = 32 + 11 * pass;
+        let mut cnt = [0usize; 2049];
+        for &x in k.iter() {
+            cnt[((x >> shift) & 2047) as usize + 1] += 1;
+        }
+        for i in 0..2048 {
+            cnt[i + 1] += cnt[i];
+        }
+        for &x in k.iter() {
+            let b = ((x >> shift) & 2047) as usize;
+            tmp[cnt[b]] = x;
+            cnt[b] += 1;
+        }
+        std::mem::swap(k, tmp);
     }
 }
 

@@ -97,7 +97,16 @@ pub fn write(path: &std::path::Path, names: &[&str], cols: &[Col]) -> std::io::R
         Col::I64(v) => v.len(),
         Col::Date(v) => v.len(),
     };
-    let mut out: Vec<u8> = Vec::new();
+    let est: usize = cols
+        .iter()
+        .map(|c| match c {
+            Col::Str(v) => v.iter().map(|s| s.len() + 4).sum::<usize>(),
+            Col::OptStr(v) => v.len() / 8 + v.iter().flatten().map(|s| s.len() + 4).sum::<usize>(),
+            Col::I64(v) => v.len() * 8,
+            Col::Date(v) => v.len() * 4,
+        })
+        .sum();
+    let mut out: Vec<u8> = Vec::with_capacity(est + 4096);
     out.extend_from_slice(b"PAR1");
     let mut chunks = Vec::new(); // (type, data_page_offset, total size)
     let mut page = Vec::new();
