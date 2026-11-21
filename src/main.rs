@@ -765,7 +765,16 @@ fn phase_a<'a>(
     // The table must not fill up between two reports of a thread's additions: a
     // thread adds at most one ID per 8 bytes of a batch before it reports.
     let floor = nthreads * (256 + bufsz / 8) * 8;
-    let links = links::build(&lfiles, &ltasks, lbytes as usize, est / 40 * scale, floor * scale, nthreads, bufsz, huge);
+    // Test hooks: SS_SLOTS forces the first attempt's table size, SS_FULLPCT the fill
+    // at which the table counts as full, to exercise the start-over path.
+    let (users, floor) = match envn("SS_SLOTS") {
+        Some(n) if scale == 1 => (0, n),
+        _ => ((est / 40).max(1) * scale, floor * scale),
+    };
+    let mut links = links::build(&lfiles, &ltasks, lbytes as usize, users, floor, nthreads, bufsz, huge);
+    if let Some(pct) = envn("SS_FULLPCT") {
+        links.limit = links.slots() / 100 * pct.min(85);
+    }
     log(&format!(
         "links: {} ids in {} slots (huge pages {}, {} MB free in 2 MB blocks)",
         links.linked,

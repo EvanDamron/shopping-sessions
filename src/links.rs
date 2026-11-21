@@ -35,7 +35,8 @@ pub struct Links {
     /// IDs that appear in link lines.
     pub linked: usize,
     count: AtomicUsize,
-    limit: usize,
+    /// Entries past which the table counts as full.
+    pub limit: usize,
     /// Set when the table is too full to go on; the run is then redone with a larger one.
     pub full: AtomicBool,
 }
@@ -237,7 +238,8 @@ pub fn build(
 ) -> Links {
     // About 15 bytes of link file per distinct ID in practice. Sized to end up at
     // most ~70% full, and rebuilt larger if the link files alone overfill it.
-    let mut slots = floor.max(bytes / 8).max((bytes / 15 + users) / 7 * 10).next_power_of_two();
+    // (`users == 0` with a `floor` is a test hook: exactly `floor` slots to start with.)
+    let mut slots = if users == 0 { floor } else { floor.max(bytes / 8).max((bytes / 15 + users) / 7 * 10) }.next_power_of_two();
     loop {
         if let Some(l) = try_build(files, tasks, slots, nthreads, buf, huge) {
             return l;
