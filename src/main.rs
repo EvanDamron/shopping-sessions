@@ -658,6 +658,11 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             }
         });
     }
+    // Freeing the build structures is pure overhead: the process exits soon anyway.
+    std::mem::forget(st);
+    std::mem::forget(shards);
+    std::mem::forget(names);
+    std::mem::forget(parent);
     Links { region, shards: shard_tabs, count: total as usize }
 }
 
@@ -1461,6 +1466,8 @@ fn rest(
     });
     let nrows: usize = cs.iter().map(|s| s.rows.len()).sum();
     log(&format!("wrote {nrows} user rows"));
+    // Outputs are written and closed; skip freeing gigabytes of buffers.
+    std::process::exit(0);
 }
 
 #[inline]
