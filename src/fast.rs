@@ -431,10 +431,13 @@ pub fn setup(
 pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
     let slots = links.slots();
     let next = AtomicUsize::new(0);
+    let cpu = AtomicU64::new(0);
     const STEP: usize = 1 << 14;
     std::thread::scope(|sc| {
         for _ in 0..nthreads {
-            sc.spawn(|| loop {
+            sc.spawn(|| {
+              let t0 = thread_cpu_ns();
+              loop {
                 let lo = next.fetch_add(STEP, Relaxed);
                 if lo >= slots {
                     break;
@@ -469,9 +472,45 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                         }
                     }
                 }
+              }
+              cpu.fetch_add(thread_cpu_ns() - t0, Relaxed);
             });
         }
     });
+    gt_hooks(fx, cpu.load(Relaxed));
+}
+
+/// CPU time this thread has used, in ns (0 where the clock is not available).
+fn thread_cpu_ns() -> u64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+    #[cfg(not(unix))]
+    0
+}
+
+/// Test hooks: SS_TIME prints the CPU time `build_gt` used; SS_GTSUM prints a digest
+/// of what the event stage reads from `gt` (per user number: the alias mask and
+/// COMPLEX), to compare two builds on the same data.
+fn gt_hooks(fx: &Fx, cpu_ns: u64) {
+    if std::env::var_os("SS_TIME").is_some() {
+        eprintln!("  build_gt: {:.1} ms of CPU", cpu_ns as f64 / 1e6);
+    }
+    if std::env::var_os("SS_GTSUM").is_some() {
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut cells, mut complex) = (0u64, 0u64);
+        for (g, c) in fx.gt.iter().enumerate() {
+            let w = c.load(Relaxed);
+            let v = ((g as u64) << 17) | (((w >> 32) & 0xFFFF) << 1) | (w >> 63);
+            h = (h ^ v).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29);
+            cells += (w != 0) as u64;
+            complex += w >> 63;
+        }
+        eprintln!("  gt digest {h:016x} ({cells} user numbers in links, {complex} complex)");
+    }
 }
 
 /// Counters for the log and for deciding whether the fast path fits the data.
