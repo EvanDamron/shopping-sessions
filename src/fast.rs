@@ -145,6 +145,52 @@ pub unsafe fn body36_in_buffer(d: *const u8, s: usize, e: usize, prefix: u8) -> 
     body36(d, s, e, prefix)
 }
 
+/// `body36` for an ID held as an `Id`: the digits are taken from its two words, moved
+/// so that the last one is the top byte, and converted all at once.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+pub fn id36(id: Id, prefix: u8) -> u64 {
+    use core::arch::x86_64::*;
+    // Inline IDs keep their length in the top byte (a long one has 0xFF there).
+    let len = (id.hi >> 56) as usize;
+    if len.wrapping_sub(2) > 7 || id.lo as u8 != prefix {
+        return NONE;
+    }
+    let nd = len - 1; // digits, 1 to 8: bytes 1..len of the ID
+    let w = ((id.lo >> 8) | (id.hi << 56)) << (8 * (8 - nd));
+    unsafe {
+        let v = _mm_cvtsi64_si128(w as i64);
+        let dig = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let let_ = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+        let isd = _mm_cmpeq_epi8(_mm_min_epu8(dig, _mm_set1_epi8(9)), dig);
+        let isl = _mm_cmpeq_epi8(_mm_min_epu8(let_, _mm_set1_epi8(25)), let_);
+        let val = _mm_or_si128(_mm_and_si128(isd, dig), _mm_and_si128(isl, _mm_add_epi8(let_, _mm_set1_epi8(10))));
+        let keep = (0xFFu32 << (8 - nd)) & 0xFF;
+        if _mm_movemask_epi8(_mm_or_si128(isd, isl)) as u32 & keep != keep {
+            return NONE;
+        }
+        let val = _mm_and_si128(val, _mm_cvtsi64_si128((u64::MAX << (8 * (8 - nd))) as i64));
+        let p = _mm_maddubs_epi16(val, _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 36, 1, 36, 1, 36, 1, 36));
+        let q = _mm_cvtsi128_si64(_mm_madd_epi16(p, _mm_set_epi16(0, 0, 0, 0, 1, 1296, 1, 1296))) as u64;
+        let n = (q & 0xFFFF_FFFF) * 1_679_616 + (q >> 32);
+        if ((id.lo >> 8) as u8 == b'0' && nd > 1) || n > MASK40 {
+            NONE
+        } else {
+            n
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[inline(always)]
+pub fn id36(id: Id, prefix: u8) -> u64 {
+    if id.is_long() {
+        return NONE;
+    }
+    let b = id.bytes();
+    unsafe { body36(b.as_ptr(), 0, b.len(), prefix) }
+}
+
 /// An event that went through the index buckets. `a` is the user: the user number
 /// (40 bits), or ODDU | person number for a user ID of another form, or INVALID for a
 /// copy that fails validation (it still takes part in dedup). `lo` is the event
@@ -243,12 +289,9 @@ impl Fx {
         }
     }
 
+    #[inline(always)]
     fn user_num_of(&self, id: Id) -> u64 {
-        if id.is_long() {
-            return NONE;
-        }
-        let b = id.bytes();
-        self.user_of(unsafe { body36(b.as_ptr(), 0, b.len(), b'u') })
+        self.user_of(id36(id, b'u'))
     }
 
     /// The user ID string for a number `user_num` returned.
@@ -428,29 +471,79 @@ pub fn setup(
 /// ID that maps to it belongs to one person, all of that person's linked IDs map to
 /// it, and their aliases are below 16. Any linked ID breaking that marks the user
 /// numbers involved COMPLEX: its own and its person's name's.
+///
+/// Both the cell of `gt` an ID lands in and the slot of its person's name are anywhere
+/// in memory, so the IDs are taken a batch at a time and those places are fetched
+/// ahead of their use; `gt` is still written one ID at a time, in slot order.
 pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
     let slots = links.slots();
     let next = AtomicUsize::new(0);
     let cpu = AtomicU64::new(0);
-    const STEP: usize = 1 << 14;
-    std::thread::scope(|sc| {
-        for _ in 0..nthreads {
-            sc.spawn(|| {
-              let t0 = thread_cpu_ns();
-              loop {
-                let lo = next.fetch_add(STEP, Relaxed);
-                if lo >= slots {
-                    break;
-                }
-                for i in lo..(lo + STEP).min(slots) {
+    let alone = nthreads <= 1; // the only writer of `gt`: plain stores will do
+    // The table is walked in slot order, a batch of linked IDs at a time: while a
+    // batch is gathered its cells of `gt` are fetched, then the slots of the names
+    // that have to be read, and only then is `gt` written, in the same order as one
+    // ID at a time would.
+    let work = || {
+        const STEP: usize = 1 << 14;
+        const BATCH: usize = 64;
+        let t0 = thread_cpu_ns();
+        let mut ids = [(0u32, 0u32); BATCH]; // person, own slot
+        let mut nums = [(NONE, NONE); BATCH]; // the ID's number, its person's name's
+        // The name's number is not looked up yet.
+        const LATER: u64 = NONE - 1;
+        loop {
+            let lo = next.fetch_add(STEP, Relaxed);
+            if lo >= slots {
+                break;
+            }
+            let hi = (lo + STEP).min(slots);
+            let mut i = lo;
+            while i < hi {
+                let mut n = 0;
+                while i < hi && n < BATCH {
                     // (Runs beside phase A, which adds IDs no link mentions: an entry
                     // still being written is such an ID, and it changes nothing here.)
-                    let Some((id, p)) = links.linked_at(i) else { continue };
-                    let un = fx.user_num_of(id);
-                    let pn = if p as usize == i { un } else { fx.user_num_of(links.name(p)) };
+                    if let Some((id, p)) = links.linked_at(i) {
+                        let un = fx.user_num_of(id);
+                        if un != NONE {
+                            prefetch_cell(&fx.gt, un >> 9);
+                        } else if p as usize != i {
+                            links.prefetch_slot(p);
+                        }
+                        ids[n] = (p, i as u32);
+                        nums[n] = (un, if p as usize == i { un } else { LATER });
+                        n += 1;
+                    }
+                    i += 1;
+                }
+                for k in 0..n {
+                    let (un, pn) = nums[k];
+                    if pn == LATER && un != NONE {
+                        // If the ID's cell already holds its person, an earlier ID of
+                        // that person got there: the name maps to this user number
+                        // too, and its slot need not be read.
+                        if fx.gt[(un >> 9) as usize].load(Relaxed) as u32 == ids[k].0 + 1 {
+                            nums[k].1 = un;
+                        } else {
+                            links.prefetch_slot(ids[k].0);
+                        }
+                    }
+                }
+                for k in 0..n {
+                    if nums[k].1 == LATER {
+                        let pn = fx.user_num_of(links.name(ids[k].0));
+                        if pn != NONE && pn >> 9 != nums[k].0 >> 9 {
+                            prefetch_cell(&fx.gt, pn >> 9);
+                        }
+                        nums[k].1 = pn;
+                    }
+                }
+                for k in 0..n {
+                    let (un, pn) = nums[k];
                     if un != NONE && pn != NONE && un >> 9 == pn >> 9 && un & 511 < 16 {
                         let cell = &fx.gt[(un >> 9) as usize];
-                        let mine = (p + 1) as u64;
+                        let mine = (ids[k].0 + 1) as u64;
                         let mut cur = cell.load(Relaxed);
                         loop {
                             let new = if cur as u32 == 0 || cur & 0xFFFF_FFFF == mine {
@@ -458,26 +551,59 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                             } else {
                                 cur | COMPLEX // two persons under one user number
                             };
+                            if new == cur {
+                                break;
+                            }
+                            if alone {
+                                cell.store(new, Relaxed);
+                                break;
+                            }
                             match cell.compare_exchange_weak(cur, new, Relaxed, Relaxed) {
                                 Ok(_) => break,
                                 Err(c) => cur = c,
                             }
                         }
                     } else {
-                        if un != NONE {
-                            fx.gt[(un >> 9) as usize].fetch_or(COMPLEX, Relaxed);
-                        }
-                        if pn != NONE {
-                            fx.gt[(pn >> 9) as usize].fetch_or(COMPLEX, Relaxed);
+                        for x in [un, pn] {
+                            if x != NONE {
+                                let cell = &fx.gt[(x >> 9) as usize];
+                                let cur = cell.load(Relaxed);
+                                if cur & COMPLEX == 0 {
+                                    if alone {
+                                        cell.store(cur | COMPLEX, Relaxed);
+                                    } else {
+                                        cell.fetch_or(COMPLEX, Relaxed);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-              }
-              cpu.fetch_add(thread_cpu_ns() - t0, Relaxed);
-            });
+            }
         }
-    });
+        cpu.fetch_add(thread_cpu_ns() - t0, Relaxed);
+    };
+    if nthreads <= 1 {
+        work();
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..nthreads {
+                sc.spawn(work);
+            }
+        });
+    }
     gt_hooks(fx, cpu.load(Relaxed));
+}
+
+/// Starts loading the cell of user number `g` for writing.
+#[inline(always)]
+fn prefetch_cell(gt: &[AtomicU64], g: u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(gt.as_ptr().add(g as usize) as *const i8, core::arch::x86_64::_MM_HINT_ET0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (gt, g);
 }
 
 /// CPU time this thread has used, in ns (0 where the clock is not available).
@@ -551,6 +677,37 @@ mod tests {
         assert_eq!(num("e1 "), NONE);
         assert_eq!(num("ezzzzzzzz"), NONE); // 36^8 - 1 is past 2^40
         assert_eq!(num("e1000000"), 36u64.pow(6));
+    }
+
+    #[test]
+    fn id36_agrees() {
+        let mut x = 0x1357_9bdf_2468_ace1u64;
+        let mut rnd = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let alpha = b"0123456789abcdefghijklmnopqrstuvwxyzAZ _u\"\0\xff";
+        for _ in 0..400_000 {
+            let n = rnd(20) as usize;
+            let mut s = vec![if rnd(8) == 0 { b'e' } else { b'u' }];
+            for _ in 0..n {
+                let k = if rnd(6) == 0 { rnd(alpha.len() as u64) } else { rnd(36) };
+                s.push(alpha[k as usize]);
+            }
+            if rnd(50) == 0 {
+                s.clear();
+            }
+            let id = Id::intern(&s);
+            let want = unsafe { body36(s.as_ptr(), 0, s.len(), b'u') };
+            assert_eq!(id36(id, b'u'), want, "{:?}", String::from_utf8_lossy(&s));
+        }
+        // Every length of digits, largest and smallest values.
+        for s in ["u0", "uz", "u10", "uzzzzzzz", "u1000000", "uzzzzzzzz", "u10000000", "ua1b2c3d4", "u00", "u012", "u", "uu", "U1"] {
+            let id = Id::intern(s.as_bytes());
+            assert_eq!(id36(id, b'u'), unsafe { body36(s.as_ptr(), 0, s.len(), b'u') }, "{s}");
+        }
     }
 
     #[test]

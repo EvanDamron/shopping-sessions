@@ -79,6 +79,12 @@ impl Links {
         prefetch(unsafe { self.tab.add((h >> self.shift) as usize) });
     }
 
+    /// Starts loading slot `i`.
+    #[inline(always)]
+    pub fn prefetch_slot(&self, i: u32) {
+        prefetch(unsafe { self.tab.add(i as usize) });
+    }
+
     /// The ID in slot `i` and its person, if the slot is in use.
     #[inline(always)]
     pub fn linked_at(&self, i: usize) -> Option<(Id, u32)> {
