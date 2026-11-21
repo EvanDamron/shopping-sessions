@@ -1291,7 +1291,12 @@ fn rest(
     {
         let ast = &ast;
         let ctx = &ctx;
+        // Largest partitions first, so a whale's partition never starts last.
+        let mut order: Vec<usize> = (0..PB).collect();
+        order.sort_by_key(|&p| std::cmp::Reverse(ast.iter().map(|a| a.pe[p].len() + a.pc[p].len()).sum::<usize>()));
+        let order = &order;
         par(&mut cs, PB, |st, p| {
+            let p = order[p];
             // Group by person with a local table, then sort each person's rows by time.
             let n_ev: usize = ast.iter().map(|a| a.pe[p].len()).sum();
             let mut table = std::mem::take(&mut st.table);
