@@ -167,7 +167,8 @@ impl DecC {
 
 #[repr(C, align(64))]
 struct Batch {
-    ids: [[u64; 4]; B], // [1] campaign number (or 1 << 63 | campaign index), [3] user ID value
+    ids: [[u64; 4]; B], // [3] user ID value
+    camp: [u32; B],     // campaign index, NOTFOUND for none
     cid: [[u64; 2]; B], // the click ID as an Id's two words
     t: [i64; B], // ts, ms since the click window's start
     line: [u32; B],
@@ -222,10 +223,9 @@ unsafe fn campaign_slow(sh: &Shared, d: *const u8, s: usize, e: usize) -> u32 {
 /// What becomes of row `j`: (0 dropped, 1 filed here, 2 to the plain reading; user
 /// number; campaign index).
 #[inline(always)]
-unsafe fn row(fx: &Fx, dc: &DecC, span: u64, bt: &Batch, j: usize) -> (u8, u64, u32) {
+unsafe fn row(fx: &Fx, span: u64, bt: &Batch, j: usize) -> (u8, u64, u32) {
     let (_, uk, _, gmax) = fx.keys();
-    let c = bt.ids[j][1];
-    let cp = if c >> 63 != 0 { c as u32 } else { *dc.ctab.get_unchecked(c.min(dc.clen) as usize) };
+    let cp = bt.camp[j];
     let nu = bt.ids[j][3];
     let u = unscramble(nu, uk);
     let out = ((nu >> 40) != 0) | ((u >> 9) >= gmax);
@@ -236,13 +236,13 @@ unsafe fn row(fx: &Fx, dc: &DecC, span: u64, bt: &Batch, j: usize) -> (u8, u64, 
 /// Finishes a batch: campaigns, the window, user numbers from user ID values, and the
 /// clicks filed under their user numbers.
 #[inline(never)]
-unsafe fn flush(sh: &Shared, fx: &Fx, dc: &DecC, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
+unsafe fn flush(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
     let span = sh.win.span as u64;
     if sh.deccheck {
-        check(sh, fx, dc, w, d, bt, n);
+        check(sh, fx, w, d, bt, n);
     }
     for j in 0..n {
-        let (st, u, camp) = row(fx, dc, span, bt, j);
+        let (st, u, camp) = row(fx, span, bt, j);
         if st == 1 {
             let g = u >> 9;
             let r = CRec { who: g as u32, ts: bt.t[j] as u32, camp, _pad: (u & 511) as u32, cid: Id { lo: bt.cid[j][0], hi: bt.cid[j][1] } };
@@ -256,9 +256,9 @@ unsafe fn flush(sh: &Shared, fx: &Fx, dc: &DecC, w: &mut Worker, d: *const u8, b
 /// Test hook: every row of the batch against the plain reading of its line.
 #[cold]
 #[inline(never)]
-unsafe fn check(sh: &Shared, fx: &Fx, dc: &DecC, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
+unsafe fn check(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, n: usize) {
     for j in 0..n {
-        let (st, u, camp) = row(fx, dc, sh.win.span as u64, bt, j);
+        let (st, u, camp) = row(fx, sh.win.span as u64, bt, j);
         if st == 2 {
             continue;
         }
@@ -383,9 +383,11 @@ pub unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
             continue;
         }
         _mm256_storeu_si256(bt.ids.as_mut_ptr().add(nb) as *mut __m256i, idv);
+        let cn = _mm_extract_epi64::<1>(_mm256_castsi256_si128(idv)) as u64;
+        *bt.camp.get_unchecked_mut(nb) = *dc.ctab.get_unchecked(cn.min(dc.clen) as usize);
         if cslow != 0 {
             let cs = pos + (c2 + 1 + q2) as usize;
-            bt.ids.get_unchecked_mut(nb)[1] = (1 << 63) | campaign_slow(sh, d, cs, pos + (c3 - q2) as usize) as u64;
+            *bt.camp.get_unchecked_mut(nb) = campaign_slow(sh, d, cs, pos + (c3 - q2) as usize);
         }
         // (Id::short: the bytes masked to the length, the length in byte 15)
         let cid = _mm_and_si128(ld16(p.add(q0 as usize)), ld16(KEEP.as_ptr().add(16 - l0 as usize)));
@@ -394,10 +396,10 @@ pub unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         *bt.line.get_unchecked_mut(nb) = pos as u32;
         nb += 1;
         if nb == B {
-            flush(sh, fx, dc, w, d, &bt, nb);
+            flush(sh, fx, w, d, &bt, nb);
             nb = 0;
         }
         pos = next;
     }
-    flush(sh, fx, dc, w, d, &bt, nb);
+    flush(sh, fx, w, d, &bt, nb);
 }
