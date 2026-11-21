@@ -39,46 +39,46 @@ const B: usize = 64;
 /// How one form of `ts` is read: lane 0 of a 256-bit vector holds 16 bytes of the
 /// `ts` field, lane 1 always holds `THH:MM:SSZ` of `ingest_ts`.
 #[repr(C, align(64))]
-struct Form {
-    lo: [u8; 32],    // subtracted from each byte ...
-    mk: [u8; 32],    // ... masked ...
-    rg: [u8; 32],    // ... and then at most this: digits 0..9, separators exact
-    shuf: [u8; 32],  // digits into pairs
-    wlim: [i16; 16], // the most each pair may be
-    w2: [i16; 16],
-    w3: [i16; 16],
-    off: isize,      // lane 0 starts this far from the field's first character
-    k0: i64,         // time = c + k0 * first number + kb * second number
-    kb: [i64; 2],    // (indexed by bit 1 of the character after the seconds)
-    dmask: u64,      // all ones if the field starts with a date
-    c0: i64,
-    bad: u64,        // nonzero: no such form
+pub(crate) struct Form {
+    pub(crate) lo: [u8; 32],    // subtracted from each byte ...
+    pub(crate) mk: [u8; 32],    // ... masked ...
+    pub(crate) rg: [u8; 32],    // ... and then at most this: digits 0..9, separators exact
+    pub(crate) shuf: [u8; 32],  // digits into pairs
+    pub(crate) wlim: [i16; 16], // the most each pair may be
+    pub(crate) w2: [i16; 16],
+    pub(crate) w3: [i16; 16],
+    pub(crate) off: isize,      // lane 0 starts this far from the field's first character
+    pub(crate) k0: i64,         // time = c + k0 * first number + kb * second number
+    pub(crate) kb: [i64; 2],    // (indexed by bit 1 of the character after the seconds)
+    pub(crate) dmask: u64,      // all ones if the field starts with a date
+    pub(crate) c0: i64,
+    pub(crate) bad: u64,        // nonzero: no such form
 }
 
 /// One day of the date table.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Day {
-    w0: u64,   // "YYYY-MM-"
-    w1: u64,   // "YY-MM-DD"
-    tms: i64,  // the day's start, ms since the click window's start
+pub(crate) struct Day {
+    pub(crate) w0: u64,   // "YYYY-MM-"
+    pub(crate) w1: u64,   // "YY-MM-DD"
+    pub(crate) tms: i64,  // the day's start, ms since the click window's start
     isec: i64, // the day's start, seconds since the click window's start
 }
 
 /// Bits of "YY-MM-DD" that tell the days of two neighbouring months apart: the
 /// month's last digit (bit 0), the day's digits (2 and 4 bits).
-const DAYBITS: u64 = (1 << 32) | (3 << 48) | (0xF << 56);
+pub(crate) const DAYBITS: u64 = (1 << 32) | (3 << 48) | (0xF << 56);
 
 #[repr(C, align(64))]
 pub struct Dec {
-    forms: [Form; 4],
+    pub(crate) forms: [Form; 4],
     /// Form of a `ts` field by 2 * raw length + quoted.
-    tsform: [u8; 128],
+    pub(crate) tsform: [u8; 128],
     /// Shuffle for an ID field by 2 * raw length + quoted, applied to the 16 bytes
     /// that end where the field ends: digits right-aligned in bytes 8..16, the
     /// prefix letter in byte 7, the first digit again in byte 6.
-    idsh: [[u8; 16]; 128],
-    days: [Day; 128],
+    pub(crate) idsh: [[u8; 16]; 128],
+    pub(crate) days: [Day; 128],
     idt: [u8; 32],
     idlow: [u8; 32],
     idrng: [u8; 32],

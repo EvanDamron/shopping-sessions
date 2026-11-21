@@ -13,6 +13,8 @@
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 mod dec;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod decc;
 mod fast;
 mod id;
 mod links;
@@ -353,6 +355,8 @@ struct Shared<'a> {
     fx: Option<fast::Fx>, // the index-order fast path (fast.rs), when the data's IDs allow it
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
     dec: Option<Box<dec::Dec>>, // the per-line decoder's tables (dec.rs), with the fast path
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
 }
 
@@ -390,6 +394,7 @@ struct Worker {
     odd: Vec<fast::OddEv>, // event lines whose event ID has no number
     nodd: u64,      // lines whose IDs took the general path
     ncold: u64,     // event lines the per-line decoder handed to the plain reading
+    nccold: u64,    // click lines the click-line decoder handed to the plain reading
 }
 
 impl Worker {
@@ -419,6 +424,7 @@ impl Worker {
             odd: Vec::new(),
             nodd: 0,
             ncold: 0,
+            nccold: 0,
         }
     }
 
@@ -788,17 +794,17 @@ unsafe fn events_x(sh: &Shared, w: &mut Worker, rd: &Reader) {
     }
 }
 
-/// The seven fields of the line `d[ls..le]` (without its newline), read the plain
+/// The N fields of the line `d[ls..le]` (without its newline), read the plain
 /// way (`split`); None for a malformed line.
 #[allow(dead_code)]
-unsafe fn plain_fields(d: *const u8, ls: usize, le: usize) -> Option<[(usize, usize); 7]> {
+unsafe fn plain_fields<const N: usize>(d: *const u8, ls: usize, le: usize) -> Option<[(usize, usize); N]> {
     let line = std::slice::from_raw_parts(d.add(ls), le - ls);
-    let mut g: [&[u8]; 7] = [&[]; 7];
-    if !split::<7>(line, &mut g) {
+    let mut g: [&[u8]; N] = [&[]; N];
+    if !split::<N>(line, &mut g) {
         return None;
     }
-    let mut f = [(0usize, 0usize); 7];
-    for k in 0..7 {
+    let mut f = [(0usize, 0usize); N];
+    for k in 0..N {
         let s = g[k].as_ptr() as usize - d as usize;
         f[k] = (s, s + g[k].len());
     }
@@ -826,8 +832,59 @@ unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le
     }
 }
 
-/// Phase A for one batch of click lines with the fast path on: as `clicks`, but a
-/// click whose user ID has the generator's form is filed under its user number.
+/// What becomes of one click line with the fast path on.
+#[allow(dead_code)]
+enum COut {
+    Drop,
+    X(usize, CRec), // filed under user-number bucket (`push_xclick`)
+    P(usize, CRec), // filed under person bucket (`push_click`)
+}
+
+/// One click line with the fast path on, given its four fields without their
+/// quotes: as `clicks`, but a click whose user ID has the generator's form is filed
+/// under its user number.
+#[inline(always)]
+unsafe fn click_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u8, f: &[(usize, usize); 4]) -> COut {
+    let win = &sh.win;
+    let (s0, e0) = f[0];
+    let (s1, e1) = f[1];
+    if s0 == e0 || s1 == e1 {
+        return COut::Drop;
+    }
+    let (s2, e2) = f[2];
+    let camp = match sh.lk.campaigns.get(Id::field(d, s2, e2)) {
+        Some(c) => c,
+        None => return COut::Drop,
+    };
+    let (s3, e3) = f[3];
+    let t = win.ts(d, s3, e3);
+    if t as u64 >= win.span as u64 {
+        return COut::Drop;
+    }
+    let cid = Id::field(d, s0, e0);
+    let un = fx.user_num(d, s1, e1);
+    if un != fast::NONE {
+        let g = un >> 9;
+        COut::X((g >> fx.cshift) as usize, CRec { who: g as u32, ts: t as u32, camp, _pad: (un & 511) as u32, cid })
+    } else {
+        let uid = Id::field(d, s1, e1);
+        let who = sh.links.person(uid, uid.hash(), &mut w.added);
+        COut::P((who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid })
+    }
+}
+
+/// `click_x_decide`, and the line filed accordingly.
+#[inline(always)]
+unsafe fn click_x_fields(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u8, f: &[(usize, usize); 4]) {
+    match click_x_decide(sh, fx, w, d, f) {
+        COut::Drop => {}
+        COut::X(c, r) => w.push_xclick(fx, c, r),
+        COut::P(p, r) => w.push_click(sh, p, r),
+    }
+}
+
+/// Phase A for one batch of click lines with the fast path on, through the
+/// separator index (`click_x_fields` for each well-formed line).
 #[inline(never)]
 unsafe fn clicks_x(sh: &Shared, w: &mut Worker, rd: &Reader) {
     if sh.links.full.load(Relaxed) {
@@ -835,37 +892,35 @@ unsafe fn clicks_x(sh: &Shared, w: &mut Worker, rd: &Reader) {
     }
     let fx = sh.fx.as_ref().unwrap_unchecked();
     let d = rd.data();
-    let win = &sh.win;
     rd.lines::<4>(|ip, ls| {
         let (p0, p1, p2, p3) = (*ip as usize, *ip.add(1) as usize, *ip.add(2) as usize, *ip.add(3) as usize);
-        let (s0, e0) = unquote(d, ls, p0);
-        let (s1, e1) = unquote(d, p0 + 1, p1);
-        if s0 == e0 || s1 == e1 {
-            return;
-        }
-        let (s2, e2) = unquote(d, p1 + 1, p2);
-        let camp = match sh.lk.campaigns.get(Id::field(d, s2, e2)) {
-            Some(c) => c,
-            None => return,
-        };
-        let (s3, e3) = unquote(d, p2 + 1, p3);
-        let t = win.ts(d, s3, e3);
-        if t as u64 >= win.span as u64 {
-            return;
-        }
-        let cid = Id::field(d, s0, e0);
-        let un = fx.user_num(d, s1, e1);
-        if un != fast::NONE {
-            let g = un >> 9;
-            w.push_xclick(fx, (g >> fx.cshift) as usize, CRec { who: g as u32, ts: t as u32, camp, _pad: (un & 511) as u32, cid });
-        } else {
-            let uid = Id::field(d, s1, e1);
-            let who = sh.links.person(uid, uid.hash(), &mut w.added);
-            w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid });
-        }
+        let f = [unquote(d, ls, p0), unquote(d, p0 + 1, p1), unquote(d, p1 + 1, p2), unquote(d, p2 + 1, p3)];
+        click_x_fields(sh, fx, w, d, &f);
     });
     if w.added >= 256 {
         sh.links.added(&mut w.added);
+    }
+}
+
+/// The click line `d[ls..le]` with the fast path on, read the plain way and filed by
+/// `click_x_fields`. The click-line decoder (decc.rs) hands every line it does not
+/// take to this.
+#[allow(dead_code)]
+#[inline(never)]
+unsafe fn click_x_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) {
+    if let Some(f) = plain_fields(d, ls, le) {
+        click_x_fields(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &f);
+    }
+}
+
+/// Test hook (SS_DECCHECK=1): what the plain reading makes of a click line the
+/// decoder took.
+#[allow(dead_code)]
+#[inline(never)]
+unsafe fn click_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> COut {
+    match plain_fields(d, ls, le) {
+        Some(f) => click_x_decide(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &f),
+        None => COut::Drop,
     }
 }
 
@@ -1095,6 +1150,8 @@ fn phase_a<'a>(
         ck: mem::Arena::new(cbytes as usize + nthreads * pb * CCH * CREC, huge, ahead),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64)),
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        decc: (fx.is_some() && envn("SS_DEC") != Some(0) && envn("SS_DECC") != Some(0)).then(|| decc::DecC::new(lk)),
         deccheck: envn("SS_DECCHECK") == Some(1),
         fx,
     };
@@ -1144,6 +1201,17 @@ fn phase_a<'a>(
                             }
                             (true, true) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events_x(sh, w, rd) }),
                             (false, false) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) }),
+                            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+                            (false, true) if sh.decc.is_some() => {
+                                rd.run_raw(&click_files[f].0, a, b, |d, s, n| unsafe {
+                                    if !sh.links.full.load(Relaxed) {
+                                        decc::clicks(sh, w, d, s, n);
+                                        if w.added >= 256 {
+                                            sh.links.added(&mut w.added);
+                                        }
+                                    }
+                                })
+                            }
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
                         }
                     }
@@ -1172,6 +1240,21 @@ fn phase_a<'a>(
 
 fn main() {
     let t0 = Instant::now();
+    // Large malloc allocations (row columns, pass buffers) go on transparent huge pages
+    // when the machine has plenty of free 2 MB blocks, where they halve the page faults;
+    // with few, the kernel would stall compacting memory instead. glibc reads the tunable
+    // only at start, so the process restarts itself once with it set.
+    if std::env::var_os("GLIBC_TUNABLES").is_none()
+        && std::env::var("SS_HUGE").map_or(true, |v| v != "0")
+        && mem::free_huge_bytes().is_some_and(|f| f >= 8 << 30)
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure; then carry on without the tunable.
+        let _ = std::process::Command::new("/proc/self/exe")
+            .args(std::env::args_os().skip(1))
+            .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1")
+            .exec();
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -1227,6 +1310,8 @@ fn main() {
                     log(&format!("fast: {fit} event lines by number, {odd} lines the general way"));
                     let cold: u64 = x.1.iter().map(|w| w.ncold).sum();
                     log(&format!("decoder: {cold} event lines read the plain way"));
+                    let ccold: u64 = x.1.iter().map(|w| w.nccold).sum();
+                    log(&format!("decoder: {ccold} click lines read the plain way"));
                     if odd * 20 > fit {
                         x.0.ev.release_part(0, 1);
                         x.0.dk.release_part(0, 1);
