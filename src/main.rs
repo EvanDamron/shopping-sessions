@@ -544,39 +544,42 @@ unsafe fn events(sh: &Shared, w: &mut Worker, rd: &Reader) {
     let win = &sh.win;
     rd.lines::<7>(|ip, ls| {
         prefetch_user(sh, d, ip.add(7 * AHEAD));
-        let (p0, p1, p2, p3) = (*ip as usize, *ip.add(1) as usize, *ip.add(2) as usize, *ip.add(3) as usize);
-        let (p4, p5, p6) = (*ip.add(4) as usize, *ip.add(5) as usize, *ip.add(6) as usize);
+        // Fields are taken in line order, each used as soon as it is found, so little
+        // has to be kept across the whole line.
+        let p0 = *ip as usize;
         let (s0, e0) = unquote(d, ls, p0);
         if s0 == e0 {
             return; // empty event_id: dropped before dedup
         }
         let (kid, kbucket) = Id::key(d, s0, e0).hash2();
         let bucket = (kbucket >> sh.dshift) as usize;
+        let p1 = *ip.add(1) as usize;
+        let (s1, e1) = unquote(d, p0 + 1, p1);
+        let uid = Id::field(d, s1, e1); // empty user_id: the empty ID
+        let p2 = *ip.add(2) as usize;
+        let (s2, e2) = unquote(d, p1 + 1, p2);
+        let t = win.ts(d, s2, e2);
+        let p3 = *ip.add(3) as usize;
         let (s3, e3) = unquote(d, p2 + 1, p3);
-        let ing = win.ingest(d, s3, e3);
+        let (ing_ms, ing_key) = win.ingest(d, s3, e3);
+        let p4 = *ip.add(4) as usize;
         let (s4, e4) = unquote(d, p3 + 1, p4);
         let tw = (d.add(s4) as *const u64).read_unaligned();
         let tl = e4 - s4;
         let purchase = (tl == 8) & (tw == PURCHASE);
         let typed = purchase | ((tl == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
-        let (s1, e1) = unquote(d, p0 + 1, p1);
+        let p5 = *ip.add(5) as usize;
         let (s5, e5) = unquote(d, p4 + 1, p5);
-        let (s2, e2) = unquote(d, p1 + 1, p2);
-        let t = win.ts(d, s2, e2);
-        let (ing_ms, ing_key) = match ing {
-            Some(x) => x,
-            None => (i64::MAX, tsfast::INGEST_NONE),
-        };
-        // ts in [window_start, window_end), and ingested at most 24 hours after it.
+        // ts in [window_start, window_end), and ingested at most 24 hours after it
+        // (an unreadable ingest_ts counts as infinitely late).
         let mut ok = typed
-            & (e1 > s1)
+            & (uid != Id::EMPTY)
             & (e5 > s5)
-            & ing.is_some()
             & ((t.wrapping_sub(WEEK) as u64) < sh.evspan)
             & (ing_ms.wrapping_sub(t.wrapping_add(win.base)) <= DAY);
         let mut pc = 0u32;
         if purchase & ok {
-            let (s6, e6) = unquote(d, p5 + 1, p6);
+            let (s6, e6) = unquote(d, p5 + 1, *ip.add(6) as usize);
             match parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6)) {
                 Some(p) => pc = p | (sh.lk.products.get(Id::field(d, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24),
                 None => ok = false,
@@ -586,7 +589,6 @@ unsafe fn events(sh: &Shared, w: &mut Worker, rd: &Reader) {
             w.push_key(sh, bucket, kid, ((ing_key as u64) << 32) | NOSLOT as u64);
             return;
         }
-        let uid = Id::field(d, s1, e1);
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
         let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: t as u32, pc });
         w.push_key(sh, bucket, kid, ((ing_key as u64) << 32) | slot as u64);

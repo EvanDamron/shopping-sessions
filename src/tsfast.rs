@@ -23,6 +23,7 @@ unsafe fn load8(p: *const u8) -> u64 {
     (p as *const u64).read_unaligned()
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
 unsafe fn load4(p: *const u8) -> u64 {
     (p as *const u32).read_unaligned() as u64
@@ -48,6 +49,31 @@ fn parse8(w: u64) -> u64 {
     ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
         .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
         >> 32
+}
+
+
+/// `DDTHH:MM:SS` at p (16 bytes readable): the day, the seconds `HH:MM:SS` make, and
+/// whether the text is exactly that shape with an hour, minute and second in range.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn dhms(p: *const u8) -> (i64, i64, bool) {
+    use core::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i); // D D T H H : M M : S S ? ? ? ? ?
+    let x = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    // A digit where one belongs (saturating x - 9 is 0), and the three separators.
+    let nine = _mm_setr_epi8(9, 9, -1, 9, 9, -1, 9, 9, -1, 9, 9, -1, -1, -1, -1, -1);
+    let seps = _mm_setr_epi8(0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0);
+    let sepm = _mm_setr_epi8(0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0);
+    let bad = _mm_or_si128(_mm_subs_epu8(x, nine), _mm_and_si128(_mm_xor_si128(v, seps), sepm));
+    // Digits to DD, HH, MM, SS, then to DD * 24 + HH and MM * 60 + SS.
+    let y = _mm_shuffle_epi8(x, _mm_setr_epi8(0, 1, 3, 4, 6, 7, 9, 10, -1, -1, -1, -1, -1, -1, -1, -1));
+    let z = _mm_maddubs_epi16(y, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    let over = _mm_cmpgt_epi16(z, _mm_setr_epi16(i16::MAX, 23, 59, 59, 0, 0, 0, 0));
+    let bad = _mm_or_si128(bad, over);
+    let hm = _mm_madd_epi16(z, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
+    let d = _mm_extract_epi16(z, 0) as i64;
+    let part = _mm_cvtsi128_si32(hm) as i64 + _mm_extract_epi32(hm, 1) as i64;
+    (d, part, _mm_testz_si128(bad, bad) != 0)
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +143,20 @@ impl Win {
     }
 
     /// F1 (`YYYY-MM-DDTHH:MM:SSZ`, 20 bytes at p) to ms since `base`, or FAIL.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    #[inline(always)]
+    pub unsafe fn f1(&self, p: *const u8) -> i64 {
+        let (mok, m) = self.month(load8(p));
+        let (d, part, ok) = dhms(p.add(8));
+        if ok & mok & (d >= m.lo) & (d <= m.hi) & (*p.add(19) == b'Z') {
+            ((m.day0 + d) * 86_400 + part) * 1000 - self.base
+        } else {
+            FAIL
+        }
+    }
+
+    /// F1 (`YYYY-MM-DDTHH:MM:SSZ`, 20 bytes at p) to ms since `base`, or FAIL.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
     #[inline(always)]
     pub unsafe fn f1(&self, p: *const u8) -> i64 {
         const M1: u64 = 0xFFFF_00FF_FF00_FFFF;
@@ -204,11 +244,33 @@ impl Win {
         }
     }
 
-    /// An `ingest_ts` field: (epoch ms, dedup key), or None if it is not a timestamp
-    /// (rules.md says it always is a valid F1). The key orders copies of an event:
-    /// seconds since `base`, clamped to 32 bits and biased to sort unsigned.
+    /// An `ingest_ts` field: (epoch ms, dedup key). The key orders copies of an event:
+    /// seconds since `base`, clamped to 32 bits and biased to sort unsigned. Text that
+    /// is not a timestamp (rules.md says it always is a valid F1) gives
+    /// (i64::MAX, INGEST_NONE): later than anything, so the event counts as late.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
     #[inline(always)]
-    pub unsafe fn ingest(&self, d: *const u8, s: usize, e: usize) -> Option<(i64, u32)> {
+    pub unsafe fn ingest(&self, d: *const u8, s: usize, e: usize) -> (i64, u32) {
+        let p = d.add(s);
+        if e - s == 20 {
+            let (mok, m) = self.month(load8(p));
+            let (day, part, ok) = dhms(p.add(8));
+            if ok & mok & (*p.add(19) == b'Z') {
+                // F1 in a window month, every digit a digit: the general parser's arithmetic.
+                let secs = (m.day0 + day) * 86_400 + part;
+                return (secs * 1000, ((secs - self.base_s) as i32 as u32) ^ 0x8000_0000);
+            }
+        }
+        self.ingest_slow(std::slice::from_raw_parts(p, e - s))
+    }
+
+    /// An `ingest_ts` field: (epoch ms, dedup key). The key orders copies of an event:
+    /// seconds since `base`, clamped to 32 bits and biased to sort unsigned. Text that
+    /// is not a timestamp (rules.md says it always is a valid F1) gives
+    /// (i64::MAX, INGEST_NONE): later than anything, so the event counts as late.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    #[inline(always)]
+    pub unsafe fn ingest(&self, d: *const u8, s: usize, e: usize) -> (i64, u32) {
         const M1: u64 = 0xFFFF_00FF_FF00_FFFF;
         let p = d.add(s);
         if e - s == 20 {
@@ -219,7 +281,7 @@ impl Win {
                 // as the general parser does.
                 let (p1, p2) = (pairs(w1, M1), pairs(w2, 0x00FF_FF00));
                 let secs = (m.day0 + pick(p1, 0)) * 86_400 + pick(p1, 3) * 3600 + pick(p1, 6) * 60 + pick(p2, 1);
-                return Some((secs * 1000, ((secs - self.base_s) as i32 as u32) ^ 0x8000_0000));
+                return (secs * 1000, ((secs - self.base_s) as i32 as u32) ^ 0x8000_0000);
             }
         }
         self.ingest_slow(std::slice::from_raw_parts(p, e - s))
@@ -227,10 +289,14 @@ impl Win {
 
     #[cold]
     #[inline(never)]
-    fn ingest_slow(&self, b: &[u8]) -> Option<(i64, u32)> {
-        let ms = crate::ts::parse_ingest(b)?;
-        let key = (ms.div_euclid(1000) - self.base_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
-        Some((ms, (key as u32) ^ 0x8000_0000))
+    fn ingest_slow(&self, b: &[u8]) -> (i64, u32) {
+        match crate::ts::parse_ingest(b) {
+            Some(ms) => {
+                let key = (ms.div_euclid(1000) - self.base_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
+                (ms, (key as u32) ^ 0x8000_0000)
+            }
+            None => (i64::MAX, INGEST_NONE),
+        }
     }
 }
 
@@ -255,8 +321,15 @@ mod tests {
         if inw(fast) || inw(slow) {
             assert_eq!(fast, slow, "{s:?}");
         }
-        let fi = unsafe { w.ingest(buf.as_ptr(), 0, n) }.map(|x| x.0);
-        assert_eq!(fi, crate::ts::parse_ingest(s.as_bytes()), "ingest {s:?}");
+        let fi = unsafe { w.ingest(buf.as_ptr(), 0, n) };
+        let want = match crate::ts::parse_ingest(s.as_bytes()) {
+            Some(ms) => {
+                let key = (ms.div_euclid(1000) - w.base_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
+                (ms, (key as u32) ^ 0x8000_0000)
+            }
+            None => (i64::MAX, INGEST_NONE),
+        };
+        assert_eq!(fi, want, "ingest {s:?}");
     }
 
     #[test]
