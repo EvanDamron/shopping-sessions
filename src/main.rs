@@ -1608,6 +1608,30 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
     if cl.is_empty() {
         return;
     }
+    if cl.len() <= 32 {
+        // Clicks are in time order: merge per campaign in one pass with a small list.
+        let mut open: [(u32, i64, i64); 32] = [(0, 0, 0); 32];
+        let mut no = 0usize;
+        for c in cl {
+            let t = c.ts as i64;
+            match open[..no].iter_mut().find(|e| e.0 == c.camp) {
+                Some(e) if t <= e.2 => e.2 = t + WEEK,
+                Some(e) => {
+                    let (lo, hi) = (e.1, e.2);
+                    *e = (c.camp, t, t + WEEK);
+                    assist(st, c.camp, lo, hi, ndays);
+                }
+                None => {
+                    open[no] = (c.camp, t, t + WEEK);
+                    no += 1;
+                }
+            }
+        }
+        for &(camp, lo, hi) in &open[..no] {
+            assist(st, camp, lo, hi, ndays);
+        }
+        return;
+    }
     let mut tmp = std::mem::take(&mut st.tmp);
     tmp.clear();
     tmp.extend(cl.iter().map(|c| (c.camp, c.ts)));
@@ -1625,15 +1649,7 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
                 a += 1;
                 continue;
             }
-            let s = &st.starts;
-            let mut i0 = s.partition_point(|&x| x < lo);
-            let i1 = s.partition_point(|&x| x <= hi);
-            while i0 < i1 {
-                let d = st.days[i0];
-                let j = i0 + st.days[i0..i1].partition_point(|&x| x <= d);
-                st.camp[camp as usize * ndays + d as usize][3] += (j - i0) as u64;
-                i0 = j;
-            }
+            assist(st, camp, lo, hi, ndays);
             if more {
                 lo = tmp[a].1 as i64;
                 hi = lo + WEEK;
@@ -1644,6 +1660,20 @@ fn person(st: &mut CS, ev: &[PEv], cl: &[PClk], ctx: &Ctx) {
         }
     }
     st.tmp = tmp;
+}
+
+/// Counts the sessions starting in [lo, hi] as assisted by `camp`, per day.
+#[inline]
+fn assist(st: &mut CS, camp: u32, lo: i64, hi: i64, ndays: usize) {
+    let s = &st.starts;
+    let mut i0 = s.partition_point(|&x| x < lo);
+    let i1 = s.partition_point(|&x| x <= hi);
+    while i0 < i1 {
+        let d = st.days[i0];
+        let j = i0 + st.days[i0..i1].partition_point(|&x| x <= d);
+        st.camp[camp as usize * ndays + d as usize][3] += (j - i0) as u64;
+        i0 = j;
+    }
 }
 
 #[inline]
