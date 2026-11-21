@@ -487,7 +487,7 @@ impl Links {
 fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
     let ch = chunks(files, 1 << 20);
     struct LS {
-        sides: Vec<Vec<(u64, Str, u32)>>, // per shard: (hash, str, edge*2+side)
+        sides: Vec<Vec<(u64, u32, Str, u32)>>, // per shard: (hash, check hash, str, edge*2+side)
         edges: Vec<[u32; 2]>,
     }
     let mut st: Vec<LS> = (0..nthreads)
@@ -501,15 +501,15 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             let e = s.edges.len() as u32;
             s.edges.push([0, 0]);
             for side in 0..2 {
-                let h = hh(f[side]).0;
-                s.sides[(h >> 58) as usize].push((h, Str::new(f[side]), e * 2 + side as u32));
+                let (h, h2) = hh(f[side]);
+                s.sides[(h >> 58) as usize].push((h, h2, Str::new(f[side]), e * 2 + side as u32));
             }
         });
     });
     // Intern per shard.
     struct Shard {
         names: Vec<Str>,
-        hashes: Vec<u64>,
+        hashes: Vec<(u64, u32)>,
         assign: Vec<(u32, u32, u32)>, // (thread, slot, local id)
     }
     let mut shards: Vec<Option<Shard>> = (0..LSHARDS).map(|_| None).collect();
@@ -523,21 +523,22 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             let mask = (cap - 1) as u64;
             let mut slots = vec![0u32; cap];
             let mut names: Vec<Str> = Vec::new();
-            let mut hashes: Vec<u64> = Vec::new();
+            let mut hashes: Vec<(u64, u32)> = Vec::new();
             let mut assign = Vec::with_capacity(total);
             for (ti, s) in st_ref.iter().enumerate() {
-                for &(h, name, slot) in &s.sides[sh] {
+                for &(h, h2, name, slot) in &s.sides[sh] {
                     let mut i = (h & mask) as usize;
                     let id = loop {
                         let v = slots[i];
                         if v == 0 {
                             names.push(name);
-                            hashes.push(h);
+                            hashes.push((h, h2));
                             slots[i] = names.len() as u32;
                             break names.len() as u32 - 1;
                         }
                         let id = v - 1;
-                        if hashes[id as usize] == h && names[id as usize].b() == name.b() {
+                        // IDs are identified by their 96-bit hash pair.
+                        if hashes[id as usize] == (h, h2) {
                             break id;
                         }
                         i = (i + 1) & mask as usize;
@@ -631,23 +632,49 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
         nslots += cap;
     }
     let region = parts::alloc(nslots * std::mem::size_of::<LEntry>()) as *mut LEntry; // zeroed: all empty
+    // Each ID's root, then each root's hash and packed name (computed once per root).
+    let n = total as usize;
+    let mut root = vec![0u32; n];
+    let mut rph = vec![0u64; n];
+    let mut rname = vec![0u64; n];
+    {
+        let parts_n = nthreads * 8;
+        let rp = SendPtr(root.as_mut_ptr());
+        let mut dummy: Vec<()> = (0..nthreads).map(|_| ()).collect();
+        par(&mut dummy, parts_n, |_, k| {
+            for i in n * k / parts_n..n * (k + 1) / parts_n {
+                unsafe { rp.get().add(i).write(find(i as u32)) };
+            }
+        });
+        let (pp, np) = (SendPtr(rph.as_mut_ptr()), SendPtr(rname.as_mut_ptr()));
+        let root_ref = &root;
+        let names_ref = &names;
+        par(&mut dummy, parts_n, |_, k| {
+            for i in n * k / parts_n..n * (k + 1) / parts_n {
+                if root_ref[i] == i as u32 {
+                    let nm = names_ref[i].b();
+                    unsafe {
+                        pp.get().add(i).write(hh(nm).0);
+                        np.get().add(i).write(pack(nm));
+                    }
+                }
+            }
+        });
+    }
     {
         let rp = SendPtr(region);
         let shards_ref = &shards;
         let bases_ref = &bases;
-        let names_ref = &names;
         let tabs = &shard_tabs;
+        let (root, rph, rname) = (&root, &rph, &rname);
         let mut dummy: Vec<()> = (0..nthreads).map(|_| ()).collect();
         par(&mut dummy, LSHARDS, |_, sh| {
             let s = &shards_ref[sh];
             let (off, mask) = tabs[sh];
             for i in 0..s.names.len() {
-                let id = bases_ref[sh] + i as u32;
-                let r = find(id);
-                let rname = names_ref[r as usize].b();
-                let me = s.names[i].b();
-                let h = s.hashes[i];
-                let e = LEntry { h, h2: hh(me).1, ph: hh(rname).0, name: pack(rname) };
+                let r = root[bases_ref[sh] as usize + i] as usize;
+                let (h, h2) = s.hashes[i];
+                let e = LEntry { h, h2, ph: rph[r], name: rname[r] };
                 let mut k = (h & mask) as usize;
                 unsafe {
                     while (*rp.get().add(off + k)).name != 0 {
@@ -658,6 +685,9 @@ fn build_links(files: &[PathBuf], nthreads: usize) -> Links {
             }
         });
     }
+    std::mem::forget(root);
+    std::mem::forget(rph);
+    std::mem::forget(rname);
     // Freeing the build structures is pure overhead: the process exits soon anyway.
     std::mem::forget(st);
     std::mem::forget(shards);
