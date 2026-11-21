@@ -1116,13 +1116,14 @@ fn main() {
     let mut scale = 1;
     let mut links = Some(first);
     // The index-order fast path (fast.rs) is used when the data's IDs have the public
-    // generator's form; SS_FAST=0 turns it off. Without it the general pipeline runs alone.
+    // generator's form; SS_FAST=0 turns it off (SS_FAST=2, a test hook, skips its sample
+    // check). Without it the general pipeline runs alone.
     let mut fast_on = envn("SS_FAST") != Some(0);
     let (sh, mut workers, pb, db) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
         let fx = if fast_on {
             let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
-            let fx = fast::setup(&files[0], eb, cb, nthreads, l.1, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32);
+            let fx = fast::setup(&files[0], eb, cb, nthreads, l.1, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32, envn("SS_FAST") != Some(2));
             if fx.is_some() {
                 log("fast: keys found");
             }

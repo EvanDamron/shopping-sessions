@@ -197,6 +197,8 @@ pub struct Fx {
     conflict: Vec<AtomicU64>,
     /// User numbers whose odd-ID events (`OddEv`) have been taken by a run or filed.
     taken: Vec<AtomicU64>,
+    /// User numbers whose clicks have been filed with the general pipeline.
+    cfiled: Vec<AtomicU64>,
     pub xe: mem::Arena,
     pub xc: mem::Arena,
 }
@@ -342,23 +344,28 @@ fn search<P: Fn(u64) -> u64 + Sync, O: Fn(u64) -> bool + Sync>(n: &[u64], count:
     let done = AtomicBool::new(false);
     let next = AtomicU64::new(0);
     const STEP: u64 = 1 << 16;
-    std::thread::scope(|sc| {
-        for _ in 0..nthreads {
-            sc.spawn(|| loop {
-                let lo = next.fetch_add(STEP, Relaxed);
-                if lo >= count || done.load(Relaxed) {
-                    break;
-                }
-                for c in lo..(lo + STEP).min(count) {
-                    let key = m[0] ^ (plain(c).wrapping_mul(M1) & MASK40);
-                    if ok((m[1] ^ key).wrapping_mul(M1I) & MASK40) && m[2..].iter().all(|&x| ok((x ^ key).wrapping_mul(M1I) & MASK40)) {
-                        found.store(key, Relaxed);
-                        done.store(true, Relaxed);
-                    }
-                }
-            });
+    let work = || loop {
+        let lo = next.fetch_add(STEP, Relaxed);
+        if lo >= count || done.load(Relaxed) {
+            break;
         }
-    });
+        for c in lo..(lo + STEP).min(count) {
+            let key = m[0] ^ (plain(c).wrapping_mul(M1) & MASK40);
+            if ok((m[1] ^ key).wrapping_mul(M1I) & MASK40) && m[2..].iter().all(|&x| ok((x ^ key).wrapping_mul(M1I) & MASK40)) {
+                found.store(key, Relaxed);
+                done.store(true, Relaxed);
+            }
+        }
+    };
+    if count < 1 << 22 {
+        work(); // small: not worth starting threads
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..nthreads {
+                sc.spawn(work);
+            }
+        });
+    }
     let k = found.load(Relaxed);
     (k != NONE).then_some(k)
 }
@@ -373,6 +380,7 @@ pub fn setup(
     huge: bool,
     ahead: usize,
     xsh: u32,
+    check: bool,
 ) -> Option<Fx> {
     let rows = samples(event_files);
     if rows.len() < 24 {
@@ -383,13 +391,13 @@ pub fn setup(
     // the generator's are about 66. Numbers past these bounds take the general path.
     let emax = (ebytes / 52).max(1 << 12);
     let gmax = emax / 16 + 1024;
-    // A user's first alias is 0 and most have under 8: try each as sample 0's alias,
-    // and if sample 0 is unusual, start from another sample.
+    // A user's first alias is 0 and nearly all are under 4: try each as sample 0's
+    // alias, and if sample 0 is unusual, start from another sample.
     let mut uk = None;
-    'find: for rot in 0..4 {
+    'find: for rot in 0..2 {
         let mut s = us.clone();
         s.swap(0, rot);
-        for alias in 0..8u64 {
+        for alias in 0..4u64 {
             uk = search(&s, gmax, nthreads, |g| g * 512 + alias, |v| (v >> 9) < gmax);
             if uk.is_some() {
                 break 'find;
@@ -405,6 +413,17 @@ pub fn setup(
     let mut ev: Vec<u64> = vec![rows[first].0];
     ev.extend(rows.iter().take(48).map(|r| r.0));
     let ek = search(&ev, emax, nthreads, |c| c, |v| v < emax)?;
+    // What the fast path relies on, checked on the sample before committing to it:
+    // in event-number order the user number never goes down. (Later copies of an
+    // event that name another user are the generator's only exceptions, well under
+    // 1 in 1,000.) Data with valid keys but another numbering would still come out
+    // exact, every run failing its checks, but slower than the general pipeline alone.
+    let mut by_number: Vec<(u64, u64)> = rows.iter().map(|r| (unscramble(r.0, ek), unscramble(r.1, uk) >> 9)).collect();
+    by_number.sort_unstable();
+    let down = by_number.windows(2).filter(|w| w[1].1 < w[0].1).count();
+    if check && down * 200 > rows.len() {
+        return None;
+    }
     let nb = (emax >> xsh) as usize + 1;
     let gbits = (gmax as usize).div_ceil(512).next_power_of_two().trailing_zeros();
     let gper = 1usize << gbits;
@@ -424,6 +443,7 @@ pub fn setup(
         seen: (0..words).map(|_| AtomicU64::new(0)).collect(),
         conflict: (0..words).map(|_| AtomicU64::new(0)).collect(),
         taken: (0..words).map(|_| AtomicU64::new(0)).collect(),
+        cfiled: (0..words).map(|_| AtomicU64::new(0)).collect(),
         xe: mem::Arena::new((ebytes as usize / 34 + (nthreads * nb + 1) * XCH) * XREC, huge, ahead),
         xc: mem::Arena::new(cbytes as usize + nthreads * nxc * CCH * std::mem::size_of::<CRec>(), huge, ahead),
     })
@@ -690,8 +710,7 @@ pub fn passes(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log
 
     // Pass 2: the runs. Afterwards, the clicks of user numbers that take the general
     // path and had no run at all (a run files its own user number's clicks along
-    // with it) are filed there too. A click filed twice changes nothing: copies of a
-    // click are identical and the rules keep any one.
+    // with it) are filed there too.
     const GSTEP: usize = 1 << 15;
     let gtasks = (fx.gmax as usize).div_ceil(GSTEP);
     {
@@ -765,8 +784,12 @@ unsafe fn pool_extras(sh: &Shared, fx: &Fx, extras: &[(u64, u64)], w: &mut Worke
     pool_events(sh, fx, w, extras_of(extras, g).iter().copied());
 }
 
-/// Files every click of user number `g` with the general pipeline.
+/// Files every click of user number `g` with the general pipeline, the first time it is asked.
 unsafe fn pool_clicks(sh: &Shared, fx: &Fx, li: &Lists, coff: &[u32], w: &mut Worker, g: u64) {
+    let (word, bit) = ((g >> 6) as usize, 1u64 << (g & 63));
+    if fx.cfiled[word].fetch_or(bit, Relaxed) & bit != 0 {
+        return;
+    }
     let c = (g >> fx.cshift) as usize;
     let k = c * (fx.gper + 1) + (g as usize & (fx.gper - 1));
     for j in coff[k] as usize..coff[k + 1] as usize {
