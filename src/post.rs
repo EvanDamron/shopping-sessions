@@ -521,9 +521,13 @@ fn order_clicks(cl: &[PClk], cids: &[*const Id], keys: &mut Vec<u64>, rtmp: &mut
         while b < n && keys[b] >> 32 == t {
             b += 1;
         }
-        if b - a > 1 {
-            // Clicks at one instant (copies of a click, or the generator's same-millisecond
-            // pairs): the largest click_id first. Insertion sort; these groups are small.
+        // Clicks at one instant (copies of a click, or the generator's same-millisecond
+        // pairs): the largest click_id first, so the smallest is the one credited. Only
+        // the campaign of a click is used after this, so a group whose clicks all have
+        // one campaign (copies always do) is in a valid order already: their click_ids
+        // are not read.
+        if b - a > 1 && keys[a + 1..b].iter().any(|&k| cl[k as u32 as usize].camp != cl[keys[a] as u32 as usize].camp) {
+            // Insertion sort; these groups are small.
             let g = &mut keys[a..b];
             for x in 1..g.len() {
                 let mut y = x;
