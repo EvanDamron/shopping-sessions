@@ -27,8 +27,8 @@ ph=$(grep -E 'links: [0-9]|phase A parsed|stage:|phase B|phase C|wrote' $S/err |
 rm -rf $S/o $S/g20 $S/g60
 cat > $S/rows.txt <<ROWS
 DIAG1 gen20=${g20}ms gen60=${g60}ms free2M=${free2m}MB nproc=$(nproc)
-DIAG2 g20 old56effae=$A new77385d7=$B new_noMallocTHP=$C
-DIAG3 g60 old56effae=$A6 new77385d7=$B6
+DIAG2 g20 old56effae=$A new10673bc=$B new_noMallocTHP=$C
+DIAG3 g60 old56effae=$A6 new10673bc=$B6
 DIAG4 g60 new_noMallocTHP=$C6 new_SS_HUGE0=$D6
 DIAG5 g60 new phases: $ph
 ROWS
