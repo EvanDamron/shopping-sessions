@@ -364,10 +364,14 @@ impl Fx {
 /// Rows from the start of the largest event file whose event and user IDs both have
 /// the generator's form: (event ID number, user ID number), still scrambled.
 #[cfg(unix)]
-fn samples(event_files: &[(File, u64)]) -> Vec<(u64, u64)> {
+/// (Event value, user value) of sample lines from the largest event file whose IDs
+/// have the generator's form, and how many well-formed sample lines had an ID of
+/// another form.
+fn samples(event_files: &[(File, u64)]) -> (Vec<(u64, u64)>, usize) {
     use std::os::unix::fs::FileExt;
     let mut rows = Vec::new();
-    let Some((f, len)) = event_files.iter().max_by_key(|f| f.1) else { return rows };
+    let mut other = 0;
+    let Some((f, len)) = event_files.iter().max_by_key(|f| f.1) else { return (rows, other) };
     let mut buf = vec![0u8; (*len as usize).min(256 << 10)];
     let got = f.read_at(&mut buf, 0).unwrap_or(0);
     let mut lines = buf[..got].split(|&c| c == b'\n');
@@ -388,14 +392,16 @@ fn samples(event_files: &[(File, u64)]) -> Vec<(u64, u64)> {
         let (e, u) = unsafe { (body36(e.as_ptr(), 0, e.len(), b'e'), body36(u.as_ptr(), 0, u.len(), b'u')) };
         if e != NONE && u != NONE {
             rows.push((e, u));
+        } else {
+            other += 1;
         }
     }
-    rows
+    (rows, other)
 }
 
 #[cfg(not(unix))]
-fn samples(_: &[(File, u64)]) -> Vec<(u64, u64)> {
-    Vec::new()
+fn samples(_: &[(File, u64)]) -> (Vec<(u64, u64)>, usize) {
+    (Vec::new(), 0)
 }
 
 /// Finds the key under which sample 0 is `plain(c)` for some `c < count` and every
@@ -444,8 +450,11 @@ pub fn setup(
     xsh: u32,
     check: bool,
 ) -> Option<Fx> {
-    let rows = samples(event_files);
-    if rows.len() < 24 {
+    let (rows, other) = samples(event_files);
+    // Not worth a key search when more than one sample line in twenty has IDs of
+    // another form (data of the generator's v5, with its long hexadecimal IDs): the
+    // search would fail, or the fast path would send too many lines the general way.
+    if rows.len() < 24 || other * 20 > rows.len() + other {
         return None;
     }
     let us: Vec<u64> = rows.iter().take(48).map(|r| r.1).collect();
