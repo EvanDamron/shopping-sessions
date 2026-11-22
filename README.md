@@ -48,6 +48,20 @@ IDs of up to 15 bytes are held inline as 16-byte values, longer ones interned, s
 user, click, campaign and product IDs always compare exactly. Event IDs are
 deduplicated by a 64-bit hash within one of up to 1,024 hash buckets.
 
+## Open-source code and outside sources
+
+- Crates: [`memchr`](https://crates.io/crates/memchr) (MIT or Unlicense) and
+  [`libc`](https://crates.io/crates/libc) (MIT or Apache-2.0). Everything else is
+  written for this entry.
+- `src/fast.rs` uses two multiplier constants of the ID scramble in the event's public
+  data generator (`generator.zip`, from the track's starter files). They are used only to
+  turn IDs back into numbers once the per-dataset keys are recovered from the data at
+  run time; nothing is derived from a seed, and every file is still read and parsed.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
+
 ## Testing
 
     make check        # 36 fixtures + dev answer + extra seeds vs. reference/reference.py

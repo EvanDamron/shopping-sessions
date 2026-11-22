@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 pub const NONE: u64 = u64::MAX;
 const MASK40: u64 = (1 << 40) - 1;
-// The generator's scramble: ((v * M1) ^ key) & MASK40, then x ^= x >> 17, then (x * M2) & MASK40.
+// Constants of the event's public data generator (its ID scramble: ((v * M1) ^ key) & MASK40,
+// then x ^= x >> 17, then (x * M2) & MASK40), used to recover the ID keys at run time.
 const M1: u64 = 0x9E37_79B9_7F4B;
 const M2: u64 = 0xD6E8_FEB8_6659;
 pub const M1I: u64 = inverse(M1);
