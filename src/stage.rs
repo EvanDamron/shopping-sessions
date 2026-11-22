@@ -1091,7 +1091,7 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let mut clicks = false;
     if !kc.is_empty() {
         s.st.clear();
-        s.st.extend_from_slice(bk.st.get_unchecked(k..ke));
+        put(&mut s.st, bk.st.as_ptr().add(k), m);
         clicks = click_setup(s, ctx, kc, ids, m, words, wide, &cid);
     }
     let (r0, r1) = (*bk.row.get_unchecked(k) as usize, *bk.row.get_unchecked(ke - 1) as usize + 1);
