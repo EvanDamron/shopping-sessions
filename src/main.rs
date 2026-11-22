@@ -1580,6 +1580,7 @@ fn main() {
                             None => bucket(st, sh, workers, ctx, order[k]),
                         }
                     }
+                    post::finish(st, &mut scr);
                     drop(scr);
                     post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
