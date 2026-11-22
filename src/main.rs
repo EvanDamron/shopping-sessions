@@ -1117,6 +1117,31 @@ fn make_links(
     (links, huge)
 }
 
+/// The lines of `f` that start in `[a, b)`, to a per-line decoder: from the file's
+/// mapping where that is possible (in pieces of about `piece` bytes of whole lines),
+/// through the read buffer for the rest.
+#[allow(dead_code)]
+fn decode(rd: &mut Reader, f: &File, m: Option<&scan::Mapped>, a: u64, b: u64, piece: usize, mut go: impl FnMut(*const u8, usize, usize)) {
+    let Some(m) = m else {
+        return rd.run_raw(f, a, b, go);
+    };
+    if a < m.lo.min(b) {
+        rd.run_raw(f, a, b.min(m.lo), &mut go);
+    }
+    if let Some((s, e)) = m.span(a, b) {
+        let mut x = s;
+        while x < e {
+            let y = m.piece(x, e, piece);
+            go(unsafe { m.ptr().add(x) }, 0, y - x);
+            x = y;
+        }
+        m.done(s, e);
+    }
+    if b > m.hi.max(a) {
+        rd.run_raw(f, a.max(m.hi), b, &mut go);
+    }
+}
+
 /// Phase A: every event and click line parsed and filed. None if the ID table
 /// filled up (far more distinct users than estimated): the caller starts over with
 /// a larger one.
@@ -1174,9 +1199,20 @@ fn phase_a<'a>(
     let (nb, nxc) = sh.fx.as_ref().map_or((0, 0), |f| (f.nb, f.nxc));
     let fast = sh.fx.is_some();
     let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc)).collect();
+    // SS_MMAP=1: the per-line decoders read the files straight from their mappings
+    // instead of through the read buffer. (Measured equal on the development host,
+    // so it is off unless asked for.)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    let mapped = sh.dec.is_some() && envn("SS_MMAP") == Some(1);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    let mapped = false;
+    let maps = |files: &[(File, u64)]| -> Vec<Option<scan::Mapped>> {
+        files.iter().map(|f| if mapped { scan::Mapped::new(&f.0, f.1) } else { None }).collect()
+    };
+    let (emaps, cmaps) = (maps(event_files), maps(click_files));
     {
         let next = AtomicUsize::new(0);
-        let (sh, tasks, next) = (&sh, &tasks, &next);
+        let (sh, tasks, next, emaps, cmaps) = (&sh, &tasks, &next, &emaps, &cmaps);
         std::thread::scope(|sc| {
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
@@ -1202,27 +1238,29 @@ fn phase_a<'a>(
                             (true, false) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (true, true) if sh.dec.is_some() => {
-                                rd.run_raw(&event_files[f].0, a, b, |d, s, n| unsafe {
+                                let go = |d: *const u8, s: usize, n: usize| unsafe {
                                     if !sh.links.full.load(Relaxed) {
                                         dec::events(sh, w, d, s, n);
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
                                         }
                                     }
-                                })
+                                };
+                                decode(&mut rd, &event_files[f].0, emaps[f].as_ref(), a, b, bufsz, go);
                             }
                             (true, true) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events_x(sh, w, rd) }),
                             (false, false) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (false, true) if sh.decc.is_some() => {
-                                rd.run_raw(&click_files[f].0, a, b, |d, s, n| unsafe {
+                                let go = |d: *const u8, s: usize, n: usize| unsafe {
                                     if !sh.links.full.load(Relaxed) {
                                         decc::clicks(sh, w, d, s, n);
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
                                         }
                                     }
-                                })
+                                };
+                                decode(&mut rd, &click_files[f].0, cmaps[f].as_ref(), a, b, bufsz, go);
                             }
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
                         }
