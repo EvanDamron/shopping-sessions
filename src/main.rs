@@ -1654,8 +1654,18 @@ fn main() {
         tl::span(20, tcs);
         let next = AtomicUsize::new(0);
         let next = &next;
-        let done = std::sync::Barrier::new(nthreads);
-        let done = &done;
+        // The tail of phase C, without a barrier: a thread that has written its rows
+        // starts on the memory release as soon as every thread is done with its buckets
+        // (taking pieces from a shared list, so that early finishers do more of it), and
+        // the first thread to finish writing also writes campaign_daily.
+        let cells = (ncamp + 1) * ndays;
+        let bdone = AtomicUsize::new(0);
+        let claimed = std::sync::atomic::AtomicBool::new(false);
+        let parts: Vec<[AtomicUsize; 2]> = (0..nthreads).map(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]).collect();
+        const RP: usize = 32; // release pieces per region
+        let nrel = 4 + sh.fx.is_some() as usize;
+        let rnext = AtomicUsize::new(0);
+        let (bdone, claimed, parts, rnext, lk, cd) = (&bdone, &claimed, &parts, &rnext, &lk, &cd);
         std::thread::scope(|sc| {
             for (ti, st) in cs.iter_mut().enumerate() {
                 sc.spawn(move || {
@@ -1681,24 +1691,64 @@ fn main() {
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
+                    // This thread's campaign cells are final (st is not touched again before
+                    // every thread has passed the release wait below).
+                    parts[ti][0].store(st.credit.as_ptr() as usize, Relaxed);
+                    parts[ti][1].store(st.assist.as_ptr() as usize, Relaxed);
+                    bdone.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let tt = Instant::now();
                     let ttl = tl::now();
-                                        pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
-                    // Once every thread is done with the records, give their memory back
-                    // here, in parallel, rather than leave it to process exit.
+                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
                     let tw = tt.elapsed();
                     tl::span(16, ttl);
+                    let all_buckets_done = || {
+                        let mut spins = 0u32;
+                        while bdone.load(std::sync::atomic::Ordering::Acquire) < nthreads {
+                            spins += 1;
+                            if spins < 2000 {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_micros(20));
+                            }
+                        }
+                    };
+                    if !claimed.swap(true, Relaxed) {
+                        let tb = tl::now();
+                        all_buckets_done();
+                        tl::span(17, tb);
+                        let tb = tl::now();
+                        let views: Vec<(&[[u64; 2]], &[u32])> = parts
+                            .iter()
+                            .map(|p| unsafe {
+                                (
+                                    std::slice::from_raw_parts(p[0].load(Relaxed) as *const [u64; 2], cells),
+                                    std::slice::from_raw_parts(p[1].load(Relaxed) as *const u32, cells),
+                                )
+                            })
+                            .collect();
+                        write_campaign(lk, ctx, &views, cd);
+                        tl::span(19, tb);
+                    }
+                    // Once every thread is done with the records, give their memory back
+                    // here, in parallel, rather than leave it to process exit.
                     let tb = tl::now();
-                    done.wait();
+                    all_buckets_done();
                     tl::span(17, tb);
                     let tb = tl::now();
                     let tr = Instant::now();
-                    sh.ev.release_part(ti, nthreads);
-                    sh.ck.release_part(ti, nthreads);
-                    scan::release_maps_part(cmaps, ti, nthreads);
-                    sh.links.release_part(ti, nthreads);
-                    if let Some(f) = &sh.fx {
-                        f.release_part(ti, nthreads);
+                    loop {
+                        let k = rnext.fetch_add(1, Relaxed);
+                        if k >= nrel * RP {
+                            break;
+                        }
+                        let (region, part) = (k / RP, k % RP);
+                        match region {
+                            0 => sh.ev.release_part(part, RP),
+                            1 => sh.ck.release_part(part, RP),
+                            2 => scan::release_maps_part(cmaps, part, RP),
+                            3 => sh.links.release_part(part, RP),
+                            _ => sh.fx.as_ref().unwrap().release_part(part, RP),
+                        }
                     }
                     let (credit, assist, n) = (std::mem::take(&mut st.credit), std::mem::take(&mut st.assist), st.rows.n);
                     *st = CS::new(0);
@@ -1713,7 +1763,6 @@ fn main() {
             }
         });
     }
-    let tcamp = tl::now();
     log("phase C sessions, user_daily written");
     if std::env::var_os("SS_SECT").is_some() {
         let v: Vec<String> = post::SECT.iter().map(|x| format!("{:.3}", x.load(Relaxed) as f64 / 2.4e9)).collect();
@@ -1721,9 +1770,19 @@ fn main() {
     }
     log(&format!("post cpu: dedup {:.3} s, buckets {:.3} s (thread sums)", post::CPU_B.load(Relaxed) as f64 * 1e-9, post::CPU_C.load(Relaxed) as f64 * 1e-9));
 
+    let nrows: usize = cs.iter().map(|s| s.rows.n).sum();
+    log(&format!("wrote {nrows} user rows"));
+    tl::dump();
+    // Outputs are written and closed; skip freeing buffers.
+    std::process::exit(0);
+}
+
+/// campaign_daily from every thread's campaign cells (rules.md "Output tables").
+fn write_campaign(lk: &Lookups, ctx: &Ctx, parts: &[(&[[u64; 2]], &[u32])], cd: &Path) {
+    let (ncamp, ndays, day0) = (lk.channels.len(), ctx.ndays, ctx.day0);
     let mut camp_tot = vec![[0u64; 4]; (ncamp + 1) * ndays];
-    for s in &cs {
-        for ((a, c), &x) in camp_tot.iter_mut().zip(s.credit.iter()).zip(s.assist.iter()) {
+    for &(credit, assist) in parts {
+        for ((a, c), &x) in camp_tot.iter_mut().zip(credit.iter()).zip(assist.iter()) {
             a[0] += c[0] & 0xFFFF_FFFF;
             a[1] += c[0] >> 32;
             a[2] += c[1];
@@ -1756,12 +1815,6 @@ fn main() {
         &cols,
     )
     .expect("write campaign_daily");
-    let nrows: usize = cs.iter().map(|s| s.rows.n).sum();
-    log(&format!("wrote {nrows} user rows"));
-    tl::span(19, tcamp);
-    tl::dump();
-    // Outputs are written and closed; skip freeing buffers.
-    std::process::exit(0);
 }
 
 /// Runs a closure when dropped.
