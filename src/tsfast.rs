@@ -257,9 +257,18 @@ impl Win {
                 self.ts_cold(pt, nt)
             }
         } else if nt == 13 {
-            let (w0, w5) = (load8(pt), load8(pt.add(5)));
-            if digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) {
-                ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base
+            // 13 digits in one 128-bit pass: loaded from 3 bytes before, so they fill
+            // bytes 3..16; digit pairs, then groups of four, then three multiplies.
+            let v = _mm_loadu_si128(pt.sub(3) as *const __m128i);
+            let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+            let x = _mm_and_si128(_mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8)), keep);
+            let over = _mm_subs_epu8(x, _mm_set1_epi8(9));
+            if _mm_testz_si128(over, over) != 0 {
+                let p = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010A));
+                let g = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0064));
+                let (g0, g1) = (_mm_cvtsi128_si32(g) as i64, _mm_extract_epi32::<1>(g) as i64);
+                let (g2, g3) = (_mm_extract_epi32::<2>(g) as i64, _mm_extract_epi32::<3>(g) as i64);
+                ((g0 * 10_000 + g1) * 10_000 + g2) * 10_000 + g3 - self.base
             } else {
                 self.ts_cold(pt, nt)
             }
@@ -396,10 +405,14 @@ mod tests {
             let good = b"2026-10-03T23:58:10Z";
             let mut g = good.to_vec();
             g.extend_from_slice(&[b','; 40]);
+            // ts_ingest may read a few bytes before a field, as the decoders allow.
+            let pad = |v: &[u8]| -> Vec<u8> { let mut p = vec![b','; 16]; p.extend_from_slice(v); p };
+            let (pb, pg) = (pad(&buf), pad(&g));
+            let (bp, gp) = unsafe { (pb.as_ptr().add(16), pg.as_ptr().add(16)) };
             let gi = unsafe { w.ingest(g.as_ptr(), 0, 20) };
             let gt = unsafe { w.ts(g.as_ptr(), 0, 20) };
-            assert_eq!(unsafe { w.ts_ingest(buf.as_ptr(), n, g.as_ptr(), 20) }, (fast, gi.0, gi.1), "ts_ingest ts {s:?}");
-            assert_eq!(unsafe { w.ts_ingest(g.as_ptr(), 20, buf.as_ptr(), n) }, (gt, fi.0, fi.1), "ts_ingest ingest {s:?}");
+            assert_eq!(unsafe { w.ts_ingest(bp, n, gp, 20) }, (fast, gi.0, gi.1), "ts_ingest ts {s:?}");
+            assert_eq!(unsafe { w.ts_ingest(gp, 20, bp, n) }, (gt, fi.0, fi.1), "ts_ingest ingest {s:?}");
         }
         let want = match crate::ts::parse_ingest(s.as_bytes()) {
             Some(ms) => {
