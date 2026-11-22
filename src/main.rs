@@ -425,7 +425,7 @@ impl Worker {
             cchunks: (0..pb).map(|_| Vec::new()).collect(),
             added: 0,
             xcnt: vec![0; nb],
-            xwc: vec![fast::WcX([0; 24]); nb],
+            xwc: vec![fast::WcX([0; 16]); nb],
             xcur: vec![0; nb],
             xchunks: (0..nb).map(|_| Vec::new()).collect(),
             xccnt: vec![0; nxc],
@@ -442,7 +442,17 @@ impl Worker {
 
     /// Files an event under event-number bucket `b` (fast path).
     #[inline(always)]
-    unsafe fn push_x(&mut self, fx: &fast::Fx, b: usize, r: fast::XRec) {
+    unsafe fn push_x(&mut self, fx: &fast::Fx, b: usize, r: fast::XEv) {
+        let (r, ext) = r.pack();
+        self.push_xrec(fx, b, r);
+        if let Some(e) = ext {
+            self.push_xrec(fx, b, e);
+        }
+    }
+
+    /// Files one 16-byte record under event-number bucket `b`.
+    #[inline(always)]
+    unsafe fn push_xrec(&mut self, fx: &fast::Fx, b: usize, r: fast::XRec) {
         let n = *self.xcnt.get_unchecked(b);
         let off = n as usize & (fast::XCH - 1);
         if off == 0 {
@@ -455,7 +465,7 @@ impl Worker {
         let w = self.xwc.as_mut_ptr().add(b) as *mut fast::XRec;
         w.add(k).write(r);
         if k == 7 {
-            mem::stream((*self.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), w as *const u8, 3);
+            mem::stream((*self.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), w as *const u8, 2);
         }
     }
 
@@ -715,7 +725,7 @@ enum XOut {
     /// An event ID of another form than the generator's: kept aside, matched by the ID itself later.
     Odd(fast::OddEv),
     /// Filed under its event number.
-    Rec(u64, fast::XRec),
+    Rec(u64, fast::XEv),
 }
 
 /// One event line with the fast path on, given its seven fields without their
@@ -769,7 +779,7 @@ unsafe fn event_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u
         return XOut::Odd(fast::OddEv { key: Id::key(d, s0, e0), ing: ing_key, a, t: t as u32, pc });
     }
     let lo = (idx & ((1 << fx.xsh) - 1)) as u32;
-    XOut::Rec(idx, fast::XRec { a, t: t as u32, pc, ing: ing_key, lo })
+    XOut::Rec(idx, fast::XEv { a, t: t as u32, pc, ing: ing_key, lo })
 }
 
 /// `event_x_decide`, and the line filed accordingly.
@@ -837,7 +847,7 @@ unsafe fn event_x_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le:
 /// Test hook (SS_DECCHECK=1): what the plain reading makes of a line the decoder took.
 #[allow(dead_code)]
 #[inline(never)]
-unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<(u64, fast::XRec)> {
+unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<(u64, fast::XEv)> {
     match event_x_decide(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &plain_fields(d, ls, le)?) {
         XOut::Rec(idx, r) => Some((idx, r)),
         _ => None,
@@ -1135,7 +1145,6 @@ fn decode(rd: &mut Reader, f: &File, m: Option<&scan::Mapped>, a: u64, b: u64, p
             go(unsafe { m.ptr().add(x) }, 0, y - x);
             x = y;
         }
-        m.done(s, e);
     }
     if b > m.hi.max(a) {
         rd.run_raw(f, a.max(m.hi), b, &mut go);
@@ -1209,9 +1218,14 @@ fn phase_a<'a>(
         files.iter().map(|f| if mapped { scan::Mapped::new(&f.0, f.1) } else { None }).collect()
     };
     let (emaps, cmaps) = (maps(event_files), maps(click_files));
+    // Tasks left per file: the thread that finishes a file's last one releases its mapping.
+    let left = |files: &[(File, u64)], events: bool| -> Vec<AtomicUsize> {
+        (0..files.len()).map(|f| AtomicUsize::new(tasks.iter().filter(|t| t.0 == events && t.1 == f).count())).collect()
+    };
+    let (eleft, cleft) = (left(event_files, true), left(click_files, false));
     {
         let next = AtomicUsize::new(0);
-        let (sh, tasks, next, emaps, cmaps) = (&sh, &tasks, &next, &emaps, &cmaps);
+        let (sh, tasks, next, emaps, cmaps, eleft, cleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft, &cleft);
         std::thread::scope(|sc| {
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
@@ -1256,9 +1270,14 @@ fn phase_a<'a>(
                             (false, false) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (false, true) if sh.decc.is_some() => {
+                                let casm = sh.decc.as_ref().is_some_and(|d| d.asm);
                                 let go = |d: *const u8, s: usize, n: usize| unsafe {
                                     if !sh.links.full.load(Relaxed) {
-                                        decc::clicks(sh, w, d, s, n);
+                                        if casm {
+                                            decc::clicks_a(sh, w, d, s, n);
+                                        } else {
+                                            decc::clicks(sh, w, d, s, n);
+                                        }
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
                                         }
@@ -1267,6 +1286,12 @@ fn phase_a<'a>(
                                 decode(&mut rd, &click_files[f].0, cmaps[f].as_ref(), a, b, bufsz, go);
                             }
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
+                        }
+                        let (maps, left) = if is_event { (emaps, eleft) } else { (cmaps, cleft) };
+                        if left[f].fetch_sub(1, Relaxed) == 1 {
+                            if let Some(m) = &maps[f] {
+                                m.release();
+                            }
                         }
                     }
                     unsafe { w.finish(sh) };

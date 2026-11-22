@@ -192,18 +192,54 @@ pub fn id36(id: Id, prefix: u8) -> u64 {
     unsafe { body36(b.as_ptr(), 0, b.len(), prefix) }
 }
 
-/// An event that went through the index buckets. `a` is the user: the user number
+/// An event on its way to the index buckets. `a` is the user: the user number
 /// (40 bits), or ODDU | person number for a user ID of another form, or INVALID for a
 /// copy that fails validation (it still takes part in dedup). `lo` is the event
-/// number within its bucket, `ing` the ingest key dedup compares.
+/// number within its bucket, `ing` the ingest key dedup compares, `pc` price and
+/// category (zero unless a valid purchase).
 #[derive(Clone, Copy)]
-#[repr(C)]
-pub struct XRec {
+pub struct XEv {
     pub a: u64,
     pub t: u32,
     pub pc: u32,
     pub ing: u32,
     pub lo: u32,
+}
+
+/// An event as filed in its index bucket, 16 bytes:
+///   a    `XEv::a` (user word in bits 0..39, ODDU and INVALID at bits 62 and 63)
+///        with `lo` in bits 46..61
+///   t    the time (31 bits); bit 31 (BUY) for a valid purchase
+///   ing  the ingest key
+/// A valid purchase is followed, in the same worker's records of that bucket, by one
+/// extension record carrying its price and category: `a = EXT | lo << XLO`, `t = pc`,
+/// the same `ing`. (Whichever copy holds the event's place has that ingest key or a
+/// smaller one, and copies with equal keys are identical: the price belongs to the
+/// event exactly when the keys are equal.)
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct XRec {
+    pub a: u64,
+    pub t: u32,
+    pub ing: u32,
+}
+pub const EXT: u64 = 1 << 45;
+pub const BUY: u32 = 1 << 31;
+/// Where `lo` sits in `XRec::a`, and the bits of `XRec::a` that are not `lo`.
+pub const XLO: u32 = 46;
+pub const XA: u64 = !(0xFFFF << XLO);
+
+impl XEv {
+    /// The record, and the extension record of a valid purchase.
+    #[inline(always)]
+    pub fn pack(&self) -> (XRec, Option<XRec>) {
+        let lo = (self.lo as u64) << XLO;
+        let buy = if self.pc != 0 { BUY } else { 0 };
+        (
+            XRec { a: self.a | lo, t: (self.t & !BUY) | buy, ing: self.ing },
+            (self.pc != 0).then_some(XRec { a: EXT | lo, t: self.pc, ing: self.ing }),
+        )
+    }
 }
 /// An event line whose event ID is not of the generator's form: it has no event
 /// number, so its copies are matched by the ID itself (`key`), after phase A.
@@ -211,7 +247,7 @@ pub struct XRec {
 pub struct OddEv {
     pub key: Id,
     pub ing: u32,
-    pub a: u64, // as in XRec
+    pub a: u64, // as in XEv
     pub t: u32,
     pub pc: u32,
 }
@@ -220,10 +256,10 @@ pub const ODDU: u64 = 1 << 62;
 pub const XCH: usize = 1024; // records per chunk
 pub const XREC: usize = std::mem::size_of::<XRec>();
 
-/// Write-combining buffer for 8 index-bucket records (three cache lines).
+/// Write-combining buffer for 8 index-bucket records (two cache lines).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-pub struct WcX(pub [u64; 24]);
+pub struct WcX(pub [u64; 16]);
 
 pub const COMPLEX: u64 = 1 << 63;
 /// In `Fx::gt`: the user number has valid events with an odd event ID (set by the

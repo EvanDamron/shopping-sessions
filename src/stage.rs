@@ -2,7 +2,7 @@
 //! general pipeline's phases B and C.
 //!
 //! Phase A (main.rs, fast.rs) leaves every event line with a generator-shaped event ID
-//! as a 24-byte `XRec` in the bucket of its event number, and every click with a
+//! as a 16-byte `XRec` in the bucket of its event number, and every click with a
 //! generator-shaped user ID as a `CRec` in the bucket of its user number. This module
 //! turns those into rows and campaign counts in one pass per bucket:
 //!
@@ -31,7 +31,7 @@
 //! summaries are joined once all buckets are done, and a joined run that fails a check
 //! is read again from its buckets (`replay`).
 
-use crate::fast::{scramble, Fx, XRec, COMPLEX, EXTRA, INVALID, ODDU, XCH};
+use crate::fast::{scramble, Fx, XRec, COMPLEX, EXT, EXTRA, INVALID, ODDU, XA, XCH, XLO};
 use crate::id::Id;
 use crate::mem;
 use crate::{begin_person, flush, CRec, Ctx, PRec, Shared, Worker, CCH, CS};
@@ -65,6 +65,9 @@ const NONE: u32 = u32::MAX;
 /// With more sessions than this, the sessions a click reaches are found by binary
 /// search rather than by comparing the click with every session start.
 const SCAN: usize = 256;
+
+/// The sessions `bulk_rows` builds at a time (then on to the next run start).
+const BULK: usize = 512;
 
 /// Piece flags.
 const GENERAL: u32 = 1; // already filed with the general pipeline
@@ -132,6 +135,49 @@ struct Scr {
     piv: Vec<u32>,     // the last start of each block of 16 sessions
     sday: Vec<u8>,     // per session: which of the person's days it is on
     dmask: Vec<u64>,   // per day, `words` words: the sessions on it
+    camp: Vec<u32>,    // per session: the campaign it is credited to (`person_bulk`)
+}
+
+/// A bucket's sessions and rows, built for the whole bucket before its runs are walked
+/// (`bulk_rows`). A row is the sessions of one person on one day: a new row starts
+/// where a run starts or the day changes. A whole run then copies its rows out as they
+/// are (`person_bulk`). Every array is sized for a full bucket.
+struct Bulk {
+    st: Vec<u32>,   // per session: start time
+    day: Vec<u32>,  // per session: day index (`day_of`)
+    row: Vec<u32>,  // per session: its row
+    rs: Vec<u32>,   // per row: its first session; one more entry: the number of sessions
+    rday: Vec<i32>, // per row: the date column (day index + `Ctx::day0`)
+    rses: Vec<i32>, // per row: sessions
+    rev: Vec<i32>,  // per row: events
+    rrev: Vec<i64>, // per row: revenue
+    rtop: Vec<u32>, // per row: top category, or NONE without purchases
+    rk: Vec<u32>,   // the first session of each run; ends with the number of sessions
+    ps: Vec<u32>,   // sessions with a purchase, in order; ends with NONE
+    pr: Vec<u64>,   // their revenue
+    cat: Vec<(u32, u64)>, // work area: (category, revenue) of the row at hand
+}
+
+impl Bulk {
+    fn new(cap: usize) -> Bulk {
+        // (Eight entries of slack: rows are copied out eight at a time.)
+        let n = cap + 10;
+        Bulk {
+            st: vec![0; n],
+            day: vec![0; n],
+            row: vec![0; n],
+            rs: vec![0; n],
+            rk: vec![0; n],
+            rday: vec![0; n],
+            rses: vec![0; n],
+            rev: vec![0; n],
+            rrev: vec![0; n],
+            rtop: vec![0; n],
+            ps: vec![0; n],
+            pr: vec![0; n],
+            cat: Vec::new(),
+        }
+    }
 }
 
 /// One thread's campaign counts for whole persons. A campaign's days are one row of
@@ -234,6 +280,7 @@ struct Tls {
     esc: Vec<(u32, u64)>,      // (dense index, user number * 512 + alias) of far aliases
     odd: Vec<(u64, u32, u32)>, // events of odd user IDs: (person, t, pc)
     scr: Scr,
+    bulk: Bulk,
     acc: Acc,
     ahead: u32, // clicks of the index up to here have had their campaign rows fetched
     edges: Edges,
@@ -293,6 +340,7 @@ impl Tls {
                 esc: Vec::new(),
                 odd: Vec::new(),
                 scr: Scr::default(),
+                bulk: Bulk::new(cap),
                 acc,
                 ahead: 0,
                 edges: Edges::default(),
@@ -340,14 +388,17 @@ unsafe fn place(tab: *mut Slot, pcs: *mut u32, l: &[(usize, u32)]) {
             // (The place of a record a few ahead is fetched early, and the records
             // themselves further ahead.)
             prefetch_read(rs.add(i + 48));
-            prefetch_write(tab.add((*rs.add((i + AHEAD).min(n - 1))).lo as usize));
-            let at = r.lo as usize;
+            prefetch_write(tab.add((((*rs.add((i + AHEAD).min(n - 1))).a >> XLO) & 0xFFFF) as usize));
+            let at = ((r.a >> XLO) & 0xFFFF) as usize;
             let s = tab.add(at);
-            if r.ing < (*s).ing {
-                *s = Slot { a: r.a, t: r.t | ((r.pc != 0) as u32) << 31, ing: r.ing };
-                if r.pc != 0 {
-                    *pcs.add(at) = r.pc;
+            if r.a & EXT != 0 {
+                // The price of the purchase filed just before: the event's if that
+                // copy (or an identical one) holds the place.
+                if r.ing == (*s).ing {
+                    *pcs.add(at) = r.t;
                 }
+            } else if r.ing < (*s).ing {
+                *s = Slot { a: r.a & XA, t: r.t, ing: r.ing };
             }
         }
     }
@@ -778,49 +829,8 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let off = ctx.dayoff as i32;
     let m = s.st.len();
     let words = m.div_ceil(64);
-    let mut clicks = false;
-    if !kc.is_empty() {
-        s.st.reserve(16);
-        let end = s.st.as_mut_ptr().add(m);
-        for i in 0..16 {
-            *end.add(i) = u32::MAX;
-        }
-        if wide && m > 16 && m <= SCAN {
-            s.piv.clear();
-            s.piv.resize(16, u32::MAX);
-            for k in 0..m / 16 {
-                s.piv[k] = *s.st.get_unchecked(16 * k + 15);
-            }
-        }
-        s.top.clear();
-        s.top.resize(m, (0, 0, 0));
-        if s.slot_of.len() < ctx.organic as usize {
-            s.slot_of.resize(ctx.organic as usize, 0);
-        }
-        s.touched.clear();
-        s.reached.clear();
-        #[cfg(target_arch = "x86_64")]
-        {
-            clicks = if wide { click_pass_wide(s, kc, ids, m, words, &cid) } else { click_pass_plain(s, kc, ids, m, words, &cid) };
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = wide;
-            clicks = click_pass_plain(s, kc, ids, m, words, &cid);
-        }
-    }
-    {
-        // The rows are appended to six columns that are not in cache: the lines the
-        // next few persons' rows will land on are fetched now.
-        let r = &st.rows;
-        prefetch_write(r.dict.as_ptr().wrapping_add(r.dict.len() + 128));
-        prefetch_write((r.runs.as_ptr() as *const u8).wrapping_add(r.runs.len() * 4 + 64));
-        prefetch_write((r.days.as_ptr() as *const u8).wrapping_add(r.days.len() * 4 + 128));
-        prefetch_write((r.sessions.as_ptr() as *const u8).wrapping_add(r.sessions.len() * 4 + 128));
-        prefetch_write((r.events.as_ptr() as *const u8).wrapping_add(r.events.len() * 4 + 128));
-        prefetch_write((r.revenue.as_ptr() as *const u8).wrapping_add(r.revenue.len() * 8 + 192));
-        prefetch_write((r.tops.as_ptr() as *const u8).wrapping_add(r.tops.len() * 2 + 64));
-    }
+    let clicks = !kc.is_empty() && click_setup(s, ctx, kc, ids, m, words, wide, &cid);
+    prefetch_rows(st);
     let (mut cur, mut us, mut ue, mut ur) = (NONE, 0u32, 0u32, 0u64);
     let mut pp = 0usize;
     let npur = s.pur.len();
@@ -890,6 +900,68 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         }
     }
     flush(st, name, cur as i64 + ctx.day0, us, ue, ur, ctx);
+    assists(s, acc, words, clicks, !kc.is_empty());
+}
+
+/// The click pass of a person whose `m` session starts are in `s.st` (person_rows,
+/// person_bulk): sets up the work areas and finds, per session, the latest click that
+/// reached it first-hand (`s.top`) and per campaign the sessions it reached. Returns
+/// whether any click reaches a session.
+#[inline(always)]
+unsafe fn click_setup(s: &mut Scr, ctx: &Ctx, kc: &[Kc], ids: u32, m: usize, words: usize, wide: bool, cid: &impl Fn(u32) -> Id) -> bool {
+    s.st.reserve(16);
+    let end = s.st.as_mut_ptr().add(m);
+    for i in 0..16 {
+        *end.add(i) = u32::MAX;
+    }
+    if wide && m > 16 && m <= SCAN {
+        s.piv.clear();
+        s.piv.resize(16, u32::MAX);
+        for k in 0..m / 16 {
+            s.piv[k] = *s.st.get_unchecked(16 * k + 15);
+        }
+    }
+    s.top.clear();
+    s.top.resize(m, (0, 0, 0));
+    if s.slot_of.len() < ctx.organic as usize {
+        s.slot_of.resize(ctx.organic as usize, 0);
+    }
+    s.touched.clear();
+    s.reached.clear();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if wide {
+            click_pass_wide(s, kc, ids, m, words, cid)
+        } else {
+            click_pass_plain(s, kc, ids, m, words, cid)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = wide;
+        click_pass_plain(s, kc, ids, m, words, cid)
+    }
+}
+
+/// The rows are appended to columns that are not in cache: the lines the next few
+/// persons' rows will land on are fetched now.
+#[inline(always)]
+unsafe fn prefetch_rows(st: &CS) {
+    let r = &st.rows;
+    prefetch_write(r.dict.as_ptr().wrapping_add(r.dict.len() + 128));
+    prefetch_write((r.runs.as_ptr() as *const u8).wrapping_add(r.runs.len() * 4 + 64));
+    prefetch_write((r.days.as_ptr() as *const u8).wrapping_add(r.days.len() * 4 + 128));
+    prefetch_write((r.sessions.as_ptr() as *const u8).wrapping_add(r.sessions.len() * 4 + 128));
+    prefetch_write((r.events.as_ptr() as *const u8).wrapping_add(r.events.len() * 4 + 128));
+    prefetch_write((r.revenue.as_ptr() as *const u8).wrapping_add(r.revenue.len() * 8 + 192));
+    prefetch_write((r.tops.as_ptr() as *const u8).wrapping_add(r.tops.len() * 2 + 64));
+}
+
+/// Assists after a click pass (`clicks`: it reached a session), with the person's
+/// days in `s.days`, `s.sday` and `s.dmask`; then the campaign slots are cleared.
+#[inline(always)]
+unsafe fn assists(s: &mut Scr, acc: &Acc, words: usize, clicks: bool, any_clicks: bool) {
+    let wsh = acc.wsh;
     if clicks {
         // Assists: per campaign, the sessions it reached, counted day by day: the
         // first reached session left names a day, that day's sessions are counted
@@ -907,17 +979,236 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
             }
             *s.slot_of.get_unchecked_mut(c as usize) = 0;
         }
-    } else if !kc.is_empty() {
+    } else if any_clicks {
         for &c in &s.touched {
             *s.slot_of.get_unchecked_mut(c as usize) = 0;
         }
     }
 }
 
-/// A run that passed `whole`, with its sessions and purchases in `s`.
+/// The top category of a row from its (category, revenue) list: the highest summed
+/// revenue, ties to the smaller category (as `flush` picks it); NONE for an empty list.
 #[inline(always)]
-unsafe fn person(env: &Env, st: &mut CS, s: &mut Scr, acc: &Acc, ahead: &mut u32, g: u32, bits: u32, mask: u32) {
-    let name = name_of(g, bits, mask, env.fx.uk);
+fn top_of(cat: &[(u32, u64)]) -> u32 {
+    let mut top = u32::MAX;
+    let mut best = 0u64;
+    for &(c, r) in cat {
+        if r > best || (r == best && c < top) {
+            best = r;
+            top = c;
+        }
+    }
+    top
+}
+
+/// Builds `x.bulk` for sessions `k0..k1` of a bucket after `cut` (`k0` and `k1` start
+/// runs) and their purchases `p0..p1` of the purchase list: per session its start, day
+/// and row, per row its columns, and the revenue of each session with a purchase. All
+/// of it is numbered from `k0`. Rows of runs that later take another path are built too
+/// and left unused.
+#[cfg_attr(prof, inline(never))]
+#[cfg_attr(not(prof), inline(always))]
+unsafe fn bulk_rows(x: &mut Tls, k0: usize, k1: usize, p0: usize, p1: usize, off: i32, day0: i64) {
+    let (t, ss, pi, pc) = (x.t, x.ss.add(k0), x.pi, x.pc);
+    let ns = k1 - k0;
+    let bk = &mut x.bulk;
+    let (bst, bday, brow, rs, rk) = (bk.st.as_mut_ptr(), bk.day.as_mut_ptr(), bk.row.as_mut_ptr(), bk.rs.as_mut_ptr(), bk.rk.as_mut_ptr());
+    // Sessions: a row starts at a run start or where the day differs from the session
+    // before. The row and run lists are written at every session and kept where one
+    // starts.
+    let (mut nr, mut nk) = (0usize, 0usize);
+    let mut prev = NONE;
+    for j in 0..ns {
+        let a = *ss.add(j);
+        let start = *t.add((a & M31) as usize) & M31;
+        let day = day_of(start, off);
+        *bst.add(j) = start;
+        *bday.add(j) = day;
+        *rs.add(nr) = j as u32;
+        *rk.add(nk) = j as u32;
+        nk += (a >> 31) as usize;
+        nr += ((a >> 31) | (day != prev) as u32) as usize;
+        *brow.add(j) = nr as u32 - 1;
+        prev = day;
+    }
+    *rs.add(nr) = ns as u32;
+    *rk.add(nk) = ns as u32;
+    // Rows: date, sessions and events from the row's first session and the next row's.
+    let (rday, rses, rev, rrev, rtop) = (bk.rday.as_mut_ptr(), bk.rses.as_mut_ptr(), bk.rev.as_mut_ptr(), bk.rrev.as_mut_ptr(), bk.rtop.as_mut_ptr());
+    for r in 0..nr {
+        let (a, b) = (*rs.add(r) as usize, *rs.add(r + 1) as usize);
+        *rday.add(r) = (*bday.add(a) as i64 + day0) as i32;
+        *rses.add(r) = (b - a) as i32;
+        *rev.add(r) = ((*ss.add(b) & M31) - (*ss.add(a) & M31)) as i32;
+        *rrev.add(r) = 0;
+        *rtop.add(r) = NONE;
+    }
+    // Purchases, in event order: each is added to its session and its row.
+    let (ps, pr) = (bk.ps.as_mut_ptr(), bk.pr.as_mut_ptr());
+    let cat = &mut bk.cat;
+    cat.clear();
+    let (mut sj, mut np, mut cr) = (0usize, 0usize, NONE);
+    for q in p0..p1 {
+        let i = *pi.add(q);
+        while (*ss.add(sj + 1) & M31) <= i {
+            sj += 1;
+        }
+        let v = *pc.add(i as usize);
+        let (price, cg) = ((v & 0x00FF_FFFF) as u64, v >> 24);
+        if np > 0 && *ps.add(np - 1) == sj as u32 {
+            *pr.add(np - 1) += price;
+        } else {
+            *ps.add(np) = sj as u32;
+            *pr.add(np) = price;
+            np += 1;
+        }
+        let r = *brow.add(sj);
+        if r != cr {
+            if cr != NONE {
+                *rtop.add(cr as usize) = top_of(cat);
+                cat.clear();
+            }
+            cr = r;
+        }
+        *rrev.add(r as usize) += price as i64;
+        match cat.iter_mut().find(|e| e.0 == cg) {
+            Some(e) => e.1 += price,
+            None => cat.push((cg, price)),
+        }
+    }
+    if cr != NONE {
+        *rtop.add(cr as usize) = top_of(cat);
+    }
+    *ps.add(np) = NONE;
+}
+
+/// A whole person whose rows are in `bk`: sessions `k..ke` of the bucket, sessions with
+/// a purchase `q.0..q.1` of `bk.ps`, clicks `kc` (those whose alias is in `ids`). Its
+/// rows are copied out of `bk` in one go; credit and assists as in `person_rows`.
+#[cfg_attr(prof, inline(never))]
+#[cfg_attr(not(prof), inline(always))]
+unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, bk: &Bulk, k: usize, ke: usize, q: (usize, usize), kc: &[Kc], ids: u32, wide: bool, cid: impl Fn(u32) -> Id) {
+    let wsh = acc.wsh;
+    let m = ke - k;
+    let words = m.div_ceil(64);
+    let mut clicks = false;
+    if !kc.is_empty() {
+        s.st.clear();
+        put(&mut s.st, bk.st.as_ptr().add(k), m);
+        clicks = click_setup(s, ctx, kc, ids, m, words, wide, &cid);
+    }
+    let (r0, r1) = (*bk.row.get_unchecked(k) as usize, *bk.row.get_unchecked(ke - 1) as usize + 1);
+    let nr = r1 - r0;
+    // Rows: one dictionary entry, the row count, then the columns as slices.
+    prefetch_rows(st);
+    let rw = &mut st.rows;
+    if name.is_long() {
+        begin_person(st, name);
+    } else {
+        // A short name is its 16 bytes as they are; the length goes first.
+        let len = (name.hi >> 56) as usize;
+        rw.dict.reserve(20);
+        let d = rw.dict.as_mut_ptr().add(rw.dict.len());
+        (d as *mut u32).write_unaligned(len as u32);
+        (d.add(4) as *mut Id).write_unaligned(name);
+        rw.dict.set_len(rw.dict.len() + 4 + len);
+        rw.ndict += 1;
+        rw.runs.push(0);
+    }
+    let rw = &mut st.rows;
+    *rw.runs.last_mut().unwrap_unchecked() = nr as u32;
+    put(&mut rw.days, bk.rday.as_ptr().add(r0), nr);
+    put(&mut rw.sessions, bk.rses.as_ptr().add(r0), nr);
+    put(&mut rw.events, bk.rev.as_ptr().add(r0), nr);
+    put(&mut rw.revenue, bk.rrev.as_ptr().add(r0), nr);
+    // One bit per row for a top category, and the categories of the rows that have one.
+    let n0 = rw.n;
+    rw.top_bits.resize((n0 + nr).div_ceil(8), 0);
+    rw.tops.reserve(nr);
+    let (tb, tp) = (rw.top_bits.as_mut_ptr(), rw.tops.as_mut_ptr());
+    let mut nt = rw.tops.len();
+    for i in 0..nr {
+        let top = *bk.rtop.get_unchecked(r0 + i);
+        let has = top != NONE;
+        let p = n0 + i;
+        *tb.add(p / 8) |= (has as u8) << (p % 8);
+        *tp.add(nt) = top as u16;
+        nt += has as usize;
+    }
+    rw.tops.set_len(nt);
+    rw.n = n0 + nr;
+    // Credit: without clicks every session is organic, counted a row at a time.
+    let org = ctx.organic;
+    if clicks {
+        s.camp.clear();
+        s.camp.reserve(m);
+        let cp = s.camp.as_mut_ptr();
+        // The person's days for the assists: (day, first session), and per session
+        // which of them it is on.
+        s.days.clear();
+        s.dmask.clear();
+        s.dmask.resize(nr * words, 0);
+        if s.sday.len() < m {
+            s.sday.resize(m, 0);
+        }
+        for r in r0..r1 {
+            let a = *bk.rs.get_unchecked(r);
+            s.days.push((*bk.day.get_unchecked(a as usize), a - k as u32));
+        }
+        let (sday, dmask) = (s.sday.as_mut_ptr(), s.dmask.as_mut_ptr());
+        // The click the session at hand could be credited to: (time, campaign); before
+        // the first, a time no session is within a week of.
+        let (mut cts, mut ccamp) = (-(1i64 << 40), org);
+        for j in 0..m {
+            let start = *bk.st.get_unchecked(k + j);
+            let top = *s.top.get_unchecked(j);
+            let fresh = top.0 != 0;
+            cts = if fresh { top.0 as i64 - 1 } else { cts };
+            ccamp = if fresh { top.1 } else { ccamp };
+            let camp = if start as i64 - cts <= WEEK as i64 { ccamp } else { org };
+            *cp.add(j) = camp;
+            *acc.sess.add(((camp as usize) << wsh) + *bk.day.get_unchecked(k + j) as usize) += 1;
+            let di = *bk.row.get_unchecked(k + j) as usize - r0;
+            *sday.add(j) = di as u8;
+            *dmask.add(di * words + j / 64) |= 1 << (j % 64);
+        }
+    } else {
+        let row = acc.sess.add((org as usize) << wsh);
+        for r in r0..r1 {
+            *row.add(*bk.day.get_unchecked(*bk.rs.get_unchecked(r) as usize) as usize) += *bk.rses.get_unchecked(r) as u32;
+        }
+    }
+    for qq in q.0..q.1 {
+        let rev = *bk.pr.get_unchecked(qq);
+        if rev > 0 {
+            let j = *bk.ps.get_unchecked(qq) as usize;
+            let camp = if clicks { *s.camp.as_ptr().add(j - k) } else { org };
+            let cell = ((camp as usize) << wsh) + *bk.day.get_unchecked(j) as usize;
+            *acc.purch.add(cell) += 1;
+            *acc.rev.add(cell) += rev;
+        }
+    }
+    assists(s, acc, words, clicks, !kc.is_empty());
+}
+
+/// Appends `n` values from `src` to `v`; up to eight are copied as one block (`src`
+/// has that many readable).
+#[inline(always)]
+unsafe fn put<T: Copy>(v: &mut Vec<T>, src: *const T, n: usize) {
+    if n <= 8 {
+        v.reserve(8);
+        let d = v.as_mut_ptr().add(v.len());
+        (d as *mut [T; 8]).write_unaligned((src as *const [T; 8]).read_unaligned());
+        v.set_len(v.len() + n);
+    } else {
+        v.extend_from_slice(std::slice::from_raw_parts(src, n));
+    }
+}
+
+/// The clicks of user number `g` in the click index, and its click bucket's chunks.
+/// The campaign rows of the clicks a little further on are fetched now.
+#[inline(always)]
+unsafe fn clicks_of<'a>(env: &Env<'a>, acc: &Acc, ahead: &mut u32, g: u32) -> (&'a [Kc], &'a [(usize, u32)]) {
     let (c0, c1) = (*env.coff.get_unchecked(g as usize), *env.coff.get_unchecked(g as usize + 1));
     // The index is in user-number order, the order runs come in: the campaign rows of
     // the clicks a little further on are fetched now, for the next few persons.
@@ -933,7 +1224,14 @@ unsafe fn person(env: &Env, st: &mut CS, s: &mut Scr, acc: &Acc, ahead: &mut u32
         *ahead = c1; // a very large person: not worth fetching for
     }
     let kc = std::slice::from_raw_parts(env.kc.add(c0 as usize), (c1 - c0) as usize);
-    let l = env.li.cl.get_unchecked((g >> env.fx.cshift) as usize);
+    (kc, env.li.cl.get_unchecked((g >> env.fx.cshift) as usize))
+}
+
+/// A run that passed `whole`, with its sessions and purchases in `s`.
+#[inline(always)]
+unsafe fn person(env: &Env, st: &mut CS, s: &mut Scr, acc: &Acc, ahead: &mut u32, g: u32, bits: u32, mask: u32) {
+    let name = name_of(g, bits, mask, env.fx.uk);
+    let (kc, l) = clicks_of(env, acc, ahead, g);
     person_rows(st, acc, env.ctx, name, s, kc, if mask != 0 { mask } else { bits }, env.wide, |j| (*crec(l, j as usize)).cid);
 }
 
@@ -1111,12 +1409,29 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
     let (mut k, mut pp, mut ep, mut up) = (0usize, 0usize, 0usize, 0usize);
     let (nesc, nuns) = (x.esc.len(), x.uns.len());
     let mut ends = [NONE; 2];
+    // `x.bulk` holds the sessions `k0..k1`, a few hundred at a time so that it stays in
+    // cache; `pb` is the first purchase after them.
+    let (mut k0, mut k1, mut pb) = (0usize, 0usize, 0usize);
+    let mut qp = 0usize; // sessions with a purchase: the first not before the run at hand
+    let mut ri = 0usize; // the run at hand in `x.bulk.rk`
     while k < c.ns {
-        let r0 = (*ss.add(k) & M31) as usize;
-        let mut ke = k + 1;
-        while (*ss.add(ke) as i32) >= 0 {
-            ke += 1;
+        if k == k1 {
+            k0 = k;
+            k1 = (k + BULK).min(c.ns);
+            while (*ss.add(k1) as i32) >= 0 {
+                k1 += 1;
+            }
+            let (p0, e1) = (pb, *ss.add(k1) & M31);
+            while pb < c.np && *pi.add(pb) < e1 {
+                pb += 1;
+            }
+            bulk_rows(x, k0, k1, p0, pb, env.ctx.dayoff as i32, env.ctx.day0);
+            qp = 0;
+            ri = 0;
         }
+        let r0 = (*ss.add(k) & M31) as usize;
+        ri += 1;
+        let ke = k0 + *x.bulk.rk.get_unchecked(ri) as usize;
         let r1 = (*ss.add(ke) & M31) as usize;
         let g = *u.add(r0) >> 4;
         // The columns, the table of user numbers and the click index are read front
@@ -1183,7 +1498,27 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
                 ends[1] = id;
             }
         } else if !complex {
-            if whole(bits, mask) && !unsorted {
+            if whole(bits, mask) && !unsorted && more.is_empty() {
+                // Its rows are in `x.bulk`.
+                let bk = &x.bulk;
+                let (kl, kel) = (k - k0, ke - k0);
+                while (*bk.ps.get_unchecked(qp) as usize) < kl {
+                    qp += 1;
+                }
+                let mut qe = qp;
+                while (*bk.ps.get_unchecked(qe) as usize) < kel {
+                    qe += 1;
+                }
+                let acc = x.acc;
+                let name = name_of(g, bits, mask, env.fx.uk);
+                let (kc, l) = clicks_of(env, &acc, &mut x.ahead, g);
+                let ids = if mask != 0 { mask } else { bits };
+                person_bulk(st, &acc, env.ctx, name, &mut x.scr, bk, kl, kel, (qp, qe), kc, ids, env.wide, |j| (*crec(l, j as usize)).cid);
+                qp = qe;
+                x.cnt[0] += (r1 - r0) as u64;
+                x.cnt[2] += 1;
+                x.cnt[3] += (ke - k) as u64;
+            } else if whole(bits, mask) && !unsorted {
                 let s = &mut x.scr as *mut Scr;
                 (*s).st.clear();
                 (*s).sn.clear();
@@ -1806,6 +2141,157 @@ mod tests {
                 assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
                 assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bulk_rows_match_person_rows() {
+        let cats: Vec<Vec<u8>> = [&b"apparel"[..], b"books", b"garden", b"toys", b"unknown"].iter().map(|c| c.to_vec()).collect();
+        let ctx = ctx(&cats);
+        let cells = (ctx.organic as usize + 1) * ctx.ndays;
+        let cap = 1 << 14;
+        let mut r = Rnd(0x5a5a_1234_c3c3_8765);
+        let mut xa = Tls::new(cap, 0, &ctx);
+        let xb = Tls::new(64, 1, &ctx);
+        let wides: &[bool] = if wide_ok() { &[false, true] } else { &[false] };
+        let clear = |acc: &Acc| unsafe {
+            let rows = (ctx.organic as usize + 1) << acc.wsh;
+            std::ptr::write_bytes(acc.rev, 0, rows);
+            std::ptr::write_bytes(acc.sess, 0, rows);
+            std::ptr::write_bytes(acc.assist, 0, rows);
+            std::ptr::write_bytes(acc.purch, 0, rows);
+        };
+        for round in 0..1_500 {
+            let wide = wides[round % wides.len()];
+            // A bucket: persons with rising user numbers, each with time-sorted events.
+            let persons = 1 + r.below(30) as usize;
+            let ties = round % 3 == 0;
+            let mut n = 0usize;
+            let mut g = 1 + r.below(100) as u32;
+            let mut clicks: Vec<(Vec<Kc>, Vec<Id>)> = Vec::new();
+            for p in 0..persons {
+                let ne = match (round % 100, p) {
+                    (0, 0) => 2500,
+                    (1, 0) => 500,
+                    _ => 1 + r.below(40) as usize,
+                };
+                let mut ev = events(&mut r, ne);
+                if round % 100 == 0 && p == 0 {
+                    // Spread out: one session per event, over 64 and over 256 sessions.
+                    for (i, e) in ev.iter_mut().enumerate() {
+                        e.0 = (WEEK as u64 + i as u64 * (MIN30 as u64 + 1 + (i as u64 % 3))).min(u32::MAX as u64) as u32;
+                    }
+                    ev.retain(|e| e.0 < WEEK + 14 * DAY);
+                }
+                for e in ev.iter_mut() {
+                    if e.1 != 0 && ties {
+                        // Few prices and categories: equal category revenue in a row,
+                        // and purchases of price 0.
+                        e.1 = (r.below(3) as u32 * 100) | ((r.below(3) as u32) << 24);
+                        if e.1 == 0 {
+                            e.1 = 1 << 24;
+                        }
+                    }
+                }
+                for &(t, pc) in &ev {
+                    unsafe {
+                        *xa.t.add(n) = t | if pc != 0 { BUY } else { 0 };
+                        *xa.u.add(n) = g << 4;
+                        *xa.pc.add(n) = pc;
+                    }
+                    n += 1;
+                }
+                let starts: Vec<u32> = sessions(&ev).0;
+                let nclicks = match r.below(4) {
+                    0 => 0,
+                    _ => r.below(25) as usize,
+                };
+                let (mut kc, mut ids) = (Vec::new(), Vec::new());
+                for _ in 0..nclicks {
+                    let s0 = starts[r.below(starts.len() as u64) as usize];
+                    let ts = match r.below(6) {
+                        0 => s0,
+                        1 => s0 - WEEK,
+                        2 => s0 - WEEK - 1,
+                        3 => r.below((21 * DAY) as u64) as u32,
+                        _ => s0 - r.below(3_600_000) as u32,
+                    };
+                    let camp = r.below(ctx.organic as u64) as u32;
+                    kc.push(Kc { ts, ca: (camp << 9) | r.below(3) as u32, j: ids.len() as u32 });
+                    ids.push(Id::intern(format!("k{}", r.below(1_000_000)).as_bytes()));
+                }
+                clicks.push((kc, ids));
+                g += 1 + r.below(3) as u32;
+            }
+            assert!(n <= cap);
+            let (mut got, mut want) = (CS::new(cells), CS::new(cells));
+            unsafe {
+                xa.uns.clear();
+                let c = cut_plain(&mut xa, n);
+                assert!(!c.down && xa.uns.is_empty(), "round {round}");
+                // The bulk arrays a few runs at a time, as `runs` builds them.
+                let (mut k, mut pp, mut qp, mut p) = (0usize, 0usize, 0usize, 0usize);
+                let (mut k0, mut k1, mut pb) = (0usize, 0usize, 0usize);
+                while k < c.ns {
+                    if k == k1 {
+                        k0 = k;
+                        k1 = (k + 1 + r.below(40) as usize).min(c.ns);
+                        while (*xa.ss.add(k1) as i32) >= 0 {
+                            k1 += 1;
+                        }
+                        let (p0, e1) = (pb, *xa.ss.add(k1) & M31);
+                        while pb < c.np && *xa.pi.add(pb) < e1 {
+                            pb += 1;
+                        }
+                        bulk_rows(&mut xa, k0, k1, p0, pb, ctx.dayoff as i32, ctx.day0);
+                        qp = 0;
+                    }
+                    let mut ke = k + 1;
+                    while (*xa.ss.add(ke) as i32) >= 0 {
+                        ke += 1;
+                    }
+                    assert_eq!(k0 + *xa.bulk.rk.get_unchecked(1 + (0..k - k0).filter(|&j| *xa.ss.add(k0 + j) & RUN != 0).count()) as usize, ke);
+                    let r1 = (*xa.ss.add(ke) & M31) as usize;
+                    let mut pe = pp;
+                    while pe < c.np && (*xa.pi.add(pe) as usize) < r1 {
+                        pe += 1;
+                    }
+                    let name = user_text(r.below(1 << 40));
+                    let (kc, ids) = &clicks[p];
+                    let allowed = 0b011u32;
+                    let mut s = Scr::default();
+                    sessions_into(&xa, k, ke, pp, pe, &mut s.st, &mut s.sn, &mut s.pur);
+                    person_rows(&mut want, &xb.acc, &ctx, name, &mut s, kc, allowed, wide, |j| ids[j as usize]);
+                    let bk = &xa.bulk;
+                    while (*bk.ps.get_unchecked(qp) as usize) < k - k0 {
+                        qp += 1;
+                    }
+                    let mut qe = qp;
+                    while (*bk.ps.get_unchecked(qe) as usize) < ke - k0 {
+                        qe += 1;
+                    }
+                    let mut s2 = std::mem::take(&mut xa.scr);
+                    person_bulk(&mut got, &xa.acc, &ctx, name, &mut s2, &xa.bulk, k - k0, ke - k0, (qp, qe), kc, allowed, wide, |j| ids[j as usize]);
+                    xa.scr = s2;
+                    qp = qe;
+                    pp = pe;
+                    k = ke;
+                    p += 1;
+                }
+                assert_eq!(p, persons, "round {round}");
+                fold_counts(&xa.acc, &mut got, &ctx);
+                fold_counts(&xb.acc, &mut want, &ctx);
+            }
+            clear(&xa.acc);
+            clear(&xb.acc);
+            let (a, b) = (&got.rows, &want.rows);
+            assert_eq!(a.n, b.n, "round {round}");
+            assert_eq!((&a.dict, &a.runs, a.ndict), (&b.dict, &b.runs, b.ndict), "round {round}");
+            assert_eq!((&a.days, &a.sessions, &a.events), (&b.days, &b.sessions, &b.events), "round {round}");
+            assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round}");
+            assert_eq!(got.credit, want.credit, "credit, round {round}");
+            assert_eq!(got.assist, want.assist, "assists, round {round}");
         }
     }
 
