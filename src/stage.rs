@@ -141,22 +141,38 @@ struct Scr {
 }
 
 /// The most clicks (after the alias filter) a person can have for `few_pass_*`.
-const FEW: usize = 16;
+const FEW: usize = 64;
 /// Persons with more clicks than this in the index are not gathered for `few_pass_*`.
-const GATHER: usize = 64;
+const GATHER: usize = 96;
 
-/// A person's clicks gathered for `few_pass_*` (`few_gather`): per click its time,
-/// time + 7 days, campaign and place in the click bucket. Places `n` to `FEW - 1` hold
-/// time u32::MAX and time + 7 days 0, so no session ever has them in reach.
-/// `camp[FEW]` is the organic campaign, taken when no click is in reach.
-#[derive(Default)]
+/// A person's clicks gathered for `few_pass_*`: as they come in the index (`ts`,
+/// `camp`, `j`: time, campaign, place in the click bucket; `few_gather`), then in time
+/// order, clicks at the same time in index order:
+///   sts   times; at least 16 places from `n` on hold u32::MAX
+///   sc    campaigns; place FEW: the organic campaign
+///   sj    places in the click bucket
+///   sc1   place 0: the organic campaign; place r + 1: the campaign of click r, with
+///         bit 31 set if click r has the same time as click r - 1
+///   sp    the place of the click before it with the same campaign, or -1
+/// The clicks a session reaches are then a range of places `lo..e`.
 #[repr(C, align(64))]
 struct Few {
     ts: [u32; FEW + 1],
-    tw: [u32; FEW],
     camp: [u32; FEW + 1],
     j: [u32; FEW + 1],
+    sts: [u32; FEW + 16],
+    sc: [u32; FEW + 1],
+    sj: [u32; FEW],
+    sc1: [u32; FEW + 1],
+    sp: [i32; FEW],
     n: usize,
+}
+
+impl Default for Few {
+    fn default() -> Few {
+        // (All fields are plain numbers.)
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 /// A bucket's sessions and rows, built for the whole bucket before its runs are walked
@@ -851,14 +867,14 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let m = s.st.len();
     let words = m.div_ceil(64);
     // Few clicks: credit and assists of every session first (`few_pass`).
-    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids, ctx.organic);
+    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids);
     let few = gathered && s.few.n != 0;
     if few {
         s.dayv.clear();
         s.dayv.extend(s.st.iter().map(|&t| day_of(t, off)));
         s.camp.clear();
         s.camp.reserve(m);
-        few_pass(&s.few, s.st.as_ptr(), s.dayv.as_ptr(), m, acc, s.camp.as_mut_ptr(), wide, &cid);
+        few_pass(&mut s.few, s.st.as_ptr(), s.dayv.as_ptr(), m, acc, ctx.organic, false, s.camp.as_mut_ptr(), wide, &cid);
     }
     let clicks = !kc.is_empty() && !gathered && click_setup(s, ctx, kc, ids, m, words, wide, &cid);
     prefetch_rows(st);
@@ -980,7 +996,7 @@ unsafe fn click_setup(s: &mut Scr, ctx: &Ctx, kc: &[Kc], ids: u32, m: usize, wor
 /// `kc` has at most `GATHER` entries and at most `FEW` of them are the person's.
 /// Returns whether it did; `f.n` may then be 0.
 #[inline(always)]
-unsafe fn few_gather(f: &mut Few, kc: &[Kc], ids: u32, org: u32) -> bool {
+unsafe fn few_gather(f: &mut Few, kc: &[Kc], ids: u32) -> bool {
     if kc.len() > GATHER {
         return false;
     }
@@ -996,137 +1012,193 @@ unsafe fn few_gather(f: &mut Few, kc: &[Kc], ids: u32, org: u32) -> bool {
         *f.j.get_unchecked_mut(at) = r.j;
         n += keep as usize;
     }
-    if n > FEW {
-        return false;
-    }
-    for i in 0..FEW {
-        let pad = i >= n;
-        let ts = if pad { u32::MAX } else { f.ts[i] };
-        f.ts[i] = ts;
-        f.tw[i] = if pad { 0 } else { ts.wrapping_add(WEEK) };
-    }
-    f.camp[FEW] = org;
     f.n = n;
-    true
+    n <= FEW
 }
 
-/// Credit and assists of one session for `few_pass_*`, given over the gathered clicks
-/// the mask of those in reach with no later one in reach (`tie`) and the mask of those
-/// in reach with no earlier one of the same campaign in reach (`first`). Adds the
-/// assists of the session's day `day` and returns the campaign it is credited to.
+/// The campaign credited at the end of the clicks' time order `e` (`e - 1` ties with
+/// the click before it): of the clicks at that time, the smallest click_id, the first
+/// in index order among equal ones, as `click_pass` picks it. The IDs are read only if
+/// the campaigns differ.
+#[cold]
+#[inline(never)]
+unsafe fn few_tie(f: &Few, e: usize, cid: &impl Fn(u32) -> Id) -> u32 {
+    let mut a = e - 1;
+    while a > 0 && f.sc1[a + 1] >> 31 != 0 {
+        a -= 1;
+    }
+    let c0 = f.sc[a];
+    if f.sc[a..e].iter().all(|&c| c == c0) {
+        return c0;
+    }
+    let mut best = a;
+    for r in a + 1..e {
+        if f.sj[r] != f.sj[best] && cid(f.sj[r]).less(&cid(f.sj[best])) {
+            best = r;
+        }
+    }
+    f.sc[best]
+}
+
+/// One session for `few_pass_*`: the clicks it reaches are places `lo..e` of the time
+/// order, `first` of them (a mask over places) have no click of the same campaign
+/// before them in reach. Adds an assist on day `day` per campaign of `first`, and the
+/// session itself if `sess`, and returns the campaign credited: the latest click's,
+/// organic if none.
 #[inline(always)]
-unsafe fn few_session(f: &Few, tie: u32, mut first: u32, day: u32, acc: &Acc, cid: &impl Fn(u32) -> Id) -> u32 {
-    // No click in reach: place FEW, organic.
-    let mut camp = *f.camp.get_unchecked((tie | 1 << FEW).trailing_zeros() as usize);
-    if tie & tie.wrapping_sub(1) != 0 {
-        camp = few_tie(f, tie, cid);
+unsafe fn few_session(f: &Few, lo: usize, e: usize, mut first: u64, day: u32, acc: &Acc, sess: bool, cid: &impl Fn(u32) -> Id) -> u32 {
+    let v = *f.sc1.get_unchecked(if e > lo { e } else { 0 });
+    let mut camp = v & M31;
+    if v >> 31 != 0 {
+        camp = few_tie(f, e, cid);
+    }
+    if sess {
+        *acc.sess.add(((camp as usize) << acc.wsh) + day as usize) += 1;
+    }
+    // The first two assists without a branch: with none left, place FEW (organic)
+    // gets 0 added.
+    for _ in 0..2 {
+        let c = *f.sc.get_unchecked(first.trailing_zeros() as usize);
+        *acc.assist.add(((c as usize) << acc.wsh) + day as usize) += (first != 0) as u32;
+        first &= first.wrapping_sub(1);
     }
     while first != 0 {
-        let c = *f.camp.get_unchecked(first.trailing_zeros() as usize);
+        let c = *f.sc.get_unchecked(first.trailing_zeros() as usize);
         *acc.assist.add(((c as usize) << acc.wsh) + day as usize) += 1;
         first &= first - 1;
     }
     camp
 }
 
-/// The campaign of the credited click among clicks at the same latest time (`tie`, two
-/// or more): the smallest click_id, the first in index order among equal ones, as
-/// `click_pass` picks it. The IDs are read only if the campaigns differ.
-#[cold]
-#[inline(never)]
-unsafe fn few_tie(f: &Few, tie: u32, cid: &impl Fn(u32) -> Id) -> u32 {
-    let mut best = tie.trailing_zeros() as usize;
-    let c0 = f.camp[best];
-    let mut rest = tie & (tie - 1);
-    let mut same = true;
-    while rest != 0 {
-        same &= f.camp[rest.trailing_zeros() as usize] == c0;
-        rest &= rest - 1;
-    }
-    if same {
-        return c0;
-    }
-    let mut rest = tie & (tie - 1);
-    while rest != 0 {
-        let i = rest.trailing_zeros() as usize;
-        if f.j[i] != f.j[best] && cid(f.j[i]).less(&cid(f.j[best])) {
-            best = i;
-        }
-        rest &= rest - 1;
-    }
-    f.camp[best]
+/// The places `lo..e` as a mask.
+#[inline(always)]
+fn span(lo: usize, e: usize) -> u64 {
+    let below = |k: usize| if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
+    below(e) & !below(lo)
 }
 
 /// Credit and assists of a person with few clicks (gathered in `f`, `f.n` > 0) and `m`
 /// sessions with starts `st` and days `day`: each session's campaign goes to `out`, its
-/// assists to `acc`. Per session, over all clicks at once: those in reach (at or before
-/// the start, within 7 days), of them those with no later one in reach (the credited
-/// click, or a tie) and those with no earlier one of the same campaign in reach (one
-/// assist each). Per person, per click: the clicks later than it, and the earlier ones
-/// of its campaign.
+/// assists to `acc`, and the session itself if `sess` (`org`: the organic campaign).
+/// The clicks are put in time order once (each click's place is the number of clicks
+/// before it); then per session the clicks it reaches are those from the first within
+/// 7 days before its start to the last at or before it, counted with one compare each
+/// over all clicks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,popcnt")]
-unsafe fn few_pass_wide(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, cid: &impl Fn(u32) -> Id) {
+unsafe fn few_pass_wide(f: &mut Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, org: u32, sess: bool, out: *mut u32, cid: &impl Fn(u32) -> Id) {
     use core::arch::x86_64::*;
     let n = f.n;
-    let tsv = _mm512_loadu_si512(f.ts.as_ptr() as *const __m512i);
-    let twv = _mm512_loadu_si512(f.tw.as_ptr() as *const __m512i);
-    let cv = _mm512_loadu_si512(f.camp.as_ptr() as *const __m512i);
-    let valid = ((1u32 << n) - 1) as __mmask16;
-    // Lane i: bit k set if click k is later than click i (`later`), or is before it
-    // with the same campaign (`twin`).
-    let (mut later, mut twin) = (_mm512_setzero_si512(), _mm512_setzero_si512());
-    for k in 0..n {
-        let bit = _mm512_set1_epi32(1 << k);
-        let lt = _mm512_cmplt_epu32_mask(tsv, _mm512_set1_epi32(*f.ts.get_unchecked(k) as i32));
-        later = _mm512_mask_or_epi32(later, lt, later, bit);
-        let above = valid & !(((2u32 << k) - 1) as __mmask16);
-        let eq = _mm512_mask_cmpeq_epi32_mask(above, cv, _mm512_set1_epi32(*f.camp.get_unchecked(k) as i32));
-        twin = _mm512_mask_or_epi32(twin, eq, twin, bit);
+    let nv = n.div_ceil(16);
+    let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let valid = |v: usize| (all >> (16 * v)) as __mmask16;
+    let ld = |p: *const u32| _mm512_loadu_si512(p as *const __m512i);
+    // Places: click i goes after every click with an earlier time, or the same time
+    // and a smaller i.
+    let mut ts = [_mm512_setzero_si512(); 4];
+    let mut rank = [_mm512_setzero_si512(); 4];
+    for v in 0..nv {
+        ts[v] = ld(f.ts.as_ptr().add(16 * v));
     }
-    for j in 0..m {
-        let s = _mm512_set1_epi32(*st.add(j) as i32);
-        let r = _mm512_mask_cmpge_epu32_mask(_mm512_cmple_epu32_mask(tsv, s), twv, s);
-        let rv = _mm512_set1_epi32(r as i32);
-        let tie = r & !_mm512_mask_test_epi32_mask(r, later, rv);
-        let first = r & !_mm512_mask_test_epi32_mask(r, twin, rv);
-        *out.add(j) = few_session(f, tie as u32, first as u32, *day.add(j), acc, cid);
-    }
-}
-
-/// As `few_pass_wide`, a click at a time.
-unsafe fn few_pass_plain(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, cid: &impl Fn(u32) -> Id) {
-    let n = f.n;
-    let (mut later, mut twin) = ([0u32; FEW], [0u32; FEW]);
+    let one = _mm512_set1_epi32(1);
     for k in 0..n {
-        for i in 0..FEW {
-            later[i] |= ((f.ts[k] > f.ts[i]) as u32) << k;
-            twin[i] |= ((i > k && f.camp[i] == f.camp[k]) as u32) << k;
+        let b = _mm512_set1_epi32(*f.ts.get_unchecked(k) as i32);
+        let above = !(2u64 << k).wrapping_sub(1);
+        for v in 0..nv {
+            let gt = _mm512_cmpgt_epu32_mask(ts[v], b);
+            let eq = _mm512_mask_cmpeq_epu32_mask((above >> (16 * v)) as __mmask16, ts[v], b);
+            rank[v] = _mm512_mask_add_epi32(rank[v], (gt | eq) & valid(v), rank[v], one);
+        }
+    }
+    for v in 0..nv {
+        _mm512_mask_i32scatter_epi32(f.sts.as_mut_ptr() as *mut i32, valid(v), rank[v], ts[v], 4);
+        _mm512_mask_i32scatter_epi32(f.sc.as_mut_ptr() as *mut i32, valid(v), rank[v], ld(f.camp.as_ptr().add(16 * v)), 4);
+        _mm512_mask_i32scatter_epi32(f.sj.as_mut_ptr() as *mut i32, valid(v), rank[v], ld(f.j.as_ptr().add(16 * v)), 4);
+    }
+    _mm512_storeu_si512(f.sts.as_mut_ptr().add(n) as *mut __m512i, _mm512_set1_epi32(-1));
+    f.sc[FEW] = org;
+    f.sc1[0] = org;
+    // The tie bits (a click with the same time as the one before it), and per place
+    // the place before it with the same campaign (later k overwrite).
+    let mut sts = [_mm512_setzero_si512(); 4];
+    let mut sc = [_mm512_setzero_si512(); 4];
+    let mut sp = [_mm512_set1_epi32(-1); 4];
+    let mut prev = _mm512_setzero_si512();
+    for v in 0..nv {
+        sts[v] = ld(f.sts.as_ptr().add(16 * v));
+        sc[v] = ld(f.sc.as_ptr().add(16 * v));
+        let same = _mm512_mask_cmpeq_epu32_mask(valid(v) & if v == 0 { !1 } else { !0 }, sts[v], _mm512_alignr_epi32(sts[v], prev, 15));
+        prev = sts[v];
+        let c1 = _mm512_mask_or_epi32(sc[v], same, sc[v], _mm512_set1_epi32(1 << 31));
+        _mm512_storeu_si512(f.sc1.as_mut_ptr().add(1 + 16 * v) as *mut __m512i, c1);
+    }
+    for k in 0..n {
+        let b = _mm512_set1_epi32(*f.sc.get_unchecked(k) as i32);
+        let above = !(2u64 << k).wrapping_sub(1) & all;
+        let kv = _mm512_set1_epi32(k as i32);
+        for v in 0..nv {
+            let eq = _mm512_mask_cmpeq_epu32_mask((above >> (16 * v)) as __mmask16, sc[v], b);
+            sp[v] = _mm512_mask_mov_epi32(sp[v], eq, kv);
         }
     }
     for j in 0..m {
         let s = *st.add(j);
-        let mut r = 0u32;
-        for i in 0..FEW {
-            r |= ((f.ts[i] <= s && f.tw[i] >= s) as u32) << i;
+        let (bs, bw) = (_mm512_set1_epi32(s as i32), _mm512_set1_epi32(s.saturating_sub(WEEK) as i32));
+        let (mut e, mut lo) = (0usize, 0usize);
+        for v in 0..nv {
+            e += (_mm512_mask_cmple_epu32_mask(valid(v), sts[v], bs) as u32).count_ones() as usize;
+            lo += (_mm512_mask_cmplt_epu32_mask(valid(v), sts[v], bw) as u32).count_ones() as usize;
         }
-        let (mut hl, mut ht) = (0u32, 0u32);
-        for i in 0..FEW {
-            hl |= ((later[i] & r != 0) as u32) << i;
-            ht |= ((twin[i] & r != 0) as u32) << i;
+        let range = span(lo, e);
+        let blo = _mm512_set1_epi32(lo as i32);
+        let mut first = 0u64;
+        for v in 0..nv {
+            first |= (_mm512_mask_cmplt_epi32_mask((range >> (16 * v)) as __mmask16, sp[v], blo) as u64) << (16 * v);
         }
-        *out.add(j) = few_session(f, r & !hl, r & !ht, *day.add(j), acc, cid);
+        *out.add(j) = few_session(f, lo, e, first, *day.add(j), acc, sess, cid);
+    }
+}
+
+/// As `few_pass_wide`, a click at a time.
+unsafe fn few_pass_plain(f: &mut Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, org: u32, sess: bool, out: *mut u32, cid: &impl Fn(u32) -> Id) {
+    let n = f.n;
+    for i in 0..n {
+        let ti = f.ts[i];
+        let r = (0..n).filter(|&k| f.ts[k] < ti || (f.ts[k] == ti && k < i)).count();
+        f.sts[r] = ti;
+        f.sc[r] = f.camp[i];
+        f.sj[r] = f.j[i];
+    }
+    for r in n..n + 16 {
+        f.sts[r] = u32::MAX;
+    }
+    f.sc[FEW] = org;
+    f.sc1[0] = org;
+    for r in 0..n {
+        f.sc1[r + 1] = f.sc[r] | ((r > 0 && f.sts[r] == f.sts[r - 1]) as u32) << 31;
+        f.sp[r] = (0..r).rev().find(|&k| f.sc[k] == f.sc[r]).map_or(-1, |k| k as i32);
+    }
+    for j in 0..m {
+        let s = *st.add(j);
+        let sw = s.saturating_sub(WEEK);
+        let e = f.sts[..n].iter().filter(|&&t| t <= s).count();
+        let lo = f.sts[..n].iter().filter(|&&t| t < sw).count();
+        let mut first = 0u64;
+        for r in lo..e {
+            first |= ((f.sp[r] < lo as i32) as u64) << r;
+        }
+        *out.add(j) = few_session(f, lo, e, first, *day.add(j), acc, sess, cid);
     }
 }
 
 #[inline(always)]
-unsafe fn few_pass(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, wide: bool, cid: &impl Fn(u32) -> Id) {
+unsafe fn few_pass(f: &mut Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, org: u32, sess: bool, out: *mut u32, wide: bool, cid: &impl Fn(u32) -> Id) {
     #[cfg(target_arch = "x86_64")]
     if wide {
-        return few_pass_wide(f, st, day, m, acc, out, cid);
+        return few_pass_wide(f, st, day, m, acc, org, sess, out, cid);
     }
     let _ = wide;
-    few_pass_plain(f, st, day, m, acc, out, cid)
+    few_pass_plain(f, st, day, m, acc, org, sess, out, cid)
 }
 
 /// The rows are appended to columns that are not in cache: the lines the next few
@@ -1279,7 +1351,7 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let words = m.div_ceil(64);
     let mut clicks = false;
     // Few clicks (`few_pass`): none of the person's leaves every session organic.
-    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids, ctx.organic);
+    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids);
     let few = gathered && s.few.n != 0;
     if !kc.is_empty() && !gathered {
         s.st.clear();
@@ -1333,10 +1405,7 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         s.camp.reserve(m);
         let cp = s.camp.as_mut_ptr();
         let day = bk.day.as_ptr().add(k);
-        few_pass(&s.few, bk.st.as_ptr().add(k), day, m, acc, cp, wide, &cid);
-        for j in 0..m {
-            *acc.sess.add(((*cp.add(j) as usize) << wsh) + *day.add(j) as usize) += 1;
-        }
+        few_pass(&mut s.few, bk.st.as_ptr().add(k), day, m, acc, org, true, cp, wide, &cid);
     } else if clicks {
         s.camp.clear();
         s.camp.reserve(m);
@@ -2345,8 +2414,8 @@ mod tests {
     #[test]
     fn few_clicks_match_the_click_pass() {
         // `person_rows` with few clicks (`few_pass`) against the same person with the
-        // click pass: 65 more clicks of an alias not in `allowed` change nothing but
-        // take `kc` over `GATHER`. Both against the general pipeline's person().
+        // click pass: GATHER + 1 more clicks of an alias not in `allowed` change
+        // nothing but take `kc` over `GATHER`. Both against the general pipeline's person().
         let cats: Vec<Vec<u8>> = [&b"apparel"[..], b"books", b"garden"].iter().map(|c| c.to_vec()).collect();
         let ctx = ctx(&cats);
         let cells = (ctx.organic as usize + 1) * ctx.ndays;
@@ -2380,6 +2449,7 @@ mod tests {
             let nk = match round % 10 {
                 0 => r.below(71) as usize,
                 1 => 17 + r.below(4) as usize,
+                2 => 30 + r.below(35) as usize,
                 _ => r.below(19) as usize,
             };
             let wide_camps = r.below(2) == 0;
@@ -2423,7 +2493,7 @@ mod tests {
                 }
             }
             let mut padded = kc.clone();
-            for _ in 0..65 {
+            for _ in 0..=GATHER {
                 padded.push(Kc { ts: st[0], ca: 1 << 9 | 1, j: 0 });
             }
             let name = user_text(r.below(1 << 40));
