@@ -38,7 +38,31 @@ fn mum(a: u64, b: u64) -> u64 {
     (m as u64) ^ ((m >> 64) as u64)
 }
 
-static LONG: Mutex<Option<HashMap<&'static [u8], usize>>> = Mutex::new(None);
+/// Hashes a long ID's bytes (the map below is keyed by them) eight bytes at a time.
+#[derive(Default)]
+struct LongHasher(u64);
+
+impl std::hash::Hasher for LongHasher {
+    fn write(&mut self, b: &[u8]) {
+        let mut x = self.0 ^ K3 ^ b.len() as u64;
+        for c in b.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            x = mum(x ^ u64::from_le_bytes(w), K1);
+        }
+        self.0 = x;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type LongMap = HashMap<&'static [u8], usize, std::hash::BuildHasherDefault<LongHasher>>;
+
+/// Interned long IDs, in shards chosen by a hash of the bytes, so threads that
+/// intern at the same time rarely wait on one another.
+const SHARDS: usize = 64;
+static LONG: [Mutex<Option<LongMap>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
 
 impl Id {
     pub const EMPTY: Id = Id { lo: 0, hi: 0 };
@@ -62,8 +86,14 @@ impl Id {
             t[..b.len()].copy_from_slice(b);
             return unsafe { Id::short(t.as_ptr(), b.len()) };
         }
-        let mut g = LONG.lock().unwrap();
-        let map = g.get_or_insert_with(HashMap::new);
+        let shard = {
+            use std::hash::Hasher;
+            let mut h = LongHasher::default();
+            h.write(b);
+            (h.finish() >> 58) as usize
+        };
+        let mut g = LONG[shard].lock().unwrap();
+        let map = g.get_or_insert_with(LongMap::default);
         let p = match map.get(b) {
             Some(&p) => p,
             None => {
