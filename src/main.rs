@@ -362,7 +362,8 @@ struct Shared<'a> {
     lk: &'a Lookups,
     win: Win,
     evspan: u64, // window_end - window_start
-    pshift: u32, // person number -> person bucket
+    pbits: u32, // person bucket = person number & pmask, place in it = number >> pbits
+    pmask: u32,
     dshift: u32,
     ev: mem::Arena, // event records, addressed by slot
     dk: mem::Arena, // dedup keys
@@ -374,6 +375,13 @@ struct Shared<'a> {
     decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
     dec5: bool,     // the per-line decoders for opaque IDs (dec5.rs), without the fast path
+}
+
+impl Shared<'_> {
+    /// Places per person bucket: every person number is below `places() << pbits`.
+    fn places(&self) -> usize {
+        ((self.links.persons() as usize) >> self.pbits) + 1
+    }
 }
 
 /// Per bucket: records so far, and where the current chunk starts.
@@ -718,7 +726,7 @@ unsafe fn events(sh: &Shared, w: &mut Worker, rd: &Reader) {
             return;
         }
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
-        let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: t as u32, pc });
+        let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: t as u32, pc });
         w.push_key(sh, bucket, kid, ((ing_key as u64) << 32) | slot as u64);
     });
     if w.added >= 256 {
@@ -899,7 +907,7 @@ unsafe fn click_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u
     } else {
         let uid = Id::field(d, s1, e1);
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
-        COut::P((who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid })
+        COut::P((who & sh.pmask) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid })
     }
 }
 
@@ -985,7 +993,7 @@ unsafe fn clicks(sh: &Shared, w: &mut Worker, rd: &Reader) {
         let uid = Id::field(d, s1, e1);
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
         let cid = Id::field(d, s0, e0);
-        w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid });
+        w.push_click(sh, (who & sh.pmask) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid });
     });
     if w.added >= 256 {
         sh.links.added(&mut w.added);
@@ -1186,14 +1194,15 @@ fn phase_a<'a>(
 
     // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
     // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
-    // bucket) stay well inside its share of the L2 cache. Person buckets are ranges
-    // of person numbers.
+    // bucket) stay well inside its share of the L2 cache. Person buckets are person
+    // numbers modulo the bucket count.
     let pb = envn("SS_PB").unwrap_or((est / 65_536).next_power_of_two().clamp(64, 512));
     let db = envn("SS_DB").unwrap_or((est / 32_768).next_power_of_two().clamp(64, 1024));
     let (pb, db) = (pb.next_power_of_two().clamp(2, links.slots()), db.next_power_of_two().max(2));
     let base = ws - WEEK;
     let sh = Shared {
-        pshift: links.slots().trailing_zeros() - pb.trailing_zeros(),
+        pbits: pb.trailing_zeros(),
+        pmask: pb as u32 - 1,
         links,
         lk,
         win: Win::new(base, we),
@@ -1682,8 +1691,8 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     if n_ev == 0 {
         return;
     }
-    let first = (p as u32) << sh.pshift; // the bucket's first person number
-    let np = 1usize << sh.pshift;
+    let (pbits, first) = (sh.pbits, p as u32); // person number = place << pbits | p
+    let np = sh.places();
     // Events per person, then each person's start in `ev`.
     st.off.clear();
     st.off.resize(np + 1, 0);
@@ -1691,7 +1700,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
         for chunk in w.event_chunks(sh, p) {
             for e in chunk {
                 // A dead copy counts for nobody (the count is shifted out of the last slot).
-                let i = if e.t & DEAD == 0 { (e.who - first) as usize } else { np };
+                let i = if e.t & DEAD == 0 { (e.who >> pbits) as usize } else { np };
                 unsafe { *st.off.get_unchecked_mut(i) += 1 };
             }
         }
@@ -1709,7 +1718,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 let has = unsafe { *st.off.get_unchecked(i + 1) != *st.off.get_unchecked(i) };
                 unsafe { *st.coff.get_unchecked_mut(if has { i } else { np }) += 1 };
             }
@@ -1728,7 +1737,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 unsafe {
                     if *st.off.get_unchecked(i + 1) != *st.off.get_unchecked(i) {
                         let at = st.coff.get_unchecked_mut(i);
@@ -1746,7 +1755,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
             for e in chunk {
                 if e.t & DEAD == 0 {
                     unsafe {
-                        let at = st.off.get_unchecked_mut((e.who - first) as usize);
+                        let at = st.off.get_unchecked_mut((e.who >> pbits) as usize);
                         *st.ev.get_unchecked_mut(*at as usize) = ((e.t as u64) << 32) | e.pc as u64;
                         *at += 1;
                     }
@@ -1770,7 +1779,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
                 // Time order only; equal-time ties are broken by click_id when crediting.
                 c.sort_unstable_by_key(|x| x.ts);
             }
-            let name = sh.links.name(first + i as u32);
+            let name = sh.links.name((i as u32) << pbits | first);
             person(st, name, e, c, ctx);
         }
         es = ee;

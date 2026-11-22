@@ -292,8 +292,8 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         return;
     }
     let mut tc = tsc();
-    let first = (p as u32) << sh.pshift; // the bucket's first person number
-    let np = 1usize << sh.pshift;
+    let (pbits, bucket) = (sh.pbits, p as u32); // person number = place << pbits | bucket
+    let np = sh.places();
     // The losing copies' positions, as a bitmap.
     let nchunks: usize = workers.iter().map(|w| w.pchunks[p].len()).sum();
     sc.dead.clear();
@@ -314,7 +314,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
             for (k, e) in chunk.iter().enumerate() {
                 // A dead copy counts for nobody (the count is shifted out of the last slot).
                 let dead = unsafe { *bits.get_unchecked(k >> 6) } >> (k & 63) & 1 != 0;
-                let i = if dead { np } else { (e.who - first) as usize };
+                let i = if dead { np } else { (e.who >> pbits) as usize };
                 unsafe { *sc.off.get_unchecked_mut(i) += 1 };
             }
             base += PCH;
@@ -334,7 +334,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 let has = unsafe { *sc.off.get_unchecked(i + 1) != *sc.off.get_unchecked(i) };
                 unsafe { *sc.coff.get_unchecked_mut(if has { i } else { np }) += 1 };
             }
@@ -362,7 +362,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 unsafe {
                     if *sc.off.get_unchecked(i + 1) != *sc.off.get_unchecked(i) {
                         let at = sc.coff.get_unchecked_mut(i);
@@ -386,7 +386,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
                 let dead = unsafe { *bits.get_unchecked(k >> 6) } >> (k & 63) & 1 != 0;
                 if !dead {
                     unsafe {
-                        let i = e.who - first;
+                        let i = e.who >> pbits;
                         let at = sc.off.get_unchecked_mut(i as usize);
                         *sc.ev.get_unchecked_mut(*at as usize) = e.t;
                         *at += 1;
@@ -444,17 +444,17 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     }
     const NAHEAD: usize = 8;
     for &i in who.iter().take(NAHEAD) {
-        sh.links.prefetch_slot(first + i);
+        sh.links.prefetch_name(i << pbits | bucket);
     }
     for (k, &i) in who.iter().enumerate() {
         if let Some(&j) = who.get(k + NAHEAD) {
-            sh.links.prefetch_slot(first + j);
+            sh.links.prefetch_name(j << pbits | bucket);
         }
         let i = i as usize;
         let (es, ee) = (if i == 0 { 0 } else { sc.off[i - 1] as usize }, sc.off[i] as usize);
         let (cs, ce) = (if i == 0 { 0 } else { sc.coff[i - 1] as usize }, sc.coff[i] as usize);
         let (ps, pe) = (if i == 0 { 0 } else { sc.poff[i - 1] as usize }, sc.poff[i] as usize);
-        let name = sh.links.name(first + i as u32);
+        let name = sh.links.name((i as u32) << pbits | bucket);
         person(st, sc, name, &ev[es..ee], &mut pev[ps..pe], &cl[cs..ce], ctx);
     }
     sc.ev = ev;

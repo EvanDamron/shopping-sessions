@@ -263,7 +263,7 @@ impl ToGeneral {
             }
         }
         let who = self.who[a];
-        w.push_event(env.sh, (who >> env.sh.pshift) as usize, PRec { who, t, pc });
+        w.push_event(env.sh, (who & env.sh.pmask) as usize, PRec { who, t, pc });
     }
 }
 
@@ -1245,7 +1245,7 @@ unsafe fn pool_click(env: &Env, w: &mut Worker, r: &CRec) {
     if w.added >= 256 {
         env.sh.links.added(&mut w.added);
     }
-    w.push_click(env.sh, (who >> env.sh.pshift) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
+    w.push_click(env.sh, (who & env.sh.pmask) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
 }
 
 /// Files every click of user number `g` with the general pipeline.
@@ -1568,7 +1568,7 @@ unsafe fn event_bucket(b: usize, env: &Env, x: &mut Tls, st: &mut CS, w: &mut Wo
         // Another person's event; its person number was looked up in phase A.
         let (a, t, pc) = x.odd[i];
         let who = a as u32;
-        w.push_event(env.sh, (who >> env.sh.pshift) as usize, PRec { who, t, pc });
+        w.push_event(env.sh, (who & env.sh.pmask) as usize, PRec { who, t, pc });
         x.cnt[1] += 1;
     }
     if n == 0 {
@@ -1773,7 +1773,7 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
         }
         if o.a & ODDU != 0 {
             let who = o.a as u32;
-            unsafe { workers[0].push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: o.t, pc: o.pc }) };
+            unsafe { workers[0].push_event(sh, (who & sh.pmask) as usize, PRec { who, t: o.t, pc: o.pc }) };
         } else if fx.gt[(o.a >> 9) as usize].load(Relaxed) & COMPLEX != 0 {
             now.push((o.a, o.t, o.pc));
         } else {

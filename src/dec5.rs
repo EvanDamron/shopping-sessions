@@ -122,7 +122,7 @@ unsafe fn file_event(sh: &Shared, w: &mut Worker, r: &ERow, uh: u64) {
         return;
     }
     let who = sh.links.person(r.uid, uh, &mut w.added);
-    let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: r.t, pc: r.pc });
+    let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: r.t, pc: r.pc });
     w.push_key(sh, bucket, r.kid, ((r.ing as u64) << 32) | slot as u64);
 }
 
@@ -130,7 +130,7 @@ unsafe fn file_event(sh: &Shared, w: &mut Worker, r: &ERow, uh: u64) {
 #[inline(always)]
 unsafe fn file_click(sh: &Shared, w: &mut Worker, r: &CRow, uh: u64) {
     let who = sh.links.person(r.uid, uh, &mut w.added);
-    w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
+    w.push_click(sh, (who & sh.pmask) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
 }
 
 /// The plain reading of an event line the window does not hold.
@@ -433,7 +433,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             }
             let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
-            let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
+            let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
             w.push_key(sh, bucket, kid, ing | slot as u64);
         }
         for i in 0..np {
@@ -500,7 +500,7 @@ struct Pending {
 unsafe fn file_pending(sh: &Shared, w: &mut Worker, pr: &Pending) {
     let bucket = (pr.kb >> sh.dshift) as usize;
     let who = sh.links.person(pr.uid, pr.uh, &mut w.added);
-    let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: pr.ti as u32, pc: pr.pc });
+    let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: pr.ti as u32, pc: pr.pc });
     w.push_key(sh, bucket, pr.kid, (pr.ti & !0xFFFF_FFFF) | slot as u64);
 }
 
@@ -741,7 +741,7 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
             let tc = *bt.tc.get_unchecked(j);
             let cid = Id { lo: *bt.clo.get_unchecked(j), hi: *bt.chi.get_unchecked(j) };
-            w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
+            w.push_click(sh, (who & sh.pmask) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
         }
         w.ncfast += n as u64;
         if sh.deccheck {
