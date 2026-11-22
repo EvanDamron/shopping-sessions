@@ -298,7 +298,8 @@ struct EBatch {
     pc: [u32; ROWS],
     ok: [u8; ROWS],
     long: [(u32, u32, u32); ROWS], // valid rows with a long user ID: (row, field start, length)
-    nl: [u32; STRETCH + 8],
+    lsx: [usize; ROWS], // well-formed lines of the batch: start
+    cmx: [u64; ROWS],   // and structure (`structure`)
 }
 
 impl EBatch {
@@ -330,65 +331,122 @@ pub(crate) unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, s: usize,
     EB.with(|b| events_in(sh, w, d, s, e, &mut b.borrow_mut()));
 }
 
-/// The newlines of the stretch of `d[a..end)` that starts at `a`: about STRETCH
-/// bytes, ending at a line end. Returns (count, end of the stretch).
+/// Comma, quote and newline masks of the 128 bytes at p, as (low, high) words.
 #[inline(always)]
-unsafe fn stretch(d: *const u8, a: usize, end: usize, nl: *mut u32) -> (usize, usize) {
-    let b = (a + STRETCH).min(end);
-    let nn = newlines(d, a, b, nl, 0);
-    if nn > 0 && *nl.add(nn - 1) as usize == b - 1 {
-        return (nn, b);
-    }
-    // Extend to the next newline (the piece ends with one).
-    let mut le = b;
+unsafe fn masks3(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+    let (v0, v1, v2, v3) = (ld(p), ld(p.add(32)), ld(p.add(64)), ld(p.add(96)));
+    let m = |v: __m256i, x: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 as u64;
+    let w = |x: u8| [m(v0, x) | (m(v1, x) << 32), m(v2, x) | (m(v3, x) << 32)];
+    (w(b','), w(b'"'), w(b'\n'))
+}
+
+/// Lines per batch: decoded first, filed after (the table lines the filing reads
+/// are prefetched by the decoding).
+const BATCH: usize = 96;
+
+/// How far ahead of a line the input is prefetched.
+const AHEAD: usize = 1024;
+
+/// The plain reading of the event line at `ls` whose newline the window did not
+/// reach; returns where the next line starts.
+#[cold]
+#[inline(never)]
+unsafe fn cold_event_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) -> usize {
+    let mut le = ls + 128;
     while *d.add(le) != b'\n' {
         le += 1;
     }
-    *nl.add(nn) = le as u32;
-    (nn + 1, le + 1)
+    cold_event(sh, w, d, ls, le);
+    le + 1
+}
+
+/// The structure of the event line of `len` (< 128) bytes at p, packed: its six
+/// commas (bytes 0 to 5), its length (byte 6) and which of its seven fields are
+/// quoted (bits 56 to 62); None for a malformed line (another comma count, or a
+/// quote anywhere but around a whole field).
+#[inline(always)]
+unsafe fn structure(c: [u64; 2], q: [u64; 2], len: usize) -> Option<u64> {
+    let lm = *LM.get_unchecked(len);
+    let c = (c[0] as u128 | ((c[1] as u128) << 64)) & lm;
+    let q = (q[0] as u128 | ((q[1] as u128) << 64)) & lm;
+    let sp = c | lm.wrapping_add(1);
+    let starts = ((sp << 1) | 1) & lm.wrapping_add(lm).wrapping_add(1); // field starts, at most `len`
+    let open = q & starts;
+    let close = q & (sp >> 1);
+    let ends_open = (!sp).wrapping_add(open) & sp;
+    let bad = (q ^ (open | close)) | (open & close) | (ends_open ^ (close << 1));
+    if (c.count_ones() != 6) | (bad != 0) {
+        return None;
+    }
+    let mut m = c;
+    let mut x = (len as u64) << 48;
+    for k in 0..6 {
+        x |= (m.trailing_zeros() as u64) << (8 * k);
+        m &= m.wrapping_sub(1);
+    }
+    // Quoted fields: the opening quotes, gathered from the field starts.
+    let (sl, sh) = (starts as u64, (starts >> 64) as u64);
+    let fq = _pext_u64(open as u64, sl) | (_pext_u64((open >> 64) as u64, sh) << sl.count_ones());
+    Some(x | (fq << 56))
 }
 
 #[inline(always)]
 unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut EBatch) {
     let win = &sh.win;
-    let mut a = s;
-    while a < end {
-        let (nn, b) = stretch(d, a, end, bt.nl.as_mut_ptr());
-        let nlp = bt.nl.as_ptr();
-        let mut n = 0usize; // rows
-        let mut nlong = 0usize;
-        let mut ls = a;
-        for k in 0..nn {
-            let le = *nlp.add(k) as usize;
-            let len = le - ls;
+    let mut ls = s;
+    while ls < end {
+        let first = ls;
+        // ---- Pass 1: line structure (commas, quotes) of up to BATCH lines.
+        let mut nv = 0usize; // well-formed lines
+        let mut nl = 0usize;
+        while ls < end && nl < BATCH {
+            nl += 1;
             let p = d.add(ls);
-            ls = le + 1;
+            // The input a few lines ahead: the next line's address is only known at
+            // the end of this one's newline search, so its loads cannot start early.
+            _mm_prefetch(p.add(AHEAD) as *const i8, _MM_HINT_T0);
+            let (c, q, nm) = masks3(p);
+            let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
+            let len = nm.trailing_zeros() as usize;
             if len >= 128 {
-                cold_event(sh, w, d, le - len, le);
+                ls = cold_event_from(sh, w, d, ls);
                 continue;
             }
-            let Some(c) = commas::<6>(p, len) else {
-                continue; // malformed: dropped
-            };
-            let (s0, e0) = uq(p, 0, c[0]);
+            let lp = ls;
+            ls += len + 1;
+            if let Some(x) = structure(c, q, len) {
+                *bt.lsx.get_unchecked_mut(nv) = lp;
+                *bt.cmx.get_unchecked_mut(nv) = x;
+                nv += 1;
+            }
+        }
+        // ---- Pass 2: the fields of the well-formed lines.
+        let mut n = 0usize; // rows
+        let mut nlong = 0usize;
+        for j in 0..nv {
+            let lp = *bt.lsx.get_unchecked(j);
+            let x = *bt.cmx.get_unchecked(j);
+            let p = d.add(lp);
+            let cc = |k: u32| ((x >> (8 * k)) & 0xFF) as usize;
+            let qq = |k: u32| ((x >> (56 + k)) & 1) as usize;
+            let (c0, c1, c2, c3, c4, c5, len) = (cc(0), cc(1), cc(2), cc(3), cc(4), cc(5), cc(6));
+            let (s0, e0) = (qq(0), c0 - qq(0));
             if s0 == e0 {
                 continue; // empty event_id: dropped before dedup
             }
             let (kid, kb) = Id::key(p, s0, e0).hash2();
-            let (s1, e1) = uq(p, c[0] + 1, c[1]);
+            let (s1, e1) = (c0 + 1 + qq(1), c1 - qq(1));
             let ulen = e1 - s1;
-            let (s2, e2) = uq(p, c[1] + 1, c[2]);
-            let t = win.ts_bl(p.add(s2), e2 - s2);
-            let (s3, e3) = uq(p, c[2] + 1, c[3]);
-            let (ing_ms, ing) = win.ingest(p, s3, e3);
-            let (s4, e4) = uq(p, c[3] + 1, c[4]);
+            let (s2, e2) = (c1 + 1 + qq(2), c2 - qq(2));
+            let (s3, e3) = (c2 + 1 + qq(3), c3 - qq(3));
+            let (t, ing_ms, ing) = win.ts_ingest(p.add(s2), e2 - s2, p.add(s3), e3 - s3);
+            let (s4, e4) = (c3 + 1 + qq(4), c4 - qq(4));
             let tw = (p.add(s4) as *const u64).read_unaligned();
             let tl = e4 - s4;
             let purchase = (tl == 8) & (tw == PURCHASE);
             let typed = purchase | ((tl == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
             // product_id is not empty: neither `` nor `""`
-            let plen = c[5] - c[4] - 1;
-            let pfull = (plen != 0) & ((plen != 2) | (*p.add(c[4] + 1) != b'"'));
+            let pfull = c5 - c4 - 1 > 2 * qq(5);
             let mut ok = typed
                 & (ulen != 0)
                 & pfull
@@ -396,7 +454,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 & (ing_ms.wrapping_sub(t.wrapping_add(win.base)) <= DAY);
             let mut pc = 0u32;
             if purchase & ok {
-                match purchase_pc(sh, p, c[4] + 1, c[5], len) {
+                match purchase_pc(sh, p, c4 + 1, c5, len) {
                     Some(v) => pc = v,
                     None => ok = false,
                 }
@@ -414,7 +472,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 let h = Id::long_hash(p.add(s1), ulen);
                 Id::prefetch_long(h);
                 *bt.uh.get_unchecked_mut(n) = h;
-                *bt.long.get_unchecked_mut(nlong) = (n as u32, (le - len + s1) as u32, ulen as u32);
+                *bt.long.get_unchecked_mut(nlong) = (n as u32, (lp + s1) as u32, ulen as u32);
                 nlong += 1;
             }
             *bt.kid.get_unchecked_mut(n) = kid;
@@ -451,9 +509,8 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
         }
         w.nfast += n as u64;
         if sh.deccheck {
-            check_batch_events(sh, d, a, nn, nlp, bt, n);
+            check_batch_events(sh, d, first, ls, bt, n);
         }
-        a = b;
     }
 }
 
@@ -472,33 +529,30 @@ unsafe fn check_event(sh: &Shared, d: *const u8, ls: usize, le: usize, r: &ERow)
     }
 }
 
-/// Test hook: every line of a stretch, decoded rows and dropped lines alike, against
-/// the plain reading.
+/// Test hook: every line of a batch `d[a..b)`, decoded rows and dropped lines
+/// alike, against the plain reading.
 #[cold]
 #[inline(never)]
-unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, nn: usize, nlp: *const u32, bt: &EBatch, n: usize) {
+unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: &EBatch, n: usize) {
     let mut ls = a;
     let mut j = 0;
-    for k in 0..nn {
-        let le = *nlp.add(k) as usize;
-        if le - ls < 128 {
-            let plain = plain_fields::<7>(d, ls, le).and_then(|f| event_row(sh, d, &f));
-            match plain {
-                None => {}
-                Some(_) => {
-                    if j >= n {
-                        eprintln!("decoder kept fewer rows of a stretch than the plain reading");
-                        std::process::exit(3);
-                    }
-                    check_event(sh, d, ls, le, &bt.row(j));
-                    j += 1;
-                }
+    while ls < b {
+        let mut le = ls;
+        while *d.add(le) != b'\n' {
+            le += 1;
+        }
+        if le - ls < 128 && plain_fields::<7>(d, ls, le).and_then(|f| event_row(sh, d, &f)).is_some() {
+            if j >= n {
+                eprintln!("decoder kept fewer rows of a batch than the plain reading");
+                std::process::exit(3);
             }
+            check_event(sh, d, ls, le, &bt.row(j));
+            j += 1;
         }
         ls = le + 1;
     }
     if j != n {
-        eprintln!("decoder kept {} rows of a stretch, the plain reading {}", n, j);
+        eprintln!("decoder kept {} rows of a batch, the plain reading {}", n, j);
         std::process::exit(3);
     }
 }
