@@ -1734,7 +1734,7 @@ mod tests {
                 }
                 let (a, b) = (&got.rows, &want.rows);
                 assert_eq!(a.n, b.n, "round {round} wide {wide}");
-                assert_eq!((&a.names, &a.days, &a.sessions, &a.events), (&b.names, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
+                assert_eq!((&a.dict, &a.runs, &a.days, &a.sessions, &a.events), (&b.dict, &b.runs, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
                 assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round} wide {wide}");
                 assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
                 assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
@@ -1742,6 +1742,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn kernels_agree() {
         if !wide_ok() {
