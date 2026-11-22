@@ -300,6 +300,7 @@ pub unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
     let tens = _mm_set1_epi16(0x010A); // bytes 10, 1
     while pos < end {
         let p = d.add(pos);
+        _mm_prefetch::<_MM_HINT_T0>(p.add(crate::dec::AHEAD) as *const i8); // (see dec::events)
         let (v0, v1) = (ld(p), ld(p.add(32)));
         let m = |x: __m256i| -> u64 {
             let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, x)) as u32 as u64;

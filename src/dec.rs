@@ -36,6 +36,9 @@ use core::arch::x86_64::*;
 /// Rows per batch.
 const B: usize = 64;
 
+/// How far ahead of the line being decoded the input is prefetched.
+pub(crate) const AHEAD: usize = 1024;
+
 /// How one form of `ts` is read: lane 0 of a 256-bit vector holds 16 bytes of the
 /// `ts` field, lane 1 always holds `THH:MM:SSZ` of `ingest_ts`.
 #[repr(C, align(64))]
@@ -553,6 +556,9 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
     let tens = _mm256_set1_epi16(0x010A); // bytes 10, 1
     while pos < end {
         let p = d.add(pos);
+        // (Read from a mapping, the lines come straight from the page cache: ask for
+        // them a few lines early. From the read buffer this finds them in cache.)
+        _mm_prefetch::<_MM_HINT_T0>(p.add(AHEAD) as *const i8);
         // ---- Masks of the commas, newlines and quotes of the 96 bytes at p: the
         // first 64 bytes and the last 32 of each.
         let (v0, v1, v2) = (ld(p), ld(p.add(32)), ld(p.add(64)));
