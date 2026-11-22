@@ -361,6 +361,10 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
     let jthreads = nthreads.min(tasks.len().max(1));
     let lbytes: u64 = tasks.iter().map(|t| t.2 - t.1).sum();
     let cap = (lbytes / 12) as usize / jthreads + 1024;
+    // IDs longer than 15 bytes (interned, two dependent misses each) are hashed and
+    // their long-table slot prefetched as a line is read, then interned a batch at a
+    // time with their strings prefetched (SS_LINKLONG=0: one at a time as read).
+    let defer_long = std::env::var_os("SS_LINKLONG").is_none_or(|v| v != "0");
     let lists: Vec<Vec<u32>> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..jthreads).map(|_| {
             let (b, next) = (&b, &next);
@@ -371,6 +375,26 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
                 let mut rd = Reader::new(buf);
                 let mut ids = [(Id::EMPTY, Id::EMPTY, 0u64, 0u64); BATCH];
                 let mut n = 0usize;
+                // Long IDs of the batch still to intern: (2 * line + field, start, length,
+                // long hash), in the reader's current data.
+                let mut lng = [(0usize, 0usize, 0usize, 0u64); 2 * BATCH];
+                let mut nl = 0usize;
+                let resolve = |d: *const u8, ids: &mut [(Id, Id, u64, u64)], lng: &[(usize, usize, usize, u64)]| unsafe {
+                    for &(_, _, _, h) in lng {
+                        Id::prefetch_long_string(h);
+                    }
+                    for &(k, s, len, h) in lng {
+                        let id = Id::intern_long(std::slice::from_raw_parts(d.add(s), len), h);
+                        let hh = id.hash();
+                        prefetch(b.tab.add((hh >> b.shift) as usize));
+                        let x = &mut ids[k / 2];
+                        if k % 2 == 0 {
+                            (x.0, x.2) = (id, hh);
+                        } else {
+                            (x.1, x.3) = (id, hh);
+                        }
+                    }
+                };
                 let mut added = 0usize;
                 let mut dead = false;
                 // Report insertions often enough that the table cannot fill between checks.
@@ -426,17 +450,35 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
                             if s0 == e0 || s1 == e1 {
                                 return;
                             }
-                            let (ia, ib) = (Id::field(d, s0, e0), Id::field(d, s1, e1));
-                            let (ha, hb) = (ia.hash(), ib.hash());
-                            prefetch(b.tab.add((ha >> b.shift) as usize));
-                            prefetch(b.tab.add((hb >> b.shift) as usize));
+                            let mut one = |s: usize, e: usize, k: usize| -> (Id, u64) {
+                                if e - s > 15 && defer_long {
+                                    let h = Id::long_hash(d.add(s), e - s);
+                                    Id::prefetch_long(h);
+                                    lng[nl] = (k, s, e - s, h);
+                                    nl += 1;
+                                    return (Id::EMPTY, 0);
+                                }
+                                let id = Id::field(d, s, e);
+                                let h = id.hash();
+                                prefetch(b.tab.add((h >> b.shift) as usize));
+                                (id, h)
+                            };
+                            let (ia, ha) = one(s0, e0, 2 * n);
+                            let (ib, hb) = one(s1, e1, 2 * n + 1);
                             ids[n] = (ia, ib, ha, hb);
                             n += 1;
                             if n == BATCH {
+                                resolve(d, &mut ids, &lng[..nl]);
+                                nl = 0;
                                 flush(&ids, &mut added, &mut dead, &mut new);
                                 n = 0;
                             }
                         });
+                        // The data changes with the next batch of lines.
+                        if nl > 0 {
+                            resolve(d, &mut ids, &lng[..nl]);
+                            nl = 0;
+                        }
                     });
                 }
                 if !dead {
