@@ -91,6 +91,9 @@ pub struct Dec {
     idw3: [u32; 8],
     /// What the event type must be, by the low five bits of its first letter.
     ty: [Ty; 32],
+    daybits: u64, // DAYBITS, where the hand-arranged loop can use it as an operand
+    /// The hand-arranged line loop is used (SS_ASM=0: the compiled one).
+    pub asm: bool,
     /// Category by product number (`pcat_len` of them), for products named `p` +
     /// their number; NOCAT elsewhere. (The table lives as long as the process.)
     pcat: *const u8,
@@ -156,6 +159,8 @@ impl Dec {
         dec.base = base;
         dec.base_s = base_s;
         dec.evspan = evspan;
+        dec.daybits = DAYBITS;
+        dec.asm = std::env::var_os("SS_ASM").is_none_or(|v| v != "0");
 
         // ---- The three forms of `ts`.
         // Lane 1, `ingest_ts` from its 'T': T HH : MM : SS Z.
@@ -331,6 +336,15 @@ struct Batch {
     a: [u64; B],
     w1: [u64; B],
     w2: [u64; B],
+    // For `lines_asm`: each row's line and the line after it (addresses), which rows
+    // are purchases, the lines queued for the plain reading, and a few words it
+    // keeps to hand.
+    lp: [u64; B],
+    nx: [u64; B],
+    coldp: [u64; B],
+    pur: [u8; B],
+    nc: u64,
+    scr: [u64; 5],
 }
 
 #[inline(always)]
@@ -691,4 +705,396 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         pos = next;
     }
     flush(sh, fx, dec, w, d, &mut bt, nb);
+}
+
+/// Up to B lines from `p` decoded into the batch by the hand-arranged loop:
+/// returns where it stopped, the rows it filled, and whether it stopped at a line
+/// with no newline in its first 96 bytes. It is `events`' line loop instruction for
+/// instruction (same masks, same bit operations, same tables, same lane arithmetic)
+/// with the registers assigned by hand, because the compiled loop spends about a
+/// fifth of its instructions moving values to and from the stack. Nothing is called
+/// from it: a line for the plain reading is queued in `bt.coldp`, a purchase is
+/// marked in `bt.pur`, and it returns when the batch or the queue is full.
+///
+/// Registers: rdi tables, rsi line, rdx end, r13 batch, r15 rows, r14 rows * 16;
+/// rax rbx rcx rbp r8-r12 are scratch; ymm3-ymm15 hold constants, ymm0-ymm2 scratch.
+#[inline(never)]
+unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) -> (*const u8, usize, bool) {
+    use core::mem::{offset_of, size_of};
+    let (stop, rows, long): (*const u8, usize, u64);
+    core::arch::asm!(
+        "push rbx",
+        "push rbp",
+        "xor r15d, r15d",
+        "xor r14d, r14d",
+        // ---- next line
+        "2:",
+        "cmp rsi, rdx",
+        "jae 90f",
+        "cmp r15, {b}",
+        "jae 90f",
+        "prefetcht0 byte ptr [rsi + {ahead}]",
+        // newline: nl in rax (96 or more: none in the first 96 bytes)
+        "vpcmpeqb ymm0, ymm14, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm14, ymmword ptr [rsi + 32]",
+        "vpcmpeqb ymm2, ymm14, ymmword ptr [rsi + 64]",
+        "vpmovmskb eax, ymm0",
+        "vpmovmskb ecx, ymm1",
+        "vpmovmskb r8d, ymm2",
+        "shl rcx, 32",
+        "or rax, rcx",
+        "tzcnt r8, r8",
+        "add r8, 64",
+        "tzcnt rax, rax",
+        "cmovc rax, r8",
+        "cmp rax, 96",
+        "jae 80f",
+        // commas: first 64 bytes in r8, last 32 in r9
+        "vpcmpeqb ymm0, ymm15, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm15, ymmword ptr [rsi + 32]",
+        "vpcmpeqb ymm2, ymm15, ymmword ptr [rsi + 64]",
+        "vpmovmskb r8d, ymm0",
+        "vpmovmskb ecx, ymm1",
+        "vpmovmskb r9d, ymm2",
+        "shl rcx, 32",
+        "or r8, rcx",
+        // c1 rcx, c2 rbx, c3 r12; the first three commas as a mask in rbp
+        "blsr rbx, r8",
+        "tzcnt rcx, r8",
+        "blsr rbp, rbx",
+        "tzcnt rbx, rbx",
+        "tzcnt r12, rbp",
+        "blsr rbp, rbp",
+        "xor rbp, r8",
+        "cmp r12, 64",
+        "jae 70f",
+        // the bytes of both IDs, for later
+        "vmovdqu xmm0, xmmword ptr [rsi + rcx - 16]",
+        "vinserti128 ymm0, ymm0, xmmword ptr [rsi + rbx - 16], 1",
+        // commas after the third, from the byte after it: r10; nlr = nl - c3 - 1: r9
+        "shrx r10, r8, r12",
+        "shr r10, 1",
+        "mov r11d, 63",
+        "sub r11, r12",
+        "shlx r9, r9, r11",
+        "or r10, r9",
+        "lea r9, [rax - 1]",
+        "sub r9, r12",
+        "bzhi r10, r10, r9",
+        "lea rax, [rsi + rax + 1]",
+        "mov qword ptr [r13 + {scr}], rax",
+        // quotes: of fields 0..2 in r8, of the rest (from the same byte) in rax
+        "vpcmpeqb ymm1, ymm13, ymmword ptr [rsi]",
+        "vpcmpeqb ymm2, ymm13, ymmword ptr [rsi + 32]",
+        "vpmovmskb r8d, ymm1",
+        "vpmovmskb eax, ymm2",
+        "shl rax, 32",
+        "or r8, rax",
+        "vpcmpeqb ymm1, ymm13, ymmword ptr [rsi + 64]",
+        "vpmovmskb eax, ymm1",
+        "shlx rax, rax, r11",
+        "shrx r11, r8, r12",
+        "shr r11, 1",
+        "or rax, r11",
+        "bzhi rax, rax, r9",
+        "bzhi r8, r8, r12",
+        // quotes of fields 0..2: which are quoted in r8, anything out of place in r11
+        "lea r11, [rbp + rbp + 1]",
+        "mov qword ptr [r13 + {scr} + 8], r11",
+        "andn r11, r11, r8",
+        "pext r8, r8, qword ptr [r13 + {scr} + 8]",
+        "shr rbp, 1",
+        "pdep rbp, r8, rbp",
+        "xor r11, rbp",
+        // ---- both IDs
+        "mov ebp, r8d",
+        "and ebp, 1",
+        "lea rbp, [rbp + rcx*2]",
+        "shl rbp, 4",
+        "vmovdqu xmm1, xmmword ptr [rdi + rbp + {idsh}]",
+        "mov rbp, rbx",
+        "sub rbp, rcx",
+        "mov ecx, r8d",
+        "shr ecx, 1",
+        "and ecx, 1",
+        "lea rbp, [rcx + rbp*2]",
+        "shl rbp, 4",
+        "vinserti128 ymm1, ymm1, xmmword ptr [rdi + rbp + {idsh} - 32], 1",
+        "vpsubb ymm0, ymm0, ymm12",
+        "vpshufb ymm0, ymm0, ymm1",
+        "vpcmpgtb ymm1, ymm0, ymm11",
+        "vpand ymm2, ymm1, ymm10",
+        "vpsubb ymm0, ymm0, ymm2",
+        "vpand ymm1, ymm1, ymm9",
+        "vpsubb ymm2, ymm0, ymm8",
+        "vpsubb ymm2, ymm2, ymm1",
+        "vpsubusb ymm2, ymm2, ymm7",
+        "vpmaddubsw ymm0, ymm0, ymm6",
+        "vpmaddwd ymm0, ymm0, ymm5",
+        "vpmuludq ymm1, ymm0, ymm4",
+        "vpsrlq ymm0, ymm0, 32",
+        "vpaddq ymm0, ymm0, ymm1",
+        "vpermq ymm0, ymm0, 0xDD",
+        "vmovdqu xmmword ptr [r13 + r14 + {ids}], xmm0",
+        // ---- ts: its form (rcx), its 16 bytes (xmm1), its date, the constant part
+        // of the time and the multiplier of the second number
+        "shr r8, 2",
+        "mov rcx, r12",
+        "sub rcx, rbx",
+        "lea rcx, [r8 + rcx*2]",
+        "movzx ecx, byte ptr [rdi + rcx + {tsform} - 2]",
+        "imul ecx, ecx, {fsize}",
+        "lea rcx, [rdi + rcx + {forms}]",
+        "lea rbx, [rbx + r8 + 1]",
+        "add rbx, rsi",
+        "or r11, qword ptr [rcx + {f_bad}]",
+        "mov rbp, qword ptr [rcx + {f_off}]",
+        "vmovdqu xmm1, xmmword ptr [rbx + rbp]",
+        "mov rbp, qword ptr [rbx + 2]",
+        "pext r8, rbp, qword ptr [rdi + {daybits}]",
+        "shl r8, 5",
+        "xor rbp, qword ptr [rdi + r8 + {days} + 8]",
+        "and rbp, qword ptr [rcx + {f_dmask}]",
+        "or r11, rbp",
+        "mov rbp, qword ptr [rbx]",
+        "xor rbp, qword ptr [rdi + r8 + {days}]",
+        "and rbp, qword ptr [rcx + {f_dmask}]",
+        "or r11, rbp",
+        "mov rbp, qword ptr [rdi + r8 + {days} + 16]",
+        "and rbp, qword ptr [rcx + {f_dmask}]",
+        "add rbp, qword ptr [rcx + {f_c0}]",
+        "mov qword ptr [r13 + {scr} + 16], rbp",
+        "movzx r8d, byte ptr [rbx + 19]",
+        "and r8d, 2",
+        "mov rbp, qword ptr [rcx + r8*4 + {f_kb}]",
+        "mov qword ptr [r13 + {scr} + 24], rbp",
+        "mov qword ptr [r13 + {scr} + 32], rcx",
+        // ---- the rest of the line: c4 rbx, c5 rbp, c6 r8; exactly three commas
+        // and the newline within 64 bytes
+        "tzcnt rbx, r10",
+        "blsr r8, r10",
+        "tzcnt rbp, r8",
+        "blsr r8, r8",
+        "blsr rcx, r8",
+        "or r11, rcx",
+        "tzcnt r8, r8",
+        "mov rcx, r9",
+        "or rcx, r8",
+        "shr rcx, 6",
+        "or r11, rcx",
+        // its quotes: which of fields 3..6 are quoted in r9
+        "bts r10, r9",
+        "lea rcx, [r10 + r10 + 1]",
+        "pext r9, rax, rcx",
+        "andn rcx, rcx, rax",
+        "shr r10, 1",
+        "pdep r10, r9, r10",
+        "xor rcx, r10",
+        "or r11, rcx",
+        // ingest_ts: 20 characters; where it starts in rax
+        "mov eax, r9d",
+        "and eax, 1",
+        "lea r12, [rsi + r12 + 1]",
+        "lea rcx, [rax + rax]",
+        "mov r10, rbx",
+        "sub r10, rcx",
+        "xor r10, 20",
+        "or r11, r10",
+        "add rax, r12",
+        // type: the table entry for its first letter
+        "mov ecx, r9d",
+        "shr ecx, 1",
+        "and ecx, 1",
+        "lea r10, [r12 + rbx + 1]",
+        "mov r10, qword ptr [r10 + rcx]",
+        "mov r12, r10",
+        "and r12d, 31",
+        "shl r12, 5",
+        "xor r10, qword ptr [rdi + r12 + {ty}]",
+        "and r10, qword ptr [rdi + r12 + {ty} + 8]",
+        "or r11, r10",
+        "mov r10, rbp",
+        "sub r10, rbx",
+        "lea rcx, [rcx + rcx + 1]",
+        "sub r10, rcx",
+        "xor r10, qword ptr [rdi + r12 + {ty} + 16]",
+        "or r11, r10",
+        "mov r10, qword ptr [rdi + r12 + {ty} + 24]",
+        "mov byte ptr [r13 + r15 + {pur}], r10b",
+        // product: not empty
+        "shr r9d, 2",
+        "and r9d, 1",
+        "add r9d, r9d",
+        "sub r8, rbp",
+        "dec r8",
+        "xor ecx, ecx",
+        "cmp r8, r9",
+        "sete cl",
+        "or r11, rcx",
+        // ingest date; the day's start in rbx
+        "mov rbp, qword ptr [rax + 2]",
+        "pext r8, rbp, qword ptr [rdi + {daybits}]",
+        "shl r8, 5",
+        "xor rbp, qword ptr [rdi + r8 + {days} + 8]",
+        "or r11, rbp",
+        "mov rbp, qword ptr [rax]",
+        "xor rbp, qword ptr [rdi + r8 + {days}]",
+        "or r11, rbp",
+        "mov rbx, qword ptr [rdi + r8 + {days} + 24]",
+        // ---- both timestamps
+        "mov rcx, qword ptr [r13 + {scr} + 32]",
+        "vinserti128 ymm1, ymm1, xmmword ptr [rax + 10], 1",
+        "vpsubb ymm1, ymm1, ymmword ptr [rcx + {f_lo}]",
+        "vpand ymm1, ymm1, ymmword ptr [rcx + {f_mk}]",
+        "vpsubusb ymm0, ymm1, ymmword ptr [rcx + {f_rg}]",
+        "vpor ymm2, ymm2, ymm0",
+        "vpshufb ymm1, ymm1, ymmword ptr [rcx + {f_shuf}]",
+        "vpmaddubsw ymm1, ymm1, ymm3",
+        "vpcmpgtw ymm0, ymm1, ymmword ptr [rcx + {f_wlim}]",
+        "vpor ymm2, ymm2, ymm0",
+        "vpmaddwd ymm1, ymm1, ymmword ptr [rcx + {f_w2}]",
+        "vpackusdw ymm1, ymm1, ymm1",
+        "vpmaddwd ymm1, ymm1, ymmword ptr [rcx + {f_w3}]",
+        "vmovq rax, xmm1",
+        "vextracti128 xmm0, ymm1, 1",
+        "vmovd r8d, xmm0",
+        "add rbx, r8",
+        // ts = constant part + k0 * first number + kb * second number
+        "mov r10d, eax",
+        "shr rax, 32",
+        "imul r10, qword ptr [rcx + {f_k0}]",
+        "imul rax, qword ptr [r13 + {scr} + 24]",
+        "add rax, r10",
+        "add rax, qword ptr [r13 + {scr} + 16]",
+        // ---- a row, or a line for the plain reading
+        "vptest ymm2, ymm2",
+        "jnz 60f",
+        "test r11, r11",
+        "jnz 60f",
+        "mov qword ptr [r13 + r15*8 + {t}], rax",
+        "mov qword ptr [r13 + r15*8 + {ing}], rbx",
+        "mov qword ptr [r13 + r15*8 + {lp}], rsi",
+        "mov rsi, qword ptr [r13 + {scr}]",
+        "mov qword ptr [r13 + r15*8 + {nx}], rsi",
+        "inc r15",
+        "add r14, 16",
+        "jmp 2b",
+        "60:",
+        "mov rax, qword ptr [r13 + {scr}]",
+        "jmp 71f",
+        "70:",
+        "lea rax, [rsi + rax + 1]",
+        "71:",
+        "mov rcx, qword ptr [r13 + {nc}]",
+        "mov qword ptr [r13 + rcx*8 + {coldp}], rsi",
+        "inc rcx",
+        "mov qword ptr [r13 + {nc}], rcx",
+        "mov rsi, rax",
+        "cmp rcx, {b}",
+        "jb 2b",
+        "90:",
+        "xor eax, eax",
+        "jmp 99f",
+        "80:",
+        "mov eax, 1",
+        "99:",
+        "pop rbp",
+        "pop rbx",
+        b = const B,
+        ahead = const AHEAD,
+        idsh = const offset_of!(Dec, idsh),
+        tsform = const offset_of!(Dec, tsform),
+        forms = const offset_of!(Dec, forms),
+        days = const offset_of!(Dec, days),
+        ty = const offset_of!(Dec, ty),
+        daybits = const offset_of!(Dec, daybits),
+        fsize = const size_of::<Form>(),
+        f_lo = const offset_of!(Form, lo),
+        f_mk = const offset_of!(Form, mk),
+        f_rg = const offset_of!(Form, rg),
+        f_shuf = const offset_of!(Form, shuf),
+        f_wlim = const offset_of!(Form, wlim),
+        f_w2 = const offset_of!(Form, w2),
+        f_w3 = const offset_of!(Form, w3),
+        f_off = const offset_of!(Form, off),
+        f_k0 = const offset_of!(Form, k0),
+        f_kb = const offset_of!(Form, kb),
+        f_dmask = const offset_of!(Form, dmask),
+        f_c0 = const offset_of!(Form, c0),
+        f_bad = const offset_of!(Form, bad),
+        ids = const offset_of!(Batch, ids),
+        t = const offset_of!(Batch, t),
+        ing = const offset_of!(Batch, ing),
+        lp = const offset_of!(Batch, lp),
+        nx = const offset_of!(Batch, nx),
+        coldp = const offset_of!(Batch, coldp),
+        pur = const offset_of!(Batch, pur),
+        nc = const offset_of!(Batch, nc),
+        scr = const offset_of!(Batch, scr),
+        in("rdi") dec as *const Dec,
+        inout("rsi") p => stop,
+        in("rdx") pend,
+        in("r13") bt as *mut Batch,
+        out("r15") rows,
+        out("rax") long,
+        out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r14") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _,
+        in("ymm3") _mm256_set1_epi16(0x010A),
+        in("ymm4") ld(dec.idw3.as_ptr() as *const u8),
+        in("ymm5") ld(dec.idw2.as_ptr() as *const u8),
+        in("ymm6") ld(dec.idw1.as_ptr()),
+        in("ymm7") ld(dec.idrng.as_ptr()),
+        in("ymm8") ld(dec.idlow.as_ptr()),
+        in("ymm9") _mm256_set1_epi8(10),
+        in("ymm10") _mm256_set1_epi8(39),
+        in("ymm11") ld(dec.idt.as_ptr()),
+        in("ymm12") _mm256_set1_epi8(b'0' as i8),
+        in("ymm13") _mm256_set1_epi8(b'"' as i8),
+        in("ymm14") _mm256_set1_epi8(b'\n' as i8),
+        in("ymm15") _mm256_set1_epi8(b',' as i8),
+    );
+    (stop, rows, long != 0)
+}
+
+/// `events` with the line loop of `lines_asm`: the same rows into the same batch
+/// stage, the same lines to the plain reading.
+#[inline(never)]
+pub unsafe fn events_a(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, end: usize) {
+    let fx = sh.fx.as_ref().unwrap_unchecked();
+    let dec: &Dec = sh.dec.as_ref().unwrap_unchecked();
+    let mut bt: Batch = std::mem::zeroed();
+    let (mut p, pend) = (d.add(start), d.add(end));
+    while p < pend {
+        bt.nc = 0;
+        let (stop, rows, long) = lines_asm(dec, p, pend, &mut bt);
+        let mut purchases = 0u64;
+        for j in 0..rows {
+            bt.line[j] = (bt.lp[j] - d as u64) as u32;
+            purchases |= ((bt.pur[j] != 0) as u64) << j;
+        }
+        // The purchases' price and category. A price the rules do not accept puts
+        // the row outside every window: the copy is invalid.
+        let mut m = purchases;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match purchase(sh, dec, d, (bt.nx[j] - d as u64) as usize - 1) {
+                Some(x) => bt.pc[j] = (x as u64) << 32,
+                None => bt.t[j] = i64::MIN,
+            }
+        }
+        flush(sh, fx, dec, w, d, &mut bt, rows);
+        let mut m = purchases;
+        while m != 0 {
+            bt.pc[m.trailing_zeros() as usize] = 0;
+            m &= m - 1;
+        }
+        for k in 0..bt.nc as usize {
+            cold_from(sh, w, d, (bt.coldp[k] - d as u64) as usize);
+        }
+        p = stop;
+        if long {
+            p = d.add(cold_from(sh, w, d, p as usize - d as usize));
+        }
+    }
 }
