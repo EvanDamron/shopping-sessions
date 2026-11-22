@@ -93,10 +93,27 @@ fn store(b: &[u8]) -> *const u8 {
     })
 }
 
-/// The bytes of an interned string at `p`.
+
+/// Whether the interned string at `p` is `b`: lengths, then eight bytes at a time
+/// (no call to a general compare; this runs once per long ID read).
 #[inline(always)]
-unsafe fn stored(p: *const u8) -> &'static [u8] {
-    std::slice::from_raw_parts(p.add(8), (p as *const u64).read() as usize)
+unsafe fn stored_eq(p: *const u8, b: &[u8]) -> bool {
+    let n = b.len();
+    if (p as *const u64).read() as usize != n {
+        return false;
+    }
+    let (s, t) = (p.add(8), b.as_ptr());
+    let mut i = 0;
+    let mut diff = 0u64;
+    while i + 8 <= n {
+        diff |= (s.add(i) as *const u64).read_unaligned() ^ (t.add(i) as *const u64).read_unaligned();
+        i += 8;
+    }
+    while i < n {
+        diff |= (*s.add(i) ^ *t.add(i)) as u64;
+        i += 1;
+    }
+    diff == 0
 }
 
 /// Looks `b` up in the long-ID table, adding it if absent; None when the table is
@@ -133,7 +150,7 @@ fn intern_table(b: &[u8], h: u64) -> Option<*const u8> {
         }
         if v & (0xFFFF << 48) == tag {
             let p = (v & ((1 << 48) - 1)) as *const u8;
-            if unsafe { stored(p) } == b {
+            if unsafe { stored_eq(p, b) } {
                 return Some(p);
             }
         }
@@ -226,6 +243,22 @@ impl Id {
         let _ = h;
     }
 
+    /// Starts loading the interned string a lookup with hash `h` compares first, if
+    /// its table slot (prefetched earlier with `prefetch_long`) holds one with the
+    /// same tag.
+    #[inline(always)]
+    pub fn prefetch_long_string(h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(t) = LTAB.get() {
+            let v = unsafe { t.slots.get_unchecked((h as usize) & t.mask) }.load(Ordering::Relaxed);
+            if v > CLOSED && v & (0xFFFF << 48) == h & (0xFFFF << 48) {
+                unsafe { core::arch::x86_64::_mm_prefetch((v & ((1 << 48) - 1)) as *const i8, core::arch::x86_64::_MM_HINT_T0) }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = h;
+    }
+
     /// `intern` for an ID of more than 15 bytes whose `long_hash` is `h`.
     #[inline(never)]
     pub fn intern_long(b: &[u8], h: u64) -> Id {
@@ -272,16 +305,27 @@ impl Id {
         }
     }
 
-    #[cold]
+    /// The key of an event ID of more than 15 bytes: its bytes eight at a time (the
+    /// last, partial word zero-filled), two chained multiply-folds. Words are read
+    /// in place (the partial one as the last eight bytes, shifted), never copied.
     #[inline(never)]
     fn hashed(b: &[u8]) -> Id {
-        let (mut x, mut y) = (K3 ^ b.len() as u64, K4);
-        for c in b.chunks(8) {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            let w = u64::from_le_bytes(w);
+        let n = b.len();
+        let p = b.as_ptr();
+        let (mut x, mut y) = (K3 ^ n as u64, K4);
+        let mut step = |w: u64| {
             x = mum(x ^ w, K1).rotate_left(29) ^ w;
             y = mum(y ^ w, K2).rotate_left(23).wrapping_add(x);
+        };
+        let mut i = 0;
+        while i + 8 <= n {
+            step(unsafe { (p.add(i) as *const u64).read_unaligned() });
+            i += 8;
+        }
+        if i < n {
+            // n > 15, so the eight bytes ending at n are all inside b.
+            let r = n - i;
+            step(unsafe { (p.add(n - 8) as *const u64).read_unaligned() } >> (8 * (8 - r)));
         }
         Id { lo: mum(x, K1 ^ y), hi: mum(y ^ K3, x ^ K4) | (0xFE << 56) }
     }
@@ -332,6 +376,28 @@ impl Id {
 #[cfg(test)]
 mod tests {
     use super::Id;
+
+    #[test]
+    fn long_keys_as_before() {
+        // The word-at-a-time key against the chunk-copying one it replaced.
+        fn old(b: &[u8]) -> Id {
+            use super::{mum, K1, K2, K3, K4};
+            let (mut x, mut y) = (K3 ^ b.len() as u64, K4);
+            for c in b.chunks(8) {
+                let mut w = [0u8; 8];
+                w[..c.len()].copy_from_slice(c);
+                let w = u64::from_le_bytes(w);
+                x = mum(x ^ w, K1).rotate_left(29) ^ w;
+                y = mum(y ^ w, K2).rotate_left(23).wrapping_add(x);
+            }
+            Id { lo: mum(x, K1 ^ y), hi: mum(y ^ K3, x ^ K4) | (0xFE << 56) }
+        }
+        let mut v: Vec<u8> = Vec::new();
+        for n in 16..80 {
+            v.push((n * 37 % 251) as u8);
+            assert_eq!(Id::hashed(&v), old(&v), "length {}", v.len());
+        }
+    }
 
     #[test]
     fn inline_ids_order_like_bytes() {

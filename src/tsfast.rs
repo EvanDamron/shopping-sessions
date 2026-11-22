@@ -213,25 +213,72 @@ impl Win {
         }
     }
 
-    /// As `ts` for the `n` bytes at p: F1 and 13-digit F3 are both worked out and
-    /// one is chosen by the length, without a branch on the form; anything that is
-    /// neither, or fails its checks, goes to `ts`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+
+    /// `(ts(pt, 0, nt), ingest(pi, 0, ni))` in one go: the `DDTHH:MM:SS` parts of
+    /// both fields are checked and folded in one 256-bit pass (lane 0 `ts` as F1,
+    /// lane 1 `ingest_ts`), a 13-digit F3 `ts` is read beside it, and the form is
+    /// chosen by the length without a branch. Anything else (F2, other lengths,
+    /// anything that fails a check) goes to `ts` / `ingest`. Reads 24 bytes at each.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[inline(always)]
-    pub unsafe fn ts_bl(&self, p: *const u8, n: usize) -> i64 {
-        let (w0, w5) = (load8(p), load8(p.add(5)));
-        let (mok, m) = self.month(w0);
-        let (d, part, hms) = dhms(p.add(8));
-        let ok1 = hms & mok & (d >= m.lo) & (d <= m.hi) & (*p.add(19) == b'Z') & (n == 20);
-        let v1 = ((m.day0 + d) * 86_400 + part) * 1000 - self.base;
-        let ok3 = digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) & (n == 13);
-        let v3 = ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base;
-        let t = if n == 20 { v1 } else { v3 };
-        if ok1 | ok3 {
-            t
+    pub unsafe fn ts_ingest(&self, pt: *const u8, nt: usize, pi: *const u8, ni: usize) -> (i64, i64, u32) {
+        use core::arch::x86_64::*;
+        let v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(pt.add(8) as *const __m128i)), _mm_loadu_si128(pi.add(8) as *const __m128i), 1);
+        let x = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let nine = _mm256_broadcastsi128_si256(_mm_setr_epi8(9, 9, -1, 9, 9, -1, 9, 9, -1, 9, 9, -1, -1, -1, -1, -1));
+        let seps = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0));
+        let sepm = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0));
+        let bad = _mm256_or_si256(_mm256_subs_epu8(x, nine), _mm256_and_si256(_mm256_xor_si256(v, seps), sepm));
+        let y = _mm256_shuffle_epi8(x, _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 1, 3, 4, 6, 7, 9, 10, -1, -1, -1, -1, -1, -1, -1, -1)));
+        let z = _mm256_maddubs_epi16(y, _mm256_broadcastsi128_si256(_mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0)));
+        let over = _mm256_cmpgt_epi16(z, _mm256_broadcastsi128_si256(_mm_setr_epi16(i16::MAX, 23, 59, 59, 0, 0, 0, 0)));
+        let bad = _mm256_or_si256(bad, over);
+        let hm = _mm256_madd_epi16(z, _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0)));
+        let good = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bad, _mm256_setzero_si256())) as u32;
+        let (dt, di) = (_mm256_extract_epi16::<0>(z) as i64, _mm256_extract_epi16::<8>(z) as i64);
+        let pt_ = _mm256_extract_epi32::<0>(hm) as i64 + _mm256_extract_epi32::<1>(hm) as i64;
+        let pi_ = _mm256_extract_epi32::<4>(hm) as i64 + _mm256_extract_epi32::<5>(hm) as i64;
+        // ingest_ts: as `ingest`
+        let (moki, mi) = self.month(load8(pi));
+        let oki = (good >> 16 == 0xFFFF) & moki & (*pi.add(19) == b'Z') & (ni == 20);
+        let secs = (mi.day0 + di) * 86_400 + pi_;
+        let (ing_ms, key) = if oki {
+            (secs * 1000, ((secs - self.base_s) as i32 as u32) ^ 0x8000_0000)
         } else {
-            self.ts(p, 0, n)
-        }
+            self.ingest_cold(pi, ni)
+        };
+        // ts: by its length (a branch is cheaper than working out both forms):
+        // F1 from the lane, as `f1`; 13-digit F3 as `f3_13`; anything else `ts`.
+        let t = if nt == 20 {
+            let (mok, m) = self.month(load8(pt));
+            if (good & 0xFFFF == 0xFFFF) & mok & (dt >= m.lo) & (dt <= m.hi) & (*pt.add(19) == b'Z') {
+                ((m.day0 + dt) * 86_400 + pt_) * 1000 - self.base
+            } else {
+                self.ts_cold(pt, nt)
+            }
+        } else if nt == 13 {
+            let (w0, w5) = (load8(pt), load8(pt.add(5)));
+            if digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) {
+                ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base
+            } else {
+                self.ts_cold(pt, nt)
+            }
+        } else {
+            self.ts_cold(pt, nt)
+        };
+        (t, ing_ms, key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn ts_cold(&self, p: *const u8, n: usize) -> i64 {
+        self.ts(p, 0, n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn ingest_cold(&self, p: *const u8, n: usize) -> (i64, u32) {
+        self.ingest(p, 0, n)
     }
 
     /// A `ts` field to ms since `base`; FAIL if it is not a timestamp. The caller
@@ -333,8 +380,6 @@ mod tests {
         let n = buf.len();
         buf.extend_from_slice(&[b','; 40]);
         let fast = unsafe { w.ts(buf.as_ptr(), 0, n) };
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
-        assert_eq!(fast, unsafe { w.ts_bl(buf.as_ptr(), n) }, "ts_bl {s:?}");
         let slow = match crate::ts::parse_ts(s.as_bytes()) {
             Some(t) => t.checked_sub(w.base).unwrap_or(i64::MAX),
             None => FAIL,
@@ -345,6 +390,17 @@ mod tests {
             assert_eq!(fast, slow, "{s:?}");
         }
         let fi = unsafe { w.ingest(buf.as_ptr(), 0, n) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // Every pairing of this text as ts with a valid ingest_ts, and as ingest_ts with a valid ts.
+            let good = b"2026-10-03T23:58:10Z";
+            let mut g = good.to_vec();
+            g.extend_from_slice(&[b','; 40]);
+            let gi = unsafe { w.ingest(g.as_ptr(), 0, 20) };
+            let gt = unsafe { w.ts(g.as_ptr(), 0, 20) };
+            assert_eq!(unsafe { w.ts_ingest(buf.as_ptr(), n, g.as_ptr(), 20) }, (fast, gi.0, gi.1), "ts_ingest ts {s:?}");
+            assert_eq!(unsafe { w.ts_ingest(g.as_ptr(), 20, buf.as_ptr(), n) }, (gt, fi.0, fi.1), "ts_ingest ingest {s:?}");
+        }
         let want = match crate::ts::parse_ingest(s.as_bytes()) {
             Some(ms) => {
                 let key = (ms.div_euclid(1000) - w.base_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
