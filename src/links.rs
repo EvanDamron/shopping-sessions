@@ -25,7 +25,8 @@ struct Entry {
     hi: AtomicU64, // 0 = empty, BUSY = being written
     person: AtomicU32,
     root: AtomicU32, // 1 when this ID is its person's name
-    _pad: [u32; 2],
+    parent: AtomicU32, // while the links are built: union-find parent plus one (0 = a root)
+    _pad: u32,
 }
 
 /// Person numbers a thread takes at a time for the IDs it adds.
@@ -213,7 +214,6 @@ impl Links {
 
 struct Build {
     tab: *const Entry,
-    parent: Vec<AtomicU32>,
     mask: usize,
     shift: u32,
     count: AtomicUsize,
@@ -228,9 +228,9 @@ impl Build {
         unsafe { &*self.tab.add(i) }
     }
 
-    /// The slot of `id`, inserting it if absent.
+    /// The slot of `id`, inserting it if absent (and then noting the slot in `new`).
     #[inline(always)]
-    fn intern(&self, id: Id, h: u64, added: &mut usize) -> u32 {
+    fn intern(&self, id: Id, h: u64, added: &mut usize, new: &mut Vec<u32>) -> u32 {
         let mut i = (h >> self.shift) as usize;
         loop {
             let e = self.entry(i);
@@ -241,6 +241,7 @@ impl Build {
                         e.lo.store(id.lo, Relaxed);
                         e.hi.store(id.hi, Release);
                         *added += 1;
+                        new.push(i as u32);
                         return i as u32;
                     }
                     Err(cur) => hi = cur,
@@ -257,6 +258,12 @@ impl Build {
         }
     }
 
+    /// Slot `i`'s union-find parent word, beside its ID in the same cache line.
+    #[inline(always)]
+    fn par(&self, i: u32) -> &AtomicU32 {
+        &self.entry(i as usize).parent
+    }
+
     #[inline(always)]
     fn id(&self, i: u32) -> Id {
         let e = self.entry(i as usize);
@@ -267,16 +274,16 @@ impl Build {
     #[inline(always)]
     fn find(&self, mut x: u32) -> u32 {
         loop {
-            let pe = self.parent[x as usize].load(Relaxed);
+            let pe = self.par(x).load(Relaxed);
             if pe == 0 {
                 return x;
             }
             let p = pe - 1;
-            let gpe = self.parent[p as usize].load(Relaxed);
+            let gpe = self.par(p).load(Relaxed);
             if gpe == 0 {
                 return p;
             }
-            let _ = self.parent[x as usize].compare_exchange_weak(pe, gpe, Relaxed, Relaxed);
+            let _ = self.par(x).compare_exchange_weak(pe, gpe, Relaxed, Relaxed);
             x = gpe - 1;
         }
     }
@@ -294,7 +301,7 @@ impl Build {
                 std::mem::swap(&mut a, &mut b);
             }
             // a has the larger name: hang it under b, if it is still a root.
-            if self.parent[a as usize].compare_exchange(0, b + 1, Relaxed, Relaxed).is_ok() {
+            if self.par(a).compare_exchange(0, b + 1, Relaxed, Relaxed).is_ok() {
                 return;
             }
         }
@@ -340,16 +347,8 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         mem::hugepages(tab, slots * std::mem::size_of::<Entry>());
     }
     let tab = tab as *const Entry;
-    let pbytes = slots * 4;
-    let pmem = mem::map(pbytes + (2 << 20));
-    let pmem = ((pmem as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
-    if huge {
-        mem::hugepages(pmem, pbytes);
-    }
-    let parent = unsafe { Vec::from_raw_parts(pmem as *mut AtomicU32, slots, slots) };
     let b = Build {
         tab,
-        parent,
         mask: slots - 1,
         shift: 64 - slots.trailing_zeros(),
         count: AtomicUsize::new(0),
@@ -357,27 +356,62 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         full: AtomicBool::new(false),
     };
     let next = AtomicUsize::new(0);
-    std::thread::scope(|sc| {
-        for _ in 0..nthreads.min(tasks.len().max(1)) {
+    // Each thread notes the slots it fills, so the numbering below visits the linked
+    // IDs alone instead of every slot of a table sized for all users.
+    let jthreads = nthreads.min(tasks.len().max(1));
+    let lbytes: u64 = tasks.iter().map(|t| t.2 - t.1).sum();
+    let cap = (lbytes / 12) as usize / jthreads + 1024;
+    // IDs longer than 15 bytes (interned, two dependent misses each) are hashed and
+    // their long-table slot prefetched as a line is read, then interned a batch at a
+    // time with their strings prefetched (SS_LINKLONG=0: one at a time as read).
+    let defer_long = std::env::var_os("SS_LINKLONG").is_none_or(|v| v != "0");
+    let lists: Vec<Vec<u32>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..jthreads).map(|_| {
             let (b, next) = (&b, &next);
             sc.spawn(move || {
                 let ttl = crate::tl::now();
                 let _tl = crate::Defer(|| crate::tl::span(2, ttl));
+                let mut new: Vec<u32> = Vec::with_capacity(cap);
                 let mut rd = Reader::new(buf);
                 let mut ids = [(Id::EMPTY, Id::EMPTY, 0u64, 0u64); BATCH];
                 let mut n = 0usize;
+                // Long IDs of the batch still to intern: (2 * line + field, start, length,
+                // long hash), in the reader's current data.
+                let mut lng = [(0usize, 0usize, 0usize, 0u64); 2 * BATCH];
+                let mut nl = 0usize;
+                let resolve = |d: *const u8, ids: &mut [(Id, Id, u64, u64)], lng: &[(usize, usize, usize, u64)]| unsafe {
+                    for &(_, _, _, h) in lng {
+                        Id::prefetch_long_string(h);
+                    }
+                    for &(k, s, len, h) in lng {
+                        let id = Id::intern_long(std::slice::from_raw_parts(d.add(s), len), h);
+                        let hh = id.hash();
+                        prefetch(b.tab.add((hh >> b.shift) as usize));
+                        let x = &mut ids[k / 2];
+                        if k % 2 == 0 {
+                            (x.0, x.2) = (id, hh);
+                        } else {
+                            (x.1, x.3) = (id, hh);
+                        }
+                    }
+                };
                 let mut added = 0usize;
                 let mut dead = false;
                 // Report insertions often enough that the table cannot fill between checks.
                 let every = (b.mask + 1) / (8 * nthreads).max(1);
-                let flush = |ids: &[(Id, Id, u64, u64)], added: &mut usize, dead: &mut bool| {
+                let flush = |ids: &[(Id, Id, u64, u64)], added: &mut usize, dead: &mut bool, new: &mut Vec<u32>| {
                     let mut s = [(0u32, 0u32); BATCH];
                     for (k, &(ia, ib, ha, hb)) in ids.iter().enumerate() {
-                        let a = b.intern(ia, ha, added);
-                        let c = b.intern(ib, hb, added);
+                        let a = b.intern(ia, ha, added, new);
+                        let c = b.intern(ib, hb, added, new);
                         s[k] = (a, c);
-                        prefetch(&b.parent[a as usize]);
-                        prefetch(&b.parent[c as usize]);
+                        // (The entries are loaded now; start on their parents'.)
+                        for x in [a, c] {
+                            let pe = b.par(x).load(Relaxed);
+                            if pe != 0 {
+                                prefetch(b.entry(pe as usize - 1) as *const Entry);
+                            }
+                        }
                     }
                     // Find both roots and start loading their entries (the union compares
                     // the roots' names), then join: three passes, so the cache misses of a
@@ -416,44 +450,64 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
                             if s0 == e0 || s1 == e1 {
                                 return;
                             }
-                            let (ia, ib) = (Id::field(d, s0, e0), Id::field(d, s1, e1));
-                            let (ha, hb) = (ia.hash(), ib.hash());
-                            prefetch(b.tab.add((ha >> b.shift) as usize));
-                            prefetch(b.tab.add((hb >> b.shift) as usize));
+                            let mut one = |s: usize, e: usize, k: usize| -> (Id, u64) {
+                                if e - s > 15 && defer_long {
+                                    let h = Id::long_hash(d.add(s), e - s);
+                                    Id::prefetch_long(h);
+                                    lng[nl] = (k, s, e - s, h);
+                                    nl += 1;
+                                    return (Id::EMPTY, 0);
+                                }
+                                let id = Id::field(d, s, e);
+                                let h = id.hash();
+                                prefetch(b.tab.add((h >> b.shift) as usize));
+                                (id, h)
+                            };
+                            let (ia, ha) = one(s0, e0, 2 * n);
+                            let (ib, hb) = one(s1, e1, 2 * n + 1);
                             ids[n] = (ia, ib, ha, hb);
                             n += 1;
                             if n == BATCH {
-                                flush(&ids, &mut added, &mut dead);
+                                resolve(d, &mut ids, &lng[..nl]);
+                                nl = 0;
+                                flush(&ids, &mut added, &mut dead, &mut new);
                                 n = 0;
                             }
                         });
+                        // The data changes with the next batch of lines.
+                        if nl > 0 {
+                            resolve(d, &mut ids, &lng[..nl]);
+                            nl = 0;
+                        }
                     });
                 }
                 if !dead {
-                    flush(&ids[..n], &mut added, &mut dead);
+                    flush(&ids[..n], &mut added, &mut dead, &mut new);
                 }
                 if b.count.fetch_add(added, Relaxed) + added > b.limit {
                     b.full.store(true, Relaxed);
                 }
-            });
-        }
+                new
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     if b.full.load(Relaxed) || b.count.load(Relaxed) > b.limit {
         unsafe {
             libc_unmap(tab as *mut u8, slots * std::mem::size_of::<Entry>());
-            libc_unmap(b.parent.as_ptr() as *mut u8, pbytes);
         }
-        std::mem::forget(b.parent);
         return None;
     }
     if std::env::var_os("SS_TIME").is_some() {
         eprintln!("  links: interned and joined at {:?}", t0.elapsed());
     }
-    // Person numbers, in one pass over the table: every linked ID finds its set's
-    // root, and the first thread to reach a root (from the root itself or from any ID
-    // of its set) gives it the next number of its block of `BLOCK` and writes the
-    // name; the others wait for that (the root's `root` word: 0 none yet, 2 being
-    // numbered, 1 numbered). Every linked ID then takes its root's number.
+    // Person numbers, in one pass over the linked IDs (the slots the join filled, from
+    // the threads' lists; SS_LINKSCAN=1 walks the whole table instead): every linked
+    // ID finds its set's root, and the first thread to reach a root (from the root
+    // itself or from any ID of its set) gives it the next number of its block of
+    // `BLOCK` and writes the name; the others wait for that (the root's `root` word: 0
+    // none yet, 2 being numbered, 1 numbered). Every linked ID then takes its root's
+    // number.
     let ncap = slots + (1 << 16);
     let names = mem::map(ncap * std::mem::size_of::<Id>()) as *mut Id;
     if huge {
@@ -463,9 +517,17 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
     let counter = AtomicU32::new(0);
     let next = AtomicUsize::new(0);
     const STEP: usize = 1 << 14;
+    let scan = std::env::var_os("SS_LINKSCAN").is_some_and(|v| v != "0");
+    // Pieces of the lists, (list, start, end), handed out one at a time.
+    const LSTEP: usize = 1 << 13;
+    let pieces: Vec<(usize, usize, usize)> = lists
+        .iter()
+        .enumerate()
+        .flat_map(|(li, l)| (0..l.len()).step_by(LSTEP).map(move |lo| (li, lo, (lo + LSTEP).min(l.len()))))
+        .collect();
     std::thread::scope(|sc| {
         for _ in 0..nthreads {
-            let (b, next, counter) = (&b, &next, &counter);
+            let (b, next, counter, lists, pieces) = (&b, &next, &counter, &lists, &pieces);
             sc.spawn(move || {
                 let ttl = crate::tl::now();
                 let _tl = crate::Defer(|| crate::tl::span(3, ttl));
@@ -481,17 +543,65 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
                                 }
                                 let n = num;
                                 num += 1;
-                                unsafe { (names_addr as *mut Id).add(n as usize).write(b.id(r)) };
                                 e.person.store(n, Relaxed);
                                 e.root.store(1, Release);
+                                // The name is written after the number is out: nothing reads
+                                // `names` before this pass ends, and the write may fault in
+                                // a page, which the other threads need not wait for.
+                                unsafe { (names_addr as *mut Id).add(n as usize).write(b.id(r)) };
                                 return n;
                             }
                             Err(1) => return e.person.load(Relaxed),
-                            Err(_) => std::hint::spin_loop(),
+                            Err(_) => {
+                                while e.root.load(Acquire) == 2 {
+                                    std::hint::spin_loop();
+                                }
+                            }
                         }
                     }
                 };
-                loop {
+                // A piece of a list is taken a batch at a time, in four passes so the
+                // misses of a batch overlap: (one batch ahead) its slots' entries, then
+                // their parents' entries, then the roots' entries, then the numbers.
+                const NB: usize = 32;
+                while !scan {
+                    let t = next.fetch_add(1, Relaxed);
+                    if t >= pieces.len() {
+                        break;
+                    }
+                    let (li, lo, hi) = pieces[t];
+                    let l = &lists[li][lo..hi];
+                    let ahead = |c: usize| {
+                        for &k in &l[(c * NB).min(l.len())..(c * NB + NB).min(l.len())] {
+                            prefetch(b.entry(k as usize) as *const Entry);
+                        }
+                    };
+                    ahead(0);
+                    let mut pend = [(0u32, 0u32); NB];
+                    for (c, ch) in l.chunks(NB).enumerate() {
+                        ahead(c + 1);
+                        for &k in ch {
+                            let pe = b.par(k).load(Relaxed);
+                            if pe != 0 {
+                                prefetch(b.entry(pe as usize - 1) as *const Entry);
+                            }
+                        }
+                        for (j, &k) in ch.iter().enumerate() {
+                            let r = b.find(k);
+                            if r != k {
+                                prefetch(b.entry(r as usize) as *const Entry);
+                            }
+                            pend[j] = (k, r);
+                        }
+                        for &(k, r) in &pend[..ch.len()] {
+                            let p = number_of(r);
+                            if k != r {
+                                b.entry(k as usize).person.store(p, Relaxed);
+                            }
+                        }
+                    }
+                }
+                while scan {
                     let lo = next.fetch_add(STEP, Relaxed);
                     if lo >= slots {
                         break;
@@ -528,9 +638,6 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         eprintln!("  links: persons written at {:?}", t0.elapsed());
     }
     let count = b.count.load(Relaxed);
-    // The parent array is dead: give its pages back in bulk.
-    mem::release(b.parent.as_ptr() as *mut u8, pbytes);
-    std::mem::forget(b.parent);
     Some(Links {
         tab,
         bytes: slots * std::mem::size_of::<Entry>(),
