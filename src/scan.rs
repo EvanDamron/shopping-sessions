@@ -484,6 +484,25 @@ impl Mapped {
     }
 }
 
+/// Releases part `k` of `n` of a set of mappings, cut by bytes across all of them
+/// (whole pages), so that `n` threads share the page-table teardown evenly.
+pub fn release_maps_part(maps: &[Option<Mapped>], k: usize, n: usize) {
+    let total: usize = maps.iter().flatten().map(|m| m.len.div_ceil(4096)).sum();
+    let (lo, hi) = (total * k / n, total * (k + 1) / n);
+    let mut at = 0usize; // pages before the current mapping
+    for m in maps.iter().flatten() {
+        let pages = m.len.div_ceil(4096);
+        let (a, b) = (lo.max(at), hi.min(at + pages));
+        if a < b {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::madvise(m.p.add((a - at) * 4096) as *mut libc::c_void, ((b - a) * 4096).min(m.len - (a - at) * 4096), libc::MADV_DONTNEED);
+            }
+        }
+        at += pages;
+    }
+}
+
 /// The field `[s, e)` without its quotes, on a line whose quotes are well-formed.
 #[inline(always)]
 pub unsafe fn unquote(d: *const u8, s: usize, e: usize) -> (usize, usize) {
