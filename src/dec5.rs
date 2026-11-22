@@ -322,6 +322,38 @@ unsafe fn structure<const K: usize>(c: [u64; 2], q: [u64; 2], len: usize) -> Opt
     Some(pos | ((len as u64) << 48) | (fq << 56))
 }
 
+/// Comma, quote and newline masks of the 64 bytes at p.
+#[inline(always)]
+unsafe fn masks1(p: *const u8) -> (u64, u64, u64) {
+    let (v0, v1) = (ld(p), ld(p.add(32)));
+    let m = |v: __m256i, x: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 as u64;
+    let w = |x: u8| m(v0, x) | (m(v1, x) << 32);
+    (w(b','), w(b'"'), w(b'\n'))
+}
+
+/// `structure` for a line of fewer than 64 bytes, from the masks of its first 64
+/// bytes: the same packed result, on one word.
+#[inline(always)]
+unsafe fn structure1<const K: usize>(c: u64, q: u64, len: usize) -> Option<u64> {
+    let ml = (1u64 << len) - 1;
+    let (cl, ql) = (c & ml, q & ml);
+    let spl = cl | (1u64 << len); // separators: the commas and the newline
+    let stl = (cl << 1) | 1; // field starts
+    let ol = ql & stl; // opening quotes
+    let xl = ql & (spl >> 1); // closing quotes
+    let el = (!spl).wrapping_add(ol) & spl; // an opening quote carried up to its field's end
+    let bad = (ql ^ (ol | xl)) | (ol & xl) | (el ^ (xl << 1));
+    if (cl.count_ones() != K as u32) | (bad != 0) {
+        return None;
+    }
+    let (mut m, mut pos) = (cl, 0u64);
+    for k in 0..K {
+        pos |= (m.trailing_zeros() as u64) << (8 * k);
+        m &= m.wrapping_sub(1);
+    }
+    Some(pos | ((len as u64) << 48) | (_pext_u64(ol, stl) << 56))
+}
+
 #[inline(always)]
 unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut EBatch) {
     let win = &sh.win;
@@ -666,16 +698,25 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             nl += 1;
             let p = d.add(ls);
             _mm_prefetch(p.add(AHEAD) as *const i8, _MM_HINT_T0);
-            let (c, q, nm) = masks3(p);
-            let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
-            let len = nm.trailing_zeros() as usize;
-            if len >= 128 {
-                ls = cold_click_from(sh, w, d, ls);
-                continue;
-            }
+            // Most click lines are under 64 bytes: their masks and structure take
+            // one word each; a longer line takes the 128-byte path.
+            let (c1, q1, n1) = masks1(p);
+            let (len, sx) = if n1 != 0 {
+                let len = n1.trailing_zeros() as usize;
+                (len, structure1::<3>(c1, q1, len))
+            } else {
+                let (c, q, nm) = masks3(p);
+                let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
+                let len = nm.trailing_zeros() as usize;
+                if len >= 128 {
+                    ls = cold_click_from(sh, w, d, ls);
+                    continue;
+                }
+                (len, structure::<3>(c, q, len))
+            };
             let lp = ls;
             ls += len + 1;
-            if let Some(x) = structure::<3>(c, q, len) {
+            if let Some(x) = sx {
                 let (fs, fl) = fields::<3>(x);
                 *bt.lsx.get_unchecked_mut(nv) = lp;
                 *bt.cmx.get_unchecked_mut(nv) = fs;
