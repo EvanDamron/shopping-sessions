@@ -92,8 +92,13 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                     for w in workers {
                         for chunk in w.key_chunks(d) {
                             let n = chunk.len();
+                            let cp = chunk.as_ptr();
                             for j in 0..n {
                                 unsafe {
+                                    if j % 4 == 0 {
+                                        // The key stream itself, a kilobyte ahead (chunks are 16 KB).
+                                        prefetch(cp.wrapping_add(j + 64));
+                                    }
                                     if j + KAHEAD < n {
                                         prefetch(tp.add((chunk.get_unchecked(j + KAHEAD)[0] >> shift) as usize));
                                     }
@@ -142,6 +147,11 @@ pub struct Scr {
     stamp: Vec<u32>, // per campaign: the last session it assisted
     sid: u32,
     who: Vec<u32>, // the bucket's persons with events, in order
+    ck: Vec<u64>,  // the current person's clicks, `ts << 32 | campaign`, in crediting order
+    keys: Vec<u64>,
+    lo: Vec<i64>, // per campaign: the interval being merged (assists_many)
+    hi: Vec<i64>,
+    open: Vec<u32>,
 }
 
 /// Persons with at most this many clicks get their assists from a window over
@@ -254,7 +264,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     // After filing, off[i] and coff[i] are the ends of person i's rows; the starts
     // are the previous person's ends.
     let mut ev = std::mem::take(&mut sc.ev);
-    let mut cl = std::mem::take(&mut sc.cl);
+    let cl = std::mem::take(&mut sc.cl);
     let who = std::mem::take(&mut sc.who);
     if sc.stamp.len() <= ctx.organic as usize {
         sc.stamp.resize(ctx.organic as usize + 1, 0);
@@ -271,43 +281,68 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         let (es, ee) = (if i == 0 { 0 } else { sc.off[i - 1] as usize }, sc.off[i] as usize);
         let (cs, ce) = (if i == 0 { 0 } else { sc.coff[i - 1] as usize }, sc.coff[i] as usize);
         let name = sh.links.name(first + i as u32);
-        person(st, sc, name, &mut ev[es..ee], &mut cl[cs..ce], ctx);
+        person(st, sc, name, &mut ev[es..ee], &cl[cs..ce], ctx);
     }
     sc.ev = ev;
     sc.cl = cl;
     sc.who = who;
 }
 
-/// Click order for crediting: by time, and within one instant the smallest click_id
-/// last, so the last click at or before a session start is the one it credits.
-#[inline]
-fn click_order(a: &Clk, b: &Clk) -> std::cmp::Ordering {
-    a.ts.cmp(&b.ts).then_with(|| {
-        if b.cid.less(&a.cid) {
-            std::cmp::Ordering::Less
-        } else if a.cid.less(&b.cid) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
+/// A person's clicks as `ts << 32 | campaign`, in crediting order: by time, and
+/// within one instant the smallest click_id last, so the last click at or before a
+/// session start is the one that session credits (rules.md "Clicks" step 4).
+fn order_clicks(cl: &[Clk], keys: &mut Vec<u64>, out: &mut Vec<u64>) {
+    out.clear();
+    if cl.len() == 1 {
+        out.push((cl[0].ts as u64) << 32 | cl[0].camp as u64);
+        return;
+    }
+    keys.clear();
+    keys.extend(cl.iter().enumerate().map(|(j, c)| (c.ts as u64) << 32 | j as u64));
+    keys.sort_unstable();
+    let n = keys.len();
+    let mut a = 0;
+    while a < n {
+        let t = keys[a] >> 32;
+        let mut b = a + 1;
+        while b < n && keys[b] >> 32 == t {
+            b += 1;
         }
-    })
+        if b - a > 1 {
+            // Clicks at one instant (copies of a click, or the generator's same-millisecond
+            // pairs): the largest click_id first. Insertion sort; these groups are small.
+            let g = &mut keys[a..b];
+            for x in 1..g.len() {
+                let mut y = x;
+                while y > 0 && cl[g[y - 1] as u32 as usize].cid.less(&cl[g[y] as u32 as usize].cid) {
+                    g.swap(y - 1, y);
+                    y -= 1;
+                }
+            }
+        }
+        a = b;
+    }
+    out.extend(keys.iter().map(|&k| (k >> 32) << 32 | cl[k as u32 as usize].camp as u64));
 }
 
 /// One person's events and clicks (unsorted): sessions, credit, assists, daily rows
 /// (rules.md "Events" steps 5 to 7 and "Clicks" steps 4 to 7).
 #[inline]
-fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &mut [u64], cl: &mut [Clk], ctx: &Ctx) {
+fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &mut [u64], cl: &[Clk], ctx: &Ctx) {
     if ev.len() >= 1024 {
         sort_events(ev, &mut sc.rtmp);
     } else {
         ev.sort_unstable();
     }
-    if cl.len() > 1 {
-        cl.sort_unstable_by(click_order);
+    let mut ck = std::mem::take(&mut sc.ck);
+    if cl.is_empty() {
+        ck.clear();
+    } else {
+        order_clicks(cl, &mut sc.keys, &mut ck);
     }
     let ndays = ctx.ndays;
     begin_person(st, name);
-    let small = cl.len() <= SMALL;
+    let small = ck.len() <= SMALL;
     st.starts.clear();
     st.days.clear();
     let mut k = 0;
@@ -350,28 +385,27 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &mut [u64], cl: &mut [Clk], c
         us += 1;
         ue += n;
         ur += rev;
-        // Credit: the latest click at or before the start, within 7 days (the smallest
-        // click_id of that instant is the last of it in `cl`).
-        while cj < cl.len() && (cl[cj].ts as i64) <= start {
+        // Credit: the latest click at or before the start, within 7 days.
+        while cj < ck.len() && (ck[cj] >> 32) as i64 <= start {
             cj += 1;
         }
-        let camp = if cj > 0 && start - cl[cj - 1].ts as i64 <= WEEK { cl[cj - 1].camp } else { ctx.organic };
+        let camp = if cj > 0 && start - (ck[cj - 1] >> 32) as i64 <= WEEK { ck[cj - 1] as u32 } else { ctx.organic };
         let c = &mut st.credit[camp as usize * ndays + day as usize];
         c[0] += 1 + ((purch as u64) << 32);
         c[1] += rev;
         if small {
             // Assists: every campaign of a click in [start - 7 days, start], once.
-            while ct < cj && (cl[ct].ts as i64) < start - WEEK {
+            while ct < cj && ((ck[ct] >> 32) as i64) < start - WEEK {
                 ct += 1;
             }
             if ct < cj {
                 sc.sid = sc.sid.wrapping_add(1);
                 let sid = sc.sid;
-                for x in &cl[ct..cj] {
-                    let s = unsafe { sc.stamp.get_unchecked_mut(x.camp as usize) };
+                for &x in &ck[ct..cj] {
+                    let s = unsafe { sc.stamp.get_unchecked_mut(x as u32 as usize) };
                     if *s != sid {
                         *s = sid;
-                        st.assist[x.camp as usize * ndays + day as usize] += 1;
+                        st.assist[x as u32 as usize * ndays + day as usize] += 1;
                     }
                 }
             }
@@ -381,46 +415,53 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &mut [u64], cl: &mut [Clk], c
         }
     }
     flush(st, name, cur_day + ctx.day0, us, ue, ur, ctx);
-    if small {
-        return;
+    if !small {
+        assists_many(st, sc, &ck, ndays);
     }
+    sc.ck = ck;
+}
 
-    // Assists of a person with many clicks: per campaign, merge [t, t + 7d]
-    // intervals; count the sessions inside them per day.
-    let mut tmp = std::mem::take(&mut st.tmp);
-    tmp.clear();
-    tmp.extend(cl.iter().map(|c| (c.camp, c.ts)));
-    tmp.sort_unstable();
-    let mut a = 0;
-    while a < tmp.len() {
-        let camp = tmp[a].0;
-        let mut lo = tmp[a].1 as i64;
-        let mut hi = lo + WEEK;
-        a += 1;
-        loop {
-            let more = a < tmp.len() && tmp[a].0 == camp;
-            if more && (tmp[a].1 as i64) <= hi {
-                hi = tmp[a].1 as i64 + WEEK;
-                a += 1;
+/// Assists of a person with many clicks: each campaign's clicks, in time order,
+/// make merged intervals [t, t + 7 days]; the sessions starting inside an interval
+/// are counted per day by binary search over the session starts.
+fn assists_many(st: &mut CS, sc: &mut Scr, ck: &[u64], ndays: usize) {
+    if sc.lo.len() < sc.stamp.len() {
+        sc.lo.resize(sc.stamp.len(), 0);
+        sc.hi.resize(sc.stamp.len(), 0);
+    }
+    sc.sid = sc.sid.wrapping_add(1);
+    let sid = sc.sid;
+    let mut open = std::mem::take(&mut sc.open);
+    open.clear();
+    let count = |st: &mut CS, camp: usize, lo: i64, hi: i64| {
+        let s = &st.starts;
+        let mut i0 = s.partition_point(|&x| x < lo);
+        let i1 = s.partition_point(|&x| x <= hi);
+        while i0 < i1 {
+            let d = st.days[i0];
+            let j = i0 + st.days[i0..i1].partition_point(|&x| x <= d);
+            st.assist[camp * ndays + d as usize] += (j - i0) as u32;
+            i0 = j;
+        }
+    };
+    for &x in ck {
+        let (t, camp) = ((x >> 32) as i64, x as u32 as usize);
+        if sc.stamp[camp] == sid {
+            if t <= sc.hi[camp] {
+                sc.hi[camp] = t + WEEK;
                 continue;
             }
-            let s = &st.starts;
-            let mut i0 = s.partition_point(|&x| x < lo);
-            let i1 = s.partition_point(|&x| x <= hi);
-            while i0 < i1 {
-                let d = st.days[i0];
-                let j = i0 + st.days[i0..i1].partition_point(|&x| x <= d);
-                st.assist[camp as usize * ndays + d as usize] += (j - i0) as u32;
-                i0 = j;
-            }
-            if more {
-                lo = tmp[a].1 as i64;
-                hi = lo + WEEK;
-                a += 1;
-            } else {
-                break;
-            }
+            count(st, camp, sc.lo[camp], sc.hi[camp]);
+        } else {
+            sc.stamp[camp] = sid;
+            open.push(camp as u32);
         }
+        sc.lo[camp] = t;
+        sc.hi[camp] = t + WEEK;
     }
-    st.tmp = tmp;
+    for &camp in &open {
+        let camp = camp as usize;
+        count(st, camp, sc.lo[camp], sc.hi[camp]);
+    }
+    sc.open = open;
 }
