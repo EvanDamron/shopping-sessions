@@ -1145,7 +1145,6 @@ fn decode(rd: &mut Reader, f: &File, m: Option<&scan::Mapped>, a: u64, b: u64, p
             go(unsafe { m.ptr().add(x) }, 0, y - x);
             x = y;
         }
-        m.done(s, e);
     }
     if b > m.hi.max(a) {
         rd.run_raw(f, a.max(m.hi), b, &mut go);
@@ -1219,9 +1218,14 @@ fn phase_a<'a>(
         files.iter().map(|f| if mapped { scan::Mapped::new(&f.0, f.1) } else { None }).collect()
     };
     let (emaps, cmaps) = (maps(event_files), maps(click_files));
+    // Tasks left per file: the thread that finishes a file's last one releases its mapping.
+    let left = |files: &[(File, u64)], events: bool| -> Vec<AtomicUsize> {
+        (0..files.len()).map(|f| AtomicUsize::new(tasks.iter().filter(|t| t.0 == events && t.1 == f).count())).collect()
+    };
+    let (eleft, cleft) = (left(event_files, true), left(click_files, false));
     {
         let next = AtomicUsize::new(0);
-        let (sh, tasks, next, emaps, cmaps) = (&sh, &tasks, &next, &emaps, &cmaps);
+        let (sh, tasks, next, emaps, cmaps, eleft, cleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft, &cleft);
         std::thread::scope(|sc| {
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
@@ -1277,6 +1281,12 @@ fn phase_a<'a>(
                                 decode(&mut rd, &click_files[f].0, cmaps[f].as_ref(), a, b, bufsz, go);
                             }
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
+                        }
+                        let (maps, left) = if is_event { (emaps, eleft) } else { (cmaps, cleft) };
+                        if left[f].fetch_sub(1, Relaxed) == 1 {
+                            if let Some(m) = &maps[f] {
+                                m.release();
+                            }
                         }
                     }
                     unsafe { w.finish(sh) };
