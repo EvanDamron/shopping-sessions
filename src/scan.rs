@@ -432,6 +432,12 @@ impl Mapped {
         self.p
     }
 
+    /// Whether `q` points into the mapping (which is never unmapped).
+    #[inline(always)]
+    pub fn contains(&self, q: *const u8) -> bool {
+        (q as usize).wrapping_sub(self.p as usize) < self.len
+    }
+
     /// The whole lines that start in `[a, b)` and in the zone, as offsets
     /// `(start, end)`: `start` is a line start, `end` is just past a newline.
     pub fn span(&self, a: u64, b: u64) -> Option<(usize, usize)> {
