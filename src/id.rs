@@ -93,11 +93,6 @@ fn store(b: &[u8]) -> *const u8 {
     })
 }
 
-/// The bytes of an interned string at `p`.
-#[inline(always)]
-unsafe fn stored(p: *const u8) -> &'static [u8] {
-    std::slice::from_raw_parts(p.add(8), (p as *const u64).read() as usize)
-}
 
 /// Whether the interned string at `p` is `b`: lengths, then eight bytes at a time
 /// (no call to a general compare; this runs once per long ID read).
@@ -310,16 +305,27 @@ impl Id {
         }
     }
 
-    #[cold]
+    /// The key of an event ID of more than 15 bytes: its bytes eight at a time (the
+    /// last, partial word zero-filled), two chained multiply-folds. Words are read
+    /// in place (the partial one as the last eight bytes, shifted), never copied.
     #[inline(never)]
     fn hashed(b: &[u8]) -> Id {
-        let (mut x, mut y) = (K3 ^ b.len() as u64, K4);
-        for c in b.chunks(8) {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            let w = u64::from_le_bytes(w);
+        let n = b.len();
+        let p = b.as_ptr();
+        let (mut x, mut y) = (K3 ^ n as u64, K4);
+        let mut step = |w: u64| {
             x = mum(x ^ w, K1).rotate_left(29) ^ w;
             y = mum(y ^ w, K2).rotate_left(23).wrapping_add(x);
+        };
+        let mut i = 0;
+        while i + 8 <= n {
+            step(unsafe { (p.add(i) as *const u64).read_unaligned() });
+            i += 8;
+        }
+        if i < n {
+            // n > 15, so the eight bytes ending at n are all inside b.
+            let r = n - i;
+            step(unsafe { (p.add(n - 8) as *const u64).read_unaligned() } >> (8 * (8 - r)));
         }
         Id { lo: mum(x, K1 ^ y), hi: mum(y ^ K3, x ^ K4) | (0xFE << 56) }
     }
@@ -370,6 +376,28 @@ impl Id {
 #[cfg(test)]
 mod tests {
     use super::Id;
+
+    #[test]
+    fn long_keys_as_before() {
+        // The word-at-a-time key against the chunk-copying one it replaced.
+        fn old(b: &[u8]) -> Id {
+            use super::{mum, K1, K2, K3, K4};
+            let (mut x, mut y) = (K3 ^ b.len() as u64, K4);
+            for c in b.chunks(8) {
+                let mut w = [0u8; 8];
+                w[..c.len()].copy_from_slice(c);
+                let w = u64::from_le_bytes(w);
+                x = mum(x ^ w, K1).rotate_left(29) ^ w;
+                y = mum(y ^ w, K2).rotate_left(23).wrapping_add(x);
+            }
+            Id { lo: mum(x, K1 ^ y), hi: mum(y ^ K3, x ^ K4) | (0xFE << 56) }
+        }
+        let mut v: Vec<u8> = Vec::new();
+        for n in 16..80 {
+            v.push((n * 37 % 251) as u8);
+            assert_eq!(Id::hashed(&v), old(&v), "length {}", v.len());
+        }
+    }
 
     #[test]
     fn inline_ids_order_like_bytes() {
