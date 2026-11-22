@@ -29,6 +29,7 @@ mod simple;
 mod stage;
 mod ts;
 mod tsfast;
+mod tl;
 
 #[cfg(test)]
 use simple::parse_ts;
@@ -1232,6 +1233,7 @@ fn phase_a<'a>(
     let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
     let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
     let est = (ebytes / 72).max(1) as usize;
+    let tsetup = tl::now();
 
     // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
     // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
@@ -1286,6 +1288,7 @@ fn phase_a<'a>(
         (0..files.len()).map(|f| AtomicUsize::new(tasks.iter().filter(|t| t.0 == events && t.1 == f).count())).collect()
     };
     let (eleft, cleft) = (left(event_files, true), left(click_files, false));
+    tl::span(9, tsetup);
     {
         let next = AtomicUsize::new(0);
         let (sh, tasks, next, emaps, cmaps, eleft, cleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft, &cleft);
@@ -1310,6 +1313,7 @@ fn phase_a<'a>(
                             break;
                         }
                         let (is_event, f, a, b) = tasks[t];
+                        let ttask = tl::now();
                         match (is_event, fast) {
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (_, false) if sh.dec5 => {
@@ -1369,6 +1373,7 @@ fn phase_a<'a>(
                             }
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
                         }
+                        tl::span(if is_event { 6 } else { 7 }, ttask);
                         let (maps, left) = if is_event { (emaps, eleft) } else { (cmaps, cleft) };
                         if left[f].fetch_sub(1, Relaxed) == 1 {
                             if let Some(m) = &maps[f] {
@@ -1376,7 +1381,9 @@ fn phase_a<'a>(
                             }
                         }
                     }
+                    let tf = tl::now();
                     unsafe { w.finish(sh) };
+                    tl::span(8, tf);
                 });
             }
         });
@@ -1410,6 +1417,9 @@ fn phase_a<'a>(
 }
 
 fn main() {
+    // Timeline trace (SS_TL): stage numbers are listed in tools/tl.py.
+    tl::init();
+    tl::span(21, tl::now());
     let t0 = Instant::now();
     // Large malloc allocations (row columns, pass buffers) go on transparent huge pages
     // when the machine has plenty of free 2 MB blocks, where they halve the page faults;
@@ -1447,8 +1457,15 @@ fn main() {
     // The product and campaign tables are read on a thread of their own while the
     // link files are processed.
     let (lk, first) = std::thread::scope(|sc| {
-        let lk = sc.spawn(|| read_lookups(&data));
+        let lk = sc.spawn(|| {
+            let t = tl::now();
+            let r = read_lookups(&data);
+            tl::span(1, t);
+            r
+        });
+        let t = tl::now();
         let links = make_links(&files, nthreads, 1, &envn, &log);
+        tl::span(4, t);
         (lk.join().expect("lookups"), links)
     });
 
@@ -1471,6 +1488,7 @@ fn main() {
     let mut fast_on = envn("SS_FAST") != Some(0) && ncamp < 1 << 23;
     let (sh, workers, pb, db, mut cs) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
+        let tfx = tl::now();
         let fx = if fast_on {
             let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
             let fx = fast::setup(&files[0], eb, cb, nthreads, l.1, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32, envn("SS_FAST") != Some(2));
@@ -1481,6 +1499,7 @@ fn main() {
         } else {
             None
         };
+        tl::span(5, tfx);
         match phase_a(&lk, l, fx, &files, ws, we, nthreads, &envn, &log) {
             Some(x) => {
                 if x.0.fx.is_some() {
@@ -1534,7 +1553,9 @@ fn main() {
 
     // ---- Phase B: dedup on event id. Losing copies are listed for phase C to drop
     // (post.rs; SS_POST=0: marked dead in their person's records, as before).
+    let tdd = tl::now();
     let kills = (envn("SS_POST") != Some(0)).then(|| post::dedup(&sh, &workers, nthreads, pb, db));
+    tl::span(22, tdd);
     if kills.is_none() {
         let (sh, workers) = (&sh, &workers);
         let next = AtomicUsize::new(0);
@@ -1613,6 +1634,7 @@ fn main() {
 
     // ---- Phase C: sessions, attribution, aggregation per person bucket; each thread
     // then writes its rows as one user_daily file.
+    let tcs = tl::now();
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
@@ -1623,6 +1645,7 @@ fn main() {
         let mut order: Vec<usize> = (0..pb).collect();
         order.sort_by_key(|&p| std::cmp::Reverse(workers.iter().map(|w| w.event_count(p) + w.click_count(p)).sum::<usize>()));
         let order = &order;
+        tl::span(20, tcs);
         let next = AtomicUsize::new(0);
         let next = &next;
         let done = std::sync::Barrier::new(nthreads);
@@ -1637,23 +1660,32 @@ fn main() {
                         if k >= pb {
                             break;
                         }
+                        let tb = tl::now();
                         match kills {
                             Some(kl) => post::bucket(st, &mut scr, sh, workers, kl, ctx, order[k]),
                             None => bucket(st, sh, workers, ctx, order[k]),
                         }
+                        tl::span(14, tb);
                     }
+                    let tb = tl::now();
                     post::finish(st, &mut scr);
+                    tl::span(15, tb);
                     drop(scr);
                     post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
                     let tt = Instant::now();
+                    let ttl = tl::now();
                                         pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
                     // Once every thread is done with the records, give their memory back
                     // here, in parallel, rather than leave it to process exit.
                     let tw = tt.elapsed();
+                    tl::span(16, ttl);
+                    let tb = tl::now();
                     done.wait();
+                    tl::span(17, tb);
+                    let tb = tl::now();
                     let tr = Instant::now();
                     sh.ev.release_part(ti, nthreads);
                     sh.ck.release_part(ti, nthreads);
@@ -1666,6 +1698,7 @@ fn main() {
                     st.credit = credit;
                     st.assist = assist;
                     st.rows.n = n;
+                    tl::span(18, tb);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: rows written in {tw:?}, memory returned in {:?}", tr.elapsed());
                     }
@@ -1673,6 +1706,7 @@ fn main() {
             }
         });
     }
+    let tcamp = tl::now();
     log("phase C sessions, user_daily written");
     if std::env::var_os("SS_SECT").is_some() {
         let v: Vec<String> = post::SECT.iter().map(|x| format!("{:.3}", x.load(Relaxed) as f64 / 2.4e9)).collect();
@@ -1717,6 +1751,8 @@ fn main() {
     .expect("write campaign_daily");
     let nrows: usize = cs.iter().map(|s| s.rows.n).sum();
     log(&format!("wrote {nrows} user rows"));
+    tl::span(19, tcamp);
+    tl::dump();
     // Outputs are written and closed; skip freeing buffers.
     std::process::exit(0);
 }
