@@ -21,6 +21,7 @@ mod fast;
 mod id;
 mod links;
 mod mem;
+mod post;
 mod pq;
 mod scan;
 #[cfg(test)]
@@ -1469,8 +1470,10 @@ fn main() {
         }
     };
 
-    // ---- Phase B: dedup on event id. Losing copies are marked dead in their person's records.
-    {
+    // ---- Phase B: dedup on event id. Losing copies are listed for phase C to drop
+    // (post.rs; SS_POST=0: marked dead in their person's records, as before).
+    let kills = (envn("SS_POST") != Some(0)).then(|| post::dedup(&sh, &workers, nthreads, pb, db));
+    if kills.is_none() {
         let (sh, workers) = (&sh, &workers);
         let next = AtomicUsize::new(0);
         let next = &next;
@@ -1553,7 +1556,7 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
     {
-        let (sh, workers, ctx, ud) = (&sh, &workers, &ctx, &ud);
+        let (sh, workers, ctx, ud, kills) = (&sh, &workers, &ctx, &ud, &kills);
         // Largest buckets first, so a whale's bucket never starts last.
         let mut order: Vec<usize> = (0..pb).collect();
         order.sort_by_key(|&p| std::cmp::Reverse(workers.iter().map(|w| w.event_count(p) + w.click_count(p)).sum::<usize>()));
@@ -1565,13 +1568,20 @@ fn main() {
         std::thread::scope(|sc| {
             for (ti, st) in cs.iter_mut().enumerate() {
                 sc.spawn(move || {
+                    let mut scr = post::Scr::default();
+                    let c0 = post::thread_cpu_ns();
                     loop {
                         let k = next.fetch_add(1, Relaxed);
                         if k >= pb {
                             break;
                         }
-                        bucket(st, sh, workers, ctx, order[k]);
+                        match kills {
+                            Some(kl) => post::bucket(st, &mut scr, sh, workers, kl, ctx, order[k]),
+                            None => bucket(st, sh, workers, ctx, order[k]),
+                        }
                     }
+                    drop(scr);
+                    post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
@@ -1601,6 +1611,11 @@ fn main() {
         });
     }
     log("phase C sessions, user_daily written");
+    if std::env::var_os("SS_SECT").is_some() {
+        let v: Vec<String> = post::SECT.iter().map(|x| format!("{:.3}", x.load(Relaxed) as f64 / 2.4e9)).collect();
+        log(&format!("post sections (s at a 2.4 GHz TSC, thread sums): {}", v.join(" ")));
+    }
+    log(&format!("post cpu: dedup {:.3} s, buckets {:.3} s (thread sums)", post::CPU_B.load(Relaxed) as f64 * 1e-9, post::CPU_C.load(Relaxed) as f64 * 1e-9));
 
     let mut camp_tot = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for s in &cs {
