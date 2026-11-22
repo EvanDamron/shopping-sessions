@@ -1270,9 +1270,14 @@ fn phase_a<'a>(
                             (false, false) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (false, true) if sh.decc.is_some() => {
+                                let casm = sh.decc.as_ref().is_some_and(|d| d.asm);
                                 let go = |d: *const u8, s: usize, n: usize| unsafe {
                                     if !sh.links.full.load(Relaxed) {
-                                        decc::clicks(sh, w, d, s, n);
+                                        if casm {
+                                            decc::clicks_a(sh, w, d, s, n);
+                                        } else {
+                                            decc::clicks(sh, w, d, s, n);
+                                        }
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
                                         }

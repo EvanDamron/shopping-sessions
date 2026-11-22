@@ -70,7 +70,7 @@ pub(crate) struct Day {
     pub(crate) w0: u64,   // "YYYY-MM-"
     pub(crate) w1: u64,   // "YY-MM-DD"
     pub(crate) tms: i64,  // the day's start, ms since the click window's start
-    isec: i64, // the day's start, seconds since the click window's start
+    pub(crate) isec: i64, // the day's start, seconds since the click window's start
     text: [u8; 16], // a quote and "YYYY-MM-DD"
     _pad: [u64; 2],
 }
@@ -98,7 +98,7 @@ pub struct Dec {
     idw3: [u32; 8],
     /// What the event type must be, by the low five bits of its first letter.
     ty: [Ty; 32],
-    daybits: u64, // DAYBITS, where the hand-arranged loop can use it as an operand
+    pub(crate) daybits: u64, // DAYBITS, where the hand-arranged loops can use it as an operand
     // For the hand-arranged loop, which takes the quoting of the IDs and of `ts`
     // from the field's raw length and checks the quotes with the field itself:
     /// The `ts` forms, bare and quoted (F1, F1 quoted, F2, F2 quoted, F3, F3 quoted, none).
