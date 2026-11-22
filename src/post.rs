@@ -227,6 +227,8 @@ pub struct Scr {
     sfirst: Vec<u32>, // assists_many: per slot, the first session starting in it or later
     nday: Vec<u32>,   // assists_many: per session, the first later session on another day
     sect: [u64; 10],
+    ses: Vec<u16>, // per credit cell (campaign * days + day): sessions not yet in `st.credit`
+    asn: Vec<u16>, // per assist cell: assists not yet in `st.assist`
 }
 
 /// A person's events in one half-hour slot.
@@ -372,6 +374,8 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     let who = std::mem::take(&mut sc.who);
     if sc.stamp.len() <= ctx.organic as usize {
         sc.stamp.resize(ctx.organic as usize + 1, 0);
+        sc.ses.resize(st.credit.len(), 0);
+        sc.asn.resize(st.assist.len(), 0);
     }
     if sc.occ.is_empty() {
         sc.occ.resize(NSLOT / 64 + 1, 0);
@@ -401,6 +405,18 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         a.fetch_add(*x, Relaxed);
         *x = 0;
     }
+}
+
+/// Folds a thread's 16-bit cell counters into its credit and assist tables.
+pub fn finish(st: &mut CS, sc: &mut Scr) {
+    for (c, &x) in st.credit.iter_mut().zip(sc.ses.iter()) {
+        c[0] += x as u64;
+    }
+    for (a, &x) in st.assist.iter_mut().zip(sc.asn.iter()) {
+        *a += x as u32;
+    }
+    sc.ses.clear();
+    sc.asn.clear();
 }
 
 /// A person's clicks as `ts << 32 | campaign`, in crediting order: by time, and
@@ -572,9 +588,21 @@ fn end_session(st: &mut CS, sc: &mut Scr, sp: &mut Sess, ck: &[u64], ctx: &Ctx, 
     }
     sp.cj = cj;
     let camp = if cj > 0 && start - (ck[cj - 1] >> 32) as i64 <= WEEK { ck[cj - 1] as u32 } else { ctx.organic };
-    let c = &mut st.credit[camp as usize * ndays + day as usize];
-    c[0] += 1 + (((rev > 0) as u64) << 32);
-    c[1] += rev;
+    // Sessions per cell are counted in 16 bits (`Scr::ses`, folded into `st.credit`
+    // when full and at the end), so the counters the sessions hit at random stay in
+    // cache; purchasing sessions go to `st.credit` directly.
+    let cell = camp as usize * ndays + day as usize;
+    let x = unsafe { sc.ses.get_unchecked_mut(cell) };
+    *x += 1;
+    if *x == u16::MAX {
+        st.credit[cell][0] += u16::MAX as u64;
+        *x = 0;
+    }
+    if rev > 0 {
+        let c = &mut st.credit[cell];
+        c[0] += 1 << 32;
+        c[1] += rev;
+    }
     if sp.small {
         // Assists: every campaign of a click in [start - 7 days, start], once.
         let mut ct = sp.ct;
@@ -589,7 +617,13 @@ fn end_session(st: &mut CS, sc: &mut Scr, sp: &mut Sess, ck: &[u64], ctx: &Ctx, 
                 let s = unsafe { sc.stamp.get_unchecked_mut(x as u32 as usize) };
                 if *s != sid {
                     *s = sid;
-                    st.assist[x as u32 as usize * ndays + day as usize] += 1;
+                    let cell = x as u32 as usize * ndays + day as usize;
+                    let a = unsafe { sc.asn.get_unchecked_mut(cell) };
+                    *a += 1;
+                    if *a == u16::MAX {
+                        st.assist[cell] += u16::MAX as u32;
+                        *a = 0;
+                    }
                 }
             }
         }
