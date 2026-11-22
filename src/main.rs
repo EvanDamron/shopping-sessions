@@ -19,6 +19,7 @@ mod fast;
 mod id;
 mod links;
 mod mem;
+mod post;
 mod pq;
 mod scan;
 #[cfg(test)]
@@ -1434,8 +1435,10 @@ fn main() {
         }
     };
 
-    // ---- Phase B: dedup on event id. Losing copies are marked dead in their person's records.
-    {
+    // ---- Phase B: dedup on event id. Losing copies are listed for phase C to drop
+    // (post.rs; SS_POST=0: marked dead in their person's records, as before).
+    let kills = (envn("SS_POST") != Some(0)).then(|| post::dedup(&sh, &workers, nthreads, pb, db));
+    if kills.is_none() {
         let (sh, workers) = (&sh, &workers);
         let next = AtomicUsize::new(0);
         let next = &next;
@@ -1518,7 +1521,7 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
     {
-        let (sh, workers, ctx, ud) = (&sh, &workers, &ctx, &ud);
+        let (sh, workers, ctx, ud, kills) = (&sh, &workers, &ctx, &ud, &kills);
         // Largest buckets first, so a whale's bucket never starts last.
         let mut order: Vec<usize> = (0..pb).collect();
         order.sort_by_key(|&p| std::cmp::Reverse(workers.iter().map(|w| w.event_count(p) + w.click_count(p)).sum::<usize>()));
@@ -1530,13 +1533,18 @@ fn main() {
         std::thread::scope(|sc| {
             for (ti, st) in cs.iter_mut().enumerate() {
                 sc.spawn(move || {
+                    let mut scr = post::Scr::default();
                     loop {
                         let k = next.fetch_add(1, Relaxed);
                         if k >= pb {
                             break;
                         }
-                        bucket(st, sh, workers, ctx, order[k]);
+                        match kills {
+                            Some(kl) => post::bucket(st, &mut scr, sh, workers, kl, ctx, order[k]),
+                            None => bucket(st, sh, workers, ctx, order[k]),
+                        }
                     }
+                    drop(scr);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
