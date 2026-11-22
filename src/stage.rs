@@ -66,10 +66,9 @@ const WEEK: u32 = 604_800_000;
 const DAY: u32 = 86_400_000;
 const NONE: u32 = u32::MAX;
 
-/// Persons with at most this many clicks find each session's assisting campaigns by
-/// comparing the clicks in reach with each other; persons with more, by following
-/// when each campaign enters and leaves the reach (`assists_many`).
-const SMALL: usize = 16;
+/// With more sessions than this, the sessions a click reaches are found by binary
+/// search rather than by comparing the click with every session start.
+const SCAN: usize = 256;
 
 /// Piece flags.
 const GENERAL: u32 = 1; // already filed with the general pipeline
@@ -108,15 +107,6 @@ unsafe fn prefetch_write<T>(p: *const T) {
     let _ = p;
 }
 
-/// A click of the person at hand: time, campaign, and its place in the click bucket
-/// (for the click ID, read only to break a tie).
-#[derive(Clone, Copy)]
-struct Ck {
-    ts: u32,
-    camp: u32,
-    j: u32,
-}
-
 /// A click in the click index: time, campaign << 9 | alias, and its place in the
 /// click bucket's chunks (chunk number * CCH + place in the chunk).
 #[derive(Clone, Copy)]
@@ -134,10 +124,35 @@ struct Scr {
     sn: Vec<u32>,         // events per session
     en: Vec<u32>,         // session ends (filled only where sessions are joined or added to)
     pur: Vec<(u32, u32)>, // (session, price | category << 24), by session
-    ck: Vec<Ck>,          // clicks by time
-    cnt: Vec<u32>,        // per campaign: clicks in reach
-    enter: Vec<u32>,      // per campaign: the first session it reached
     days: Vec<(u32, u32)>, // the person's days: (day, first session)
+    /// Per session: the latest click at or before its start and after the previous
+    /// session's, as (time + 1, campaign, place in the click bucket); time 0 for none.
+    top: Vec<(u32, u32, u32)>,
+    /// The campaigns among the person's clicks, and per campaign the set of sessions
+    /// a click of it reaches (a bit per session, `words` words each, in `reached`).
+    touched: Vec<u32>,
+    reached: Vec<u64>,
+    slot_of: Vec<u32>, // per campaign: its place in `touched` + 1, or 0
+}
+
+/// One thread's campaign counts for whole persons. A campaign's days are one row of
+/// `1 << wsh` cells (64 bytes for up to 16 days), so the row a click will need can be
+/// fetched ahead with one touch. Folded into `CS::credit` / `CS::assist` at the end.
+#[derive(Clone, Copy)]
+struct Acc {
+    sess: *mut u32,   // credited sessions
+    assist: *mut u32, // assisted sessions
+    purch: *mut u32,  // credited sessions with a purchase
+    rev: *mut u64,    // their revenue
+    wsh: u32,
+}
+
+impl Acc {
+    #[inline(always)]
+    fn fetch(&self, camp: u32) {
+        prefetch_read(unsafe { self.sess.add((camp as usize) << self.wsh) });
+        prefetch_read(unsafe { self.assist.add((camp as usize) << self.wsh) });
+    }
 }
 
 /// What a bucket leaves behind about its first or last run.
@@ -207,6 +222,8 @@ struct Tls {
     esc: Vec<(u32, u64)>,      // (dense index, user number * 512 + alias) of far aliases
     odd: Vec<(u64, u32, u32)>, // events of odd user IDs: (person, t, pc)
     scr: Scr,
+    acc: Acc,
+    ahead: u32, // clicks of the index up to here have had their campaign rows fetched
     edges: Edges,
     gen: ToGeneral,
     ti: usize,
@@ -217,10 +234,14 @@ unsafe impl Send for Tls {}
 unsafe impl Sync for Env<'_> {}
 
 impl Tls {
-    fn new(cap: usize, ti: usize) -> Tls {
+    fn new(cap: usize, ti: usize, ctx: &Ctx) -> Tls {
         const H: usize = 2 << 20;
         let col = (cap + 64) * 4;
-        let bytes = (cap + 16) * 16 + cap * 8 + 5 * col;
+        let wsh = ctx.ndays.next_power_of_two().max(16).trailing_zeros();
+        let cells = (ctx.organic as usize + 1) << wsh;
+        let tables = (cap + 16) * 16 + cap * 8 + 5 * col;
+        let tables = tables.div_ceil(64) * 64;
+        let bytes = tables + cells * 20;
         let len = bytes.div_ceil(H) * H;
         let raw = mem::map(len + H);
         let base = ((raw as usize + H - 1) & !(H - 1)) as *mut u8;
@@ -235,6 +256,15 @@ impl Tls {
             let cols = base.add((cap + 16) * 16 + cap * 8);
             // Touch the columns now, so no page is first written inside the bucket loop.
             std::ptr::write_bytes(cols, 0, 5 * col);
+            let counts = base.add(tables);
+            std::ptr::write_bytes(counts, 0, cells * 20);
+            let acc = Acc {
+                rev: counts as *mut u64,
+                sess: counts.add(cells * 8) as *mut u32,
+                assist: counts.add(cells * 12) as *mut u32,
+                purch: counts.add(cells * 16) as *mut u32,
+                wsh,
+            };
             let at = |k: usize| cols.add(k * col + 64) as *mut u32;
             Tls {
                 slots,
@@ -248,6 +278,8 @@ impl Tls {
                 esc: Vec::new(),
                 odd: Vec::new(),
                 scr: Scr::default(),
+                acc,
+                ahead: 0,
                 edges: Edges::default(),
                 gen: ToGeneral::new(),
                 ti,
@@ -267,6 +299,7 @@ struct Env<'a> {
     /// The click index: per user number, where its clicks start in `kc`.
     coff: &'a [u32],
     kc: *const Kc,
+    nclicks: u32,
     /// Valid events with an odd event ID and a numbered user: (user number * 512 +
     /// alias, t, pc), by user. `taken` is set once a user number's have been handled.
     extras: &'a [(u64, u32, u32)],
@@ -585,20 +618,157 @@ fn day_of(start: u32, off: i32) -> u32 {
     ((start as i32 + off) as u32) / DAY
 }
 
+/// The sessions a click at `ts` reaches: those that start at or after it and within
+/// 7 days of it, as a range of the time-ordered starts `st[..m]` (16 readable entries
+/// of u32::MAX follow them).
+#[inline(always)]
+unsafe fn reach_plain(st: *const u32, m: usize, ts: u32) -> (usize, usize) {
+    if m > SCAN {
+        let v = std::slice::from_raw_parts(st, m);
+        return (v.partition_point(|&x| x < ts), v.partition_point(|&x| x <= ts + WEEK));
+    }
+    let (mut a, mut b) = (0usize, 0usize);
+    for i in 0..m {
+        a += (*st.add(i) < ts) as usize;
+        b += (*st.add(i) <= ts + WEEK) as usize;
+    }
+    (a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+#[inline]
+unsafe fn reach_wide(st: *const u32, m: usize, ts: u32) -> (usize, usize) {
+    use core::arch::x86_64::*;
+    if m > SCAN {
+        return reach_plain(st, m, ts);
+    }
+    let (x, y) = (_mm512_set1_epi32(ts as i32), _mm512_set1_epi32((ts + WEEK) as i32));
+    let (mut a, mut b) = (0u32, 0u32);
+    let mut i = 0;
+    while i < m {
+        let v = _mm512_loadu_si512(st.add(i) as *const __m512i);
+        a += (_mm512_cmplt_epu32_mask(v, x) as u32).count_ones();
+        b += (_mm512_cmple_epu32_mask(v, y) as u32).count_ones();
+        i += 16;
+    }
+    (a as usize, b as usize)
+}
+
+/// The person's clicks, in any order: for each, the sessions it reaches. The first of
+/// them takes it as a candidate for its credit; all of them are noted as reached by
+/// its campaign. Returns whether any click reaches a session.
+macro_rules! click_pass {
+    ($s:ident, $kc:ident, $ids:ident, $m:ident, $words:ident, $cid:ident, $reach:ident) => {{
+        let stp = $s.st.as_ptr();
+        let mut any = false;
+        for r in $kc {
+            let alias = r.ca & 511;
+            if alias >= 16 || ($ids >> alias) & 1 == 0 {
+                continue;
+            }
+            let (je, jl) = $reach(stp, $m, r.ts);
+            if je >= jl {
+                continue;
+            }
+            any = true;
+            let camp = r.ca >> 9;
+            // Credit: the latest such click wins; at the same instant, the smallest click_id.
+            let top = $s.top.get_unchecked_mut(je);
+            if r.ts + 1 > top.0 {
+                *top = (r.ts + 1, camp, r.j);
+            } else if r.ts + 1 == top.0 && r.j != top.2 && $cid(r.j).less(&$cid(top.2)) {
+                *top = (r.ts + 1, camp, r.j);
+            }
+            let slot = *$s.slot_of.get_unchecked(camp as usize);
+            let k = if slot == 0 {
+                $s.touched.push(camp);
+                $s.reached.resize($s.reached.len() + $words, 0);
+                *$s.slot_of.get_unchecked_mut(camp as usize) = $s.touched.len() as u32;
+                $s.touched.len() - 1
+            } else {
+                slot as usize - 1
+            };
+            let set = $s.reached.as_mut_ptr().add(k * $words);
+            if $words == 1 {
+                *set |= (u64::MAX >> (64 - (jl - je))) << je;
+            } else {
+                for wi in je / 64..=(jl - 1) / 64 {
+                    let (lo, hi) = (je.max(wi * 64) - wi * 64, jl.min(wi * 64 + 64) - wi * 64);
+                    *set.add(wi) |= (u64::MAX >> (64 - (hi - lo))) << lo;
+                }
+            }
+        }
+        any
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+unsafe fn click_pass_wide(s: &mut Scr, kc: &[Kc], ids: u32, m: usize, words: usize, cid: &impl Fn(u32) -> Id) -> bool {
+    click_pass!(s, kc, ids, m, words, cid, reach_wide)
+}
+
+unsafe fn click_pass_plain(s: &mut Scr, kc: &[Kc], ids: u32, m: usize, words: usize, cid: &impl Fn(u32) -> Id) -> bool {
+    click_pass!(s, kc, ids, m, words, cid, reach_plain)
+}
+
+/// How many of the sessions `a..b` are in the set `set`.
+#[inline(always)]
+unsafe fn count_in(set: *const u64, words: usize, a: usize, b: usize) -> u32 {
+    if words == 1 {
+        return ((*set >> a) & (u64::MAX >> (64 - (b - a)))).count_ones();
+    }
+    let mut n = 0;
+    for wi in a / 64..=(b - 1) / 64 {
+        let (lo, hi) = (a.max(wi * 64) - wi * 64, b.min(wi * 64 + 64) - wi * 64);
+        n += ((*set.add(wi) >> lo) & (u64::MAX >> (64 - (hi - lo)))).count_ones();
+    }
+    n
+}
+
 /// One whole person from their session list (`s.st`, `s.sn`), purchases (`s.pur`) and
-/// clicks by time (`s.ck`): rows, credit and assists (rules.md "Events" steps 6 and 7,
-/// "Clicks" steps 4 to 7). `cid` gives a click's ID, asked only to break a tie.
+/// clicks (`kc`, those whose alias is in `ids`): rows, credit and assists (rules.md
+/// "Events" steps 6 and 7, "Clicks" steps 4 to 7). Nothing is sorted: each click finds
+/// the sessions it reaches, and each session then takes the latest click that reached
+/// it first-hand, or failing that the one the session before it had. `cid` gives a
+/// click's ID, asked only to break a tie.
 #[cfg_attr(prof, inline(never))]
 #[cfg_attr(not(prof), inline(always))]
-unsafe fn person_rows(st: &mut CS, ctx: &Ctx, name: Id, s: &mut Scr, cid: impl Fn(u32) -> Id) {
-    let ndays = ctx.ndays;
+unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, kc: &[Kc], ids: u32, wide: bool, cid: impl Fn(u32) -> Id) {
+    let wsh = acc.wsh;
     let off = ctx.dayoff as i32;
     let m = s.st.len();
-    let ncl = s.ck.len();
-    let ck = s.ck.as_ptr();
+    let words = m.div_ceil(64);
+    let mut clicks = false;
+    if !kc.is_empty() {
+        s.st.reserve(16);
+        let end = s.st.as_mut_ptr().add(m);
+        for i in 0..16 {
+            *end.add(i) = u32::MAX;
+        }
+        s.top.clear();
+        s.top.resize(m, (0, 0, 0));
+        if s.slot_of.len() < ctx.organic as usize {
+            s.slot_of.resize(ctx.organic as usize, 0);
+        }
+        s.touched.clear();
+        s.reached.clear();
+        #[cfg(target_arch = "x86_64")]
+        {
+            clicks = if wide { click_pass_wide(s, kc, ids, m, words, &cid) } else { click_pass_plain(s, kc, ids, m, words, &cid) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = wide;
+            clicks = click_pass_plain(s, kc, ids, m, words, &cid);
+        }
+    }
     let (mut cur, mut us, mut ue, mut ur) = (NONE, 0u32, 0u32, 0u64);
-    let (mut pp, mut cj, mut grp, mut lo) = (0usize, 0usize, 0usize, 0usize);
+    let mut pp = 0usize;
     let npur = s.pur.len();
+    // The click the session at hand could be credited to: (time, campaign).
+    let (mut have, mut cts, mut ccamp) = (false, 0u32, 0u32);
     st.catrev.clear();
     s.days.clear();
     for j in 0..m {
@@ -612,9 +782,7 @@ unsafe fn person_rows(st: &mut CS, ctx: &Ctx, name: Id, s: &mut Scr, cid: impl F
             us = 0;
             ue = 0;
             ur = 0;
-            if ncl > SMALL {
-                s.days.push((day, j as u32));
-            }
+            s.days.push((day, j as u32));
         }
         let mut rev = 0u64;
         while pp < npur && s.pur.get_unchecked(pp).0 == j as u32 {
@@ -631,139 +799,64 @@ unsafe fn person_rows(st: &mut CS, ctx: &Ctx, name: Id, s: &mut Scr, cid: impl F
         ue += *s.sn.get_unchecked(j);
         ur += rev;
         let mut camp = ctx.organic;
-        if ncl != 0 {
-            // Credit: the latest click at or before the start, within 7 days; among
-            // clicks at that same instant, the smallest click_id.
-            while cj < ncl && (*ck.add(cj)).ts <= start {
-                if cj == 0 || (*ck.add(cj)).ts != (*ck.add(cj - 1)).ts {
-                    grp = cj;
-                }
-                cj += 1;
+        if clicks {
+            let top = *s.top.get_unchecked(j);
+            if top.0 != 0 {
+                have = true;
+                cts = top.0 - 1;
+                ccamp = top.1;
             }
-            if cj > 0 && start - (*ck.add(cj - 1)).ts <= WEEK {
-                let mut best = grp;
-                for k in grp + 1..cj {
-                    if cid((*ck.add(k)).j).less(&cid((*ck.add(best)).j)) {
-                        best = k;
-                    }
-                }
-                camp = (*ck.add(best)).camp;
-            }
-            if ncl <= SMALL {
-                // Assists: each campaign with a click in the 7 days up to the start, once.
-                while lo < cj && start - (*ck.add(lo)).ts > WEEK {
-                    lo += 1;
-                }
-                for a in lo..cj {
-                    let c = (*ck.add(a)).camp;
-                    if !(lo..a).any(|b| (*ck.add(b)).camp == c) {
-                        *st.assist.get_unchecked_mut(c as usize * ndays + day as usize) += 1;
-                    }
-                }
+            if have && start - cts <= WEEK {
+                camp = ccamp;
             }
         }
-        let cell = st.credit.get_unchecked_mut(camp as usize * ndays + day as usize);
-        cell[0] += 1 + (((rev > 0) as u64) << 32);
-        cell[1] += rev;
+        let cell = ((camp as usize) << wsh) + day as usize;
+        *acc.sess.add(cell) += 1;
+        if rev > 0 {
+            *acc.purch.add(cell) += 1;
+            *acc.rev.add(cell) += rev;
+        }
     }
     flush(st, name, cur as i64 + ctx.day0, us, ue, ur, ctx);
-    if ncl > SMALL {
-        assists_many(st, ctx, s);
-    }
-}
-
-/// Assists for a person with many clicks. The clicks in reach of a session are a
-/// range of the time-sorted clicks that only moves forward; a campaign assists every
-/// session from the one where its first click comes into reach to the one where its
-/// last click falls out of it, and those sessions are counted day by day.
-#[inline(never)]
-unsafe fn assists_many(st: &mut CS, ctx: &Ctx, s: &mut Scr) {
-    let ndays = ctx.ndays;
-    let ncamp = ctx.organic as usize;
-    let ck = &s.ck[..];
-    let ncl = ck.len();
-    let m = s.st.len() as u32;
-    if s.cnt.len() < ncamp {
-        s.cnt.resize(ncamp, 0);
-        s.enter.resize(ncamp, 0);
-    }
-    let days = &s.days[..];
-    // Sessions `a..b` were assisted by campaign `c`.
-    let mut close = |c: usize, a: u32, b: u32| {
-        if a >= b {
-            return;
-        }
-        let mut k = days.partition_point(|d| d.1 <= a) - 1;
-        while k < days.len() && days[k].1 < b {
-            let end = if k + 1 < days.len() { days[k + 1].1 } else { m };
-            *st.assist.get_unchecked_mut(c * ndays + days[k].0 as usize) += end.min(b) - days[k].1.max(a);
-            k += 1;
-        }
-    };
-    let (mut lo, mut hi) = (0usize, 0usize);
-    for (j, &start) in s.st.iter().enumerate() {
-        while hi < ncl && ck[hi].ts <= start {
-            let c = ck[hi].camp as usize;
-            if *s.cnt.get_unchecked(c) == 0 {
-                *s.enter.get_unchecked_mut(c) = j as u32;
+    if !kc.is_empty() {
+        // Assists: per campaign, the sessions it reached, counted day by day.
+        let nd = s.days.len();
+        for (k, &c) in s.touched.iter().enumerate() {
+            let set = s.reached.as_ptr().add(k * words);
+            for di in 0..nd {
+                let (d, a) = *s.days.get_unchecked(di);
+                let b = if di + 1 < nd { s.days.get_unchecked(di + 1).1 as usize } else { m };
+                let n = count_in(set, words, a as usize, b);
+                if n != 0 {
+                    *acc.assist.add(((c as usize) << wsh) + d as usize) += n;
+                }
             }
-            *s.cnt.get_unchecked_mut(c) += 1;
-            hi += 1;
-        }
-        while lo < hi && start - ck[lo].ts > WEEK {
-            let c = ck[lo].camp as usize;
-            *s.cnt.get_unchecked_mut(c) -= 1;
-            if *s.cnt.get_unchecked(c) == 0 {
-                close(c, *s.enter.get_unchecked(c), j as u32);
-            }
-            lo += 1;
-        }
-    }
-    for x in &ck[lo..hi] {
-        let c = x.camp as usize;
-        *s.cnt.get_unchecked_mut(c) -= 1;
-        if *s.cnt.get_unchecked(c) == 0 {
-            close(c, *s.enter.get_unchecked(c), m);
-        }
-    }
-}
-
-/// The person's clicks, by time: those of user number `g` whose alias is in `ids`.
-#[cfg_attr(prof, inline(never))]
-#[cfg_attr(not(prof), inline(always))]
-unsafe fn gather(env: &Env, s: &mut Scr, g: u32, ids: u32) {
-    let (c0, c1) = (*env.coff.get_unchecked(g as usize), *env.coff.get_unchecked(g as usize + 1));
-    s.ck.clear();
-    for i in c0..c1 {
-        let r = &*env.kc.add(i as usize);
-        let alias = r.ca & 511;
-        if alias < 16 && (ids >> alias) & 1 != 0 {
-            s.ck.push(Ck { ts: r.ts, camp: r.ca >> 9, j: r.j });
-        }
-    }
-    let n = s.ck.len();
-    if n > 24 {
-        s.ck.sort_unstable_by_key(|x| x.ts);
-    } else {
-        for i in 1..n {
-            let x = s.ck[i];
-            let mut k = i;
-            while k > 0 && s.ck[k - 1].ts > x.ts {
-                s.ck[k] = s.ck[k - 1];
-                k -= 1;
-            }
-            s.ck[k] = x;
+            *s.slot_of.get_unchecked_mut(c as usize) = 0;
         }
     }
 }
 
 /// A run that passed `whole`, with its sessions and purchases in `s`.
 #[inline(always)]
-unsafe fn person(env: &Env, st: &mut CS, s: &mut Scr, g: u32, bits: u32, mask: u32) {
+unsafe fn person(env: &Env, st: &mut CS, s: &mut Scr, acc: &Acc, ahead: &mut u32, g: u32, bits: u32, mask: u32) {
     let name = name_of(g, bits, mask, env.fx.uk);
-    gather(env, s, g, if mask != 0 { mask } else { bits });
+    let (c0, c1) = (*env.coff.get_unchecked(g as usize), *env.coff.get_unchecked(g as usize + 1));
+    // The index is in user-number order, the order runs come in: the campaign rows of
+    // the clicks a little further on are fetched now, for the next few persons.
+    let to = (c1 + 24 + (c1 - c0)).min(env.nclicks);
+    let mut i = (*ahead).max(c1);
+    if i < to && to - i <= 4096 {
+        while i < to {
+            acc.fetch((*env.kc.add(i as usize)).ca >> 9);
+            i += 1;
+        }
+        *ahead = to;
+    } else if i < to {
+        *ahead = c1; // a very large person: not worth fetching for
+    }
+    let kc = std::slice::from_raw_parts(env.kc.add(c0 as usize), (c1 - c0) as usize);
     let l = env.li.cl.get_unchecked((g >> env.fx.cshift) as usize);
-    person_rows(st, env.ctx, name, s, |j| (*crec(l, j as usize)).cid);
+    person_rows(st, acc, env.ctx, name, s, kc, if mask != 0 { mask } else { bits }, env.wide, |j| (*crec(l, j as usize)).cid);
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,7 +1104,8 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
                         add_event(&mut *s, t, pc);
                     }
                 }
-                person(env, st, &mut *s, g, bits, mask);
+                let acc = x.acc;
+                person(env, st, &mut *s, &acc, &mut x.ahead, g, bits, mask);
                 x.cnt[0] += (r1 - r0 + more.len()) as u64;
                 x.cnt[2] += 1;
                 x.cnt[3] += (*s).st.len() as u64;
@@ -1165,7 +1259,8 @@ unsafe fn joined(ids: &[u32], env: &Env, all: &[Parts<Edges>], x: &mut Tls, st: 
         for &(_, t, pc) in more {
             add_event(&mut *s, t, pc);
         }
-        person(env, st, &mut *s, g, bits, mask);
+        let acc = x.acc;
+        person(env, st, &mut *s, &acc, &mut x.ahead, g, bits, mask);
         x.cnt[0] += events + more.len() as u64;
         x.cnt[2] += 1;
         x.cnt[3] += (*s).st.len() as u64;
@@ -1222,7 +1317,7 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
     let nclicks = cbase[nxc] as usize;
     let kc_bytes = (nclicks + 16) * std::mem::size_of::<Kc>();
     let kc = mem::map(kc_bytes) as *mut Kc;
-    if fx.huge {
+    if fx.huge || std::env::var_os("SS_KCHUGE").is_some() {
         mem::hugepages(kc as *mut u8, kc_bytes);
     }
     let mut coff = vec![0u32; nxc * gper + 1];
@@ -1266,6 +1361,7 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
         li: &li,
         coff: unsafe { std::slice::from_raw_parts(coff.as_ptr(), coff.len()) },
         kc,
+        nclicks: nclicks as u32,
         extras: &extras,
         taken: &taken,
         cap,
@@ -1296,7 +1392,7 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
                 sc.spawn(move || unsafe {
                     // The click index first: every bucket of events reads it.
                     let tc = Instant::now();
-                    let mut x = Tls::new(cap, ti);
+                    let mut x = Tls::new(cap, ti, ctx);
                     let mut cnt = Vec::new();
                     loop {
                         let c = nextc.fetch_add(1, Relaxed);
@@ -1394,6 +1490,16 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
                     }
                     gate2.wait();
                     w.finish(sh);
+                    // This thread's campaign counts join the general pipeline's.
+                    let (acc, nd) = (x.acc, env.ctx.ndays);
+                    for c in 0..=env.ctx.organic as usize {
+                        for d in 0..nd {
+                            let (from, to) = ((c << acc.wsh) + d, c * nd + d);
+                            st.credit[to][0] += *acc.sess.add(from) as u64 + ((*acc.purch.add(from) as u64) << 32);
+                            st.credit[to][1] += *acc.rev.add(from);
+                            st.assist[to] += *acc.assist.add(from);
+                        }
+                    }
                     // The click index is done with: each thread returns its share.
                     let part = (kc_bytes / nthreads) & !4095;
                     let lo = part * x.ti;
