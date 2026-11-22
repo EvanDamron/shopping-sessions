@@ -69,6 +69,18 @@ pub fn init_long_table(expected: usize, huge: bool) {
     let _ = LTAB.set(LongTable { slots, mask: n - 1, used: AtomicUsize::new(0), limit: n / 10 * 7 });
 }
 
+/// Returns part `k` of `n` of the long-ID table's pages to the kernel (once no ID is
+/// interned or looked up any more: the interned strings themselves stay).
+pub fn release_long_table_part(k: usize, n: usize) {
+    if let Some(t) = LTAB.get() {
+        let bytes = t.slots.len() * 8;
+        let (lo, hi) = ((bytes / n * k) & !4095, if k + 1 == n { bytes } else { (bytes / n * (k + 1)) & !4095 });
+        if hi > lo {
+            crate::mem::release(unsafe { (t.slots.as_ptr() as *mut u8).add(lo) }, hi - lo);
+        }
+    }
+}
+
 thread_local! {
     /// This thread's space for interned strings: (next free byte, bytes left).
     static ARENA: Cell<(*mut u8, usize)> = const { Cell::new((std::ptr::null_mut(), 0)) };

@@ -1521,8 +1521,6 @@ fn main() {
 
     let (ws, we) = read_manifest(&data);
     let files = [csv_files(&data.join("events")), csv_files(&data.join("clicks")), csv_files(&data.join("links"))];
-    // The product and campaign tables are read on a thread of their own while the
-    // link files are processed.
     // The product and campaign tables, the fast path's sample check and phase A's
     // arenas, workers and file mappings are made on a thread of their own while the
     // link files are processed: none of them needs the links.
@@ -1735,8 +1733,16 @@ fn main() {
         let bdone = AtomicUsize::new(0);
         let claimed = std::sync::atomic::AtomicBool::new(false);
         let parts: Vec<[AtomicUsize; 2]> = (0..nthreads).map(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]).collect();
-        const RP: usize = 32; // release pieces per region
-        let nrel = 4 + sh.fx.is_some() as usize;
+        // Release pieces: (region, part). The big regions in RP parts each, then each
+        // worker's click IDs (long ones point into the click files) and the long-ID table.
+        const RP: usize = 32;
+        let mut rel: Vec<(u8, usize)> = Vec::new();
+        for region in 0..4 + sh.fx.is_some() as u8 {
+            rel.extend((0..RP).map(|k| (region, k)));
+        }
+        rel.extend((0..nthreads).map(|w| (5, w)));
+        rel.extend((0..RP).map(|k| (6, k)));
+        let rel = &rel;
         let rnext = AtomicUsize::new(0);
         let (bdone, claimed, parts, rnext, lk, cd) = (&bdone, &claimed, &parts, &rnext, &lk, &cd);
         std::thread::scope(|sc| {
@@ -1811,16 +1817,26 @@ fn main() {
                     let tr = Instant::now();
                     loop {
                         let k = rnext.fetch_add(1, Relaxed);
-                        if k >= nrel * RP {
+                        if k >= rel.len() {
                             break;
                         }
-                        let (region, part) = (k / RP, k % RP);
+                        let (region, part) = rel[k];
                         match region {
                             0 => sh.ev.release_part(part, RP),
                             1 => sh.ck.release_part(part, RP),
                             2 => scan::release_maps_part(cmaps, part, RP),
                             3 => sh.links.release_part(part, RP),
-                            _ => sh.fx.as_ref().unwrap().release_part(part, RP),
+                            4 => sh.fx.as_ref().unwrap().release_part(part, RP),
+                            5 => {
+                                // Only the whole pages inside the buffer (it is never freed or read again).
+                                let c = &workers[part].cids;
+                                let (a, b) = (c.as_ptr() as usize, c.as_ptr() as usize + c.capacity() * std::mem::size_of::<Id>());
+                                let (a, b) = ((a + 4095) & !4095, b & !4095);
+                                if b > a {
+                                    mem::release(a as *mut u8, b - a);
+                                }
+                            }
+                            _ => id::release_long_table_part(part, RP),
                         }
                     }
                     let (credit, assist, n) = (std::mem::take(&mut st.credit), std::mem::take(&mut st.assist), st.rows.n);
