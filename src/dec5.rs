@@ -865,15 +865,13 @@ unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: 
 /// Rows of a click batch.
 #[repr(C, align(64))]
 struct CBatch {
-    ulo: [u64; ROWS],
-    uhi: [u64; ROWS],
+    uid: [Id; ROWS],
     uh: [u64; ROWS],
-    clo: [u64; ROWS],
-    chi: [u64; ROWS],
+    cid: [Id; ROWS],
     tc: [u64; ROWS], // ts | campaign << 32
     lu: [(u32, u32, u32); ROWS], // rows with a long user ID: (row, field start, length)
-    lc: [(u32, u32, u32); ROWS], // rows with a long click ID
     lsx: [usize; ROWS],
+    lnx: [u32; ROWS], // line lengths
     cmx: [u64; ROWS],
     flx: [u64; ROWS],
 }
@@ -883,59 +881,60 @@ impl CBatch {
         unsafe { Box::new(std::mem::zeroed()) }
     }
     fn row(&self, j: usize) -> CRow {
-        CRow {
-            uid: Id { lo: self.ulo[j], hi: self.uhi[j] },
-            ts: self.tc[j] as u32,
-            camp: (self.tc[j] >> 32) as u32,
-            cid: Id { lo: self.clo[j], hi: self.chi[j] },
-        }
+        CRow { uid: self.uid[j], ts: self.tc[j] as u32, camp: (self.tc[j] >> 32) as u32, cid: self.cid[j] }
     }
 }
 
-/// Campaign index by number, for the campaigns named `c_` + a number written
-/// without leading zeros (u32::MAX: no such campaign); built once from the lookups.
-static CAMPS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-
-fn camps(sh: &Shared) -> &'static [u32] {
-    CAMPS.get_or_init(|| {
-        let mut t = Vec::new();
-        for (id, v) in sh.lk.campaigns.entries() {
-            let b = id.bytes();
-            if b.len() < 3 || b.len() > 9 || &b[..2] != b"c_" || !b[2..].iter().all(u8::is_ascii_digit) || (b[2] == b'0' && b.len() > 3) {
-                continue;
-            }
-            let n = b[2..].iter().fold(0usize, |n, &c| n * 10 + (c - b'0') as usize);
-            if n >= t.len() {
-                t.resize(n + 1, u32::MAX);
-            }
-            t[n] = v;
-        }
-        t
-    })
+/// How a click ID of each length below 128 becomes its `Id` without a branch:
+/// `lo = (its first 8 bytes & ml) | (its address & pm)`, `hi = (its next 8 bytes &
+/// mh) | hi`. Lengths 1 to 15 give the inline ID (`Id::short`), 16 and up the ID by
+/// reference (`Id::external`), 0 gives `Id::EMPTY`.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct CidRow {
+    ml: u64,
+    mh: u64,
+    hi: u64,
+    pm: u64,
 }
 
-/// The campaign of the field `[s, e)` of the line at p, as `lk.campaigns.get` gives
-/// it: a field `c_` + 1 to 7 digits without a leading zero is looked up by number,
-/// anything else in the map.
+static CIDROW: [CidRow; 128] = {
+    let mut t = [CidRow { ml: 0, mh: 0, hi: 0, pm: 0 }; 128];
+    let mut n = 1;
+    while n < 128 {
+        t[n] = if n <= 15 {
+            CidRow {
+                ml: if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 },
+                mh: if n <= 8 { 0 } else { (1u64 << (8 * (n - 8))) - 1 },
+                hi: (n as u64) << 56,
+                pm: 0,
+            }
+        } else {
+            CidRow { ml: 0, mh: 0, hi: (0xFD << 56) | n as u64, pm: u64::MAX }
+        };
+        n += 1;
+    }
+    t
+};
+
+/// The click ID of the `n` (< 128) bytes at q as `Id::short` (n <= 15) or
+/// `Id::external` (n >= 16) give it, without a branch. Reads 16 bytes at q.
 #[inline(always)]
-unsafe fn campaign(sh: &Shared, tab: &[u32], p: *const u8, s: usize, e: usize) -> Option<u32> {
-    let n = e - s;
-    let nd = n.wrapping_sub(2);
-    if (nd.wrapping_sub(1) < 7) && ((p.add(s) as *const u16).read_unaligned() == u16::from_le_bytes(*b"c_")) && ((*p.add(s + 2) != b'0') | (nd == 1)) {
-        // The digits are the top `nd` bytes of the 8 that end at e; '0's fill the rest.
-        let keep = u64::MAX << (8 * (8 - nd));
-        let w = ((p.add(e - 8) as *const u64).read_unaligned() & keep) | (0x3030_3030_3030_3030 & !keep);
-        let x = w ^ 0x3030_3030_3030_3030;
-        if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 == 0 {
-            let v = x.wrapping_mul(10).wrapping_add(x >> 8);
-            let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
-                .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32)));
-            let num = (v >> 32) as usize;
-            let c = *tab.get(num).unwrap_or(&u32::MAX);
-            return (c != u32::MAX).then_some(c);
-        }
+unsafe fn cid_k(q: *const u8, n: usize) -> Id {
+    let r = CIDROW.get_unchecked(n);
+    Id {
+        lo: ((q as *const u64).read_unaligned() & r.ml) | (q as u64 & r.pm),
+        hi: ((q.add(8) as *const u64).read_unaligned() & r.mh) | r.hi,
     }
-    sh.lk.campaigns.get(Id::field(p, s, e))
+}
+
+/// A click line the kernel leaves to the general rules (`click_row` on its plain
+/// reading), as `cold_click` decides it.
+#[cold]
+#[inline(never)]
+unsafe fn click_residue(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<CRow> {
+    w.nccold += 1;
+    plain_fields::<4>(d, ls, le).and_then(|f| click_row(sh, d, &f))
 }
 
 /// Click lines `d[s..e]`: every line parsed and filed as `crate::clicks` files it.
@@ -960,7 +959,8 @@ unsafe fn cold_click_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) 
 #[inline(always)]
 unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, ext: bool, bt: &mut CBatch) {
     let win = &sh.win;
-    let tab = camps(sh);
+    let span = win.span as u64;
+    let noext = (!ext) as u64;
     let mut ls = s;
     while ls < end {
         let first = ls;
@@ -991,87 +991,82 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             if let Some(x) = sx {
                 let (fs, fl) = fields::<3>(x);
                 *bt.lsx.get_unchecked_mut(nv) = lp;
+                *bt.lnx.get_unchecked_mut(nv) = len as u32;
                 *bt.cmx.get_unchecked_mut(nv) = fs;
                 *bt.flx.get_unchecked_mut(nv) = fl;
                 nv += 1;
             }
         }
-        // ---- Pass 2: fields.
-        let (mut n, mut nlu, mut nlc) = (0usize, 0usize, 0usize);
+        // ---- Pass 2: the click kernel. Every field of the accepted shape is
+        // converted without a branch (campaign by number, the click ID inline or by
+        // reference from a table row by its length); the one branch is the user
+        // ID's width. Each check leaves a residue that is 0 on that shape; a line
+        // with any residue is decided by the general rules, in its place.
+        let (mut n, mut nlu, mut nr) = (0usize, 0usize, 0usize);
         for j in 0..nv {
             let lp = *bt.lsx.get_unchecked(j);
             let p = d.add(lp);
             let fs = bt.cmx.as_ptr().add(j) as *const u8;
             let fl = bt.flx.as_ptr().add(j) as *const u8;
-            let f = |k: usize| (*fs.add(k) as usize, *fl.add(k) as usize);
-            let ((s0, clen), (s1, ulen)) = (f(0), f(1));
-            if (clen == 0) | (ulen == 0) {
+            let (s0, l0) = (*fs as usize, *fl as usize);
+            let (s1, l1) = (*fs.add(1) as usize, *fl.add(1) as usize);
+            let (s2, l2) = (*fs.add(2) as usize, *fl.add(2) as usize);
+            let (s3, l3) = (*fs.add(3) as usize, *fl.add(3) as usize);
+            // The campaign by its inline ID in the campaigns map (an absent one, or an
+            // empty field, gives u32::MAX: the click is dropped); a campaign ID of more
+            // than 15 bytes, or a long click ID read through the buffer (it must be
+            // interned), is left to the general rules.
+            let camp = sh.lk.campaigns.get(Id::short(p.add(s2), l2 & 15)).unwrap_or(u32::MAX);
+            // ts by the table row of its form (kern.rs); any other text is residue.
+            let (t, tres) = sh.kern.ts(p.add(s3), l3);
+            let res = tres | ((l2 > 15) as u64) | (((l0 > 15) as u64) & noext);
+            if res != 0 {
+                if let Some(r) = click_residue(sh, w, d, lp, lp + *bt.lnx.get_unchecked(j) as usize) {
+                    let h = r.uid.hash();
+                    sh.links.prefetch2(h);
+                    *bt.uid.get_unchecked_mut(n) = r.uid;
+                    *bt.uh.get_unchecked_mut(n) = h;
+                    *bt.cid.get_unchecked_mut(n) = r.cid;
+                    *bt.tc.get_unchecked_mut(n) = r.ts as u64 | (r.camp as u64) << 32;
+                    n += 1;
+                    nr += 1;
+                }
                 continue;
             }
-            let (s2, l2) = f(2);
-            let Some(camp) = campaign(sh, tab, p, s2, s2 + l2) else {
-                continue;
-            };
-            let (s3, l3) = f(3);
-            let t = win.ts(p, s3, s3 + l3);
-            if t as u64 >= win.span as u64 {
-                continue;
-            }
-            if ulen <= 15 {
-                let uid = Id::short(p.add(s1), ulen);
+            // Kept: a campaign with that number, ts in the click window, both IDs non-empty.
+            let keep = (camp != u32::MAX) & ((t as u64) < span) & (l0 != 0) & (l1 != 0);
+            let cid = cid_k(p.add(s0), l0);
+            if l1 <= 15 {
+                let uid = Id::short(p.add(s1), l1);
                 let h = uid.hash();
                 sh.links.prefetch2(h);
-                *bt.ulo.get_unchecked_mut(n) = uid.lo;
-                *bt.uhi.get_unchecked_mut(n) = uid.hi;
+                *bt.uid.get_unchecked_mut(n) = uid;
                 *bt.uh.get_unchecked_mut(n) = h;
             } else {
-                let h = Id::long_hash(p.add(s1), ulen);
+                let h = Id::long_hash(p.add(s1), l1);
                 Id::prefetch_long(h);
                 *bt.uh.get_unchecked_mut(n) = h;
-                *bt.lu.get_unchecked_mut(nlu) = (n as u32, (lp + s1) as u32, ulen as u32);
-                nlu += 1;
+                *bt.lu.get_unchecked_mut(nlu) = (n as u32, (lp + s1) as u32, l1 as u32);
+                nlu += keep as usize;
             }
-            if clen <= 15 {
-                let cid = Id::short(p.add(s0), clen);
-                *bt.clo.get_unchecked_mut(n) = cid.lo;
-                *bt.chi.get_unchecked_mut(n) = cid.hi;
-            } else if ext {
-                let cid = Id::external(p.add(s0), clen);
-                *bt.clo.get_unchecked_mut(n) = cid.lo;
-                *bt.chi.get_unchecked_mut(n) = cid.hi;
-            } else {
-                let h = Id::long_hash(p.add(s0), clen);
-                Id::prefetch_long(h);
-                *bt.clo.get_unchecked_mut(n) = h; // until interned
-                *bt.lc.get_unchecked_mut(nlc) = (n as u32, (lp + s0) as u32, clen as u32);
-                nlc += 1;
-            }
+            *bt.cid.get_unchecked_mut(n) = cid;
             *bt.tc.get_unchecked_mut(n) = t as u32 as u64 | (camp as u64) << 32;
-            n += 1;
+            n += keep as usize;
         }
         for &(row, at, len) in bt.lu.get_unchecked(..nlu) {
             let row = row as usize;
             let uid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.uh.get_unchecked(row));
             let h = uid.hash();
-            *bt.ulo.get_unchecked_mut(row) = uid.lo;
-            *bt.uhi.get_unchecked_mut(row) = uid.hi;
+            *bt.uid.get_unchecked_mut(row) = uid;
             *bt.uh.get_unchecked_mut(row) = h;
             sh.links.prefetch2(h);
         }
-        for &(row, at, len) in bt.lc.get_unchecked(..nlc) {
-            let row = row as usize;
-            let cid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.clo.get_unchecked(row));
-            *bt.clo.get_unchecked_mut(row) = cid.lo;
-            *bt.chi.get_unchecked_mut(row) = cid.hi;
-        }
         for j in 0..n {
-            let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
-            let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
+            let who = sh.links.person(*bt.uid.get_unchecked(j), *bt.uh.get_unchecked(j), &mut w.added);
             let tc = *bt.tc.get_unchecked(j);
-            let cid = Id { lo: *bt.clo.get_unchecked(j), hi: *bt.chi.get_unchecked(j) };
-            w.push_click(sh, (who & sh.pmask) as usize, who, tc as u32, (tc >> 32) as u32, cid);
+            w.push_click(sh, (who & sh.pmask) as usize, who, tc as u32, (tc >> 32) as u32, *bt.cid.get_unchecked(j));
         }
-        w.ncfast += n as u64;
+        w.ncfast += (n - nr) as u64;
         if sh.deccheck {
             check_batch_clicks(sh, d, first, ls, bt, n);
         }
@@ -1109,3 +1104,29 @@ unsafe fn check_batch_clicks(sh: &Shared, d: *const u8, a: usize, b: usize, bt: 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The click kernel's ID table against `Id::short` / `Id::external` for every
+    /// length and random bytes (zero bytes included).
+    #[test]
+    fn click_ids_agree() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut buf = vec![0u8; 160];
+        for _ in 0..20_000 {
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = if x % 5 == 0 { 0 } else { x as u8 };
+            }
+            for n in 0..128 {
+                let q = buf.as_ptr();
+                let want = if n <= 15 { unsafe { Id::short(q, n) } } else { Id::external(q, n) };
+                assert_eq!(unsafe { cid_k(q, n) }, want, "length {n}");
+                assert_eq!(unsafe { cid_k(q, n) }.bytes(), &buf[..n]);
+            }
+        }
+    }
+}

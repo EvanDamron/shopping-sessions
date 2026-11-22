@@ -375,6 +375,7 @@ impl Id {
     /// orders like its bytes (`less`), but equal strings at two places are two
     /// values: for click IDs, which are only ever ordered, never matched.
     #[inline(always)]
+    #[cfg_attr(not(test), allow(dead_code))] // the click kernel builds the same value from a table (dec5::cid_k)
     pub fn external(p: *const u8, len: usize) -> Id {
         debug_assert!(len > 15 && len < 256);
         Id { lo: p as u64, hi: (0xFD << 56) | len as u64 }
