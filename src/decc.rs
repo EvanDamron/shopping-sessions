@@ -72,7 +72,15 @@ pub struct DecC {
     clen: u64,
     /// Campaigns all go through the hash map (all ones) or the table where they can (0).
     notab: u64,
+    // For the hand-arranged loop: `ctab`'s data, the length masks (16 bytes from
+    // `keep[16 - n]` keep the first n bytes), and whether it is used (SS_ASM=0, or
+    // no campaign table: the compiled loop).
+    ctabp: *const u32,
+    keep: [u8; 32],
+    pub asm: bool,
 }
+unsafe impl Send for DecC {}
+unsafe impl Sync for DecC {}
 
 /// The number of `c_` + 1 to 8 decimal digits without a leading zero.
 fn campaign_number(id: &[u8]) -> Option<u64> {
@@ -96,6 +104,9 @@ impl DecC {
             ctab: vec![NOTFOUND],
             clen: 0,
             notab: u64::MAX,
+            ctabp: std::ptr::null(),
+            keep: KEEP,
+            asm: false,
         });
         for i in 0..128 {
             let (raw, q) = (i / 2, i % 2);
@@ -161,6 +172,8 @@ impl DecC {
                 dc.notab = 0;
             }
         }
+        dc.ctabp = dc.ctab.as_ptr();
+        dc.asm = dc.notab == 0 && std::env::var_os("SS_ASM").is_none_or(|v| v != "0");
         dc
     }
 }
@@ -171,7 +184,12 @@ struct Batch {
     camp: [u32; B],     // campaign index, NOTFOUND for none
     cid: [[u64; 2]; B], // the click ID as an Id's two words
     t: [i64; B],        // ts, ms since the click window's start
-    line: [u32; B],
+    lp: [u64; B],       // where the row's line starts (address)
+    // For `lines_asm`: the lines queued for the plain reading, and where the next
+    // line starts.
+    coldp: [u64; B],
+    nc: u64,
+    scr: [u64; 2],
 }
 
 #[inline(always)]
@@ -248,7 +266,7 @@ unsafe fn flush(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, 
             let r = CRec { who: g as u32, ts: bt.t[j] as u32, camp, _pad: (u & 511) as u32, cid: Id { lo: bt.cid[j][0], hi: bt.cid[j][1] } };
             w.push_xclick(fx, (g >> fx.cshift) as usize, r);
         } else if st == 2 {
-            cold_from(sh, w, d, bt.line[j] as usize);
+            cold_from(sh, w, d, (bt.lp[j] - d as u64) as usize);
         }
     }
 }
@@ -262,7 +280,7 @@ unsafe fn check(sh: &Shared, fx: &Fx, w: &mut Worker, d: *const u8, bt: &Batch, 
         if st == 2 {
             continue;
         }
-        let ls = bt.line[j] as usize;
+        let ls = (bt.lp[j] - d as u64) as usize;
         let mut le = ls;
         while *d.add(le) != b'\n' {
             le += 1;
@@ -394,7 +412,7 @@ pub unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         let cid = _mm_and_si128(ld16(p.add(q0 as usize)), ld16(KEEP.as_ptr().add(16 - l0 as usize)));
         _mm_storeu_si128(bt.cid.as_mut_ptr().add(nb) as *mut __m128i, _mm_insert_epi8(cid, l0 as i32, 15));
         *bt.t.get_unchecked_mut(nb) = tms;
-        *bt.line.get_unchecked_mut(nb) = pos as u32;
+        *bt.lp.get_unchecked_mut(nb) = p as u64;
         nb += 1;
         if nb == B {
             flush(sh, fx, w, d, &bt, nb);
@@ -403,4 +421,296 @@ pub unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         pos = next;
     }
     flush(sh, fx, w, d, &bt, nb);
+}
+
+/// Up to B click lines from `p` decoded into the batch with the registers assigned
+/// by hand (see `dec::lines_asm` for why): returns where it stopped, the rows it
+/// filled, and whether it stopped at a line with no newline in its first 64 bytes.
+/// It does what `clicks`' loop does, with one difference: a campaign field that is
+/// not `c_` + a number goes with the line to the plain reading (queued in
+/// `bt.coldp`) instead of to the lookup map from inside the loop. Nothing is
+/// called from here.
+///
+/// Registers: rdi the event decoder's tables, r14 the click tables, rsi line, rdx
+/// end, r13 batch, r15 rows; rax rbx rcx rbp r8-r12 scratch; ymm3 and ymm7-ymm15
+/// constants, ymm0-ymm2 and ymm4 scratch.
+#[inline(never)]
+unsafe fn lines_asm(dec: &Dec, dc: &DecC, p: *const u8, pend: *const u8, bt: &mut Batch) -> (*const u8, usize, bool) {
+    use crate::dec::Day;
+    use core::mem::{offset_of, size_of};
+    let (stop, rows, long): (*const u8, usize, u64);
+    core::arch::asm!(
+        "push rbx",
+        "push rbp",
+        "xor r15d, r15d",
+        // ---- next line
+        "2:",
+        "cmp rsi, rdx",
+        "jae 90f",
+        "prefetcht0 byte ptr [rsi + {ahead}]",
+        // newline: nl in rax
+        "vpcmpeqb ymm0, ymm14, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm14, ymmword ptr [rsi + 32]",
+        "vpmovmskb eax, ymm0",
+        "vpmovmskb ecx, ymm1",
+        "shl rcx, 32",
+        "or rax, rcx",
+        "tzcnt rax, rax",
+        "jc 80f",
+        // commas (r8) and quotes (r9) of the line
+        "vpcmpeqb ymm0, ymm15, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm15, ymmword ptr [rsi + 32]",
+        "vpmovmskb r8d, ymm0",
+        "vpmovmskb ecx, ymm1",
+        "shl rcx, 32",
+        "or r8, rcx",
+        "bzhi r8, r8, rax",
+        "vpcmpeqb ymm0, ymm13, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm13, ymmword ptr [rsi + 32]",
+        "vpmovmskb r9d, ymm0",
+        "vpmovmskb ecx, ymm1",
+        "shl rcx, 32",
+        "or r9, rcx",
+        "bzhi r9, r9, rax",
+        // c1 rcx, c2 rbx, c3 r12; exactly three commas
+        "blsr rbx, r8",
+        "tzcnt rcx, r8",
+        "blsr rbp, rbx",
+        "tzcnt rbx, rbx",
+        "tzcnt r12, rbp",
+        "blsr rbp, rbp",
+        "cmp r12, 64",
+        "jae 70f",
+        "test rbp, rbp",
+        "jnz 70f",
+        // quotes: which fields are quoted in r11, anything out of place in r10
+        "bts r8, rax",
+        "lea r10, [r8 + r8 + 1]",
+        "pext r11, r9, r10",
+        "andn r10, r10, r9",
+        "shr r8, 1",
+        "pdep r8, r11, r8",
+        "xor r10, r8",
+        "lea r8, [rsi + rax + 1]",
+        "mov qword ptr [r13 + {scr}], r8",
+        // ---- ts: its form (rax), where its text starts (r8), its lane, its date,
+        // the time in rbp
+        "mov r8d, r11d",
+        "shr r8d, 3",
+        "sub rax, r12",
+        "lea rax, [r8 + rax*2]",
+        "movzx eax, byte ptr [rdi + rax + {tsform} - 2]",
+        "imul eax, eax, {fsize}",
+        "lea rax, [rdi + rax + {forms}]",
+        "or r10, qword ptr [rax + {f_bad}]",
+        "lea r8, [r12 + r8 + 1]",
+        "add r8, rsi",
+        "mov rbp, qword ptr [rax + {f_off}]",
+        "vmovdqu xmm1, xmmword ptr [r8 + rbp]",
+        "vpsubb xmm1, xmm1, xmmword ptr [rax + {f_lo}]",
+        "vpand xmm1, xmm1, xmmword ptr [rax + {f_mk}]",
+        "vpsubusb xmm2, xmm1, xmmword ptr [rax + {f_rg}]",
+        "vpshufb xmm1, xmm1, xmmword ptr [rax + {f_shuf}]",
+        "vpmaddubsw xmm1, xmm1, xmm3",
+        "vpcmpgtw xmm0, xmm1, xmmword ptr [rax + {f_wlim}]",
+        "vpor xmm2, xmm2, xmm0",
+        "vpmaddwd xmm1, xmm1, xmmword ptr [rax + {f_w2}]",
+        "vpackusdw xmm1, xmm1, xmm1",
+        "vpmaddwd xmm1, xmm1, xmmword ptr [rax + {f_w3}]",
+        "mov rbp, qword ptr [r8 + 2]",
+        "pext r9, rbp, qword ptr [rdi + {daybits}]",
+        "shl r9, 6",
+        "xor rbp, qword ptr [rdi + r9 + {d_w1}]",
+        "and rbp, qword ptr [rax + {f_dmask}]",
+        "or r10, rbp",
+        "mov rbp, qword ptr [r8]",
+        "xor rbp, qword ptr [rdi + r9 + {d_w0}]",
+        "and rbp, qword ptr [rax + {f_dmask}]",
+        "or r10, rbp",
+        "mov rbp, qword ptr [rdi + r9 + {d_tms}]",
+        "and rbp, qword ptr [rax + {f_dmask}]",
+        "add rbp, qword ptr [rax + {f_c0}]",
+        "movzx r9d, byte ptr [r8 + 19]",
+        "and r9d, 2",
+        "mov r9, qword ptr [rax + r9*4 + {f_kb}]",
+        "vmovd r8d, xmm1",
+        "imul r8, qword ptr [rax + {f_k0}]",
+        "add rbp, r8",
+        "vpextrd r8d, xmm1, 1",
+        "imul r8, r9",
+        "add rbp, r8",
+        // ---- campaign (lane 0) and user ID (lane 1): shuffles by raw length and
+        // quoting, the lane arithmetic, the checks
+        "mov rax, r12",
+        "sub rax, rbx",
+        "mov r8d, r11d",
+        "shr r8d, 2",
+        "and r8d, 1",
+        "lea rax, [r8 + rax*2]",
+        "shl rax, 4",
+        "vmovdqu xmm0, xmmword ptr [r14 + rax + {csh} - 32]",
+        "mov rax, rbx",
+        "sub rax, rcx",
+        "mov r8d, r11d",
+        "shr r8d, 1",
+        "and r8d, 1",
+        "lea rax, [r8 + rax*2]",
+        "shl rax, 4",
+        "vinserti128 ymm0, ymm0, xmmword ptr [rdi + rax + {idsh} - 32], 1",
+        "vmovdqu xmm1, xmmword ptr [rsi + r12 - 16]",
+        "vinserti128 ymm1, ymm1, xmmword ptr [rsi + rbx - 16], 1",
+        "vpsubb ymm1, ymm1, ymm12",
+        "vpshufb ymm1, ymm1, ymm0",
+        "vpcmpgtb ymm0, ymm1, ymm11",
+        "vpand ymm4, ymm0, ymm10",
+        "vpsubb ymm1, ymm1, ymm4",
+        "vpand ymm0, ymm0, ymm9",
+        "vpsubb ymm4, ymm1, ymm8",
+        "vpsubb ymm4, ymm4, ymm0",
+        "vpsubusb ymm4, ymm4, ymm7",
+        "vpor ymm4, ymm4, ymm2",
+        "vpmaddubsw ymm1, ymm1, ymmword ptr [r14 + {idw1}]",
+        "vpmaddwd ymm1, ymm1, ymmword ptr [r14 + {idw2}]",
+        "vpmuludq ymm0, ymm1, ymmword ptr [r14 + {idw3}]",
+        "vpsrlq ymm1, ymm1, 32",
+        "vpaddq ymm1, ymm1, ymm0",
+        // the campaign's index by its number (eax)
+        "vpextrq rax, xmm1, 1",
+        "cmp rax, qword ptr [r14 + {clen}]",
+        "cmovae rax, qword ptr [r14 + {clen}]",
+        "mov r8, qword ptr [r14 + {ctabp}]",
+        "mov eax, dword ptr [r8 + rax*4]",
+        // ---- click ID: 1 to 15 bytes, masked to its length, the length in byte 15
+        "mov r8d, r11d",
+        "and r8d, 1",
+        "lea r9, [r8 + r8]",
+        "sub rcx, r9",
+        "lea r9, [rcx - 1]",
+        "cmp r9, 14",
+        "ja 60f",
+        "vmovdqu xmm0, xmmword ptr [rsi + r8]",
+        "mov r9d, 16",
+        "sub r9, rcx",
+        "vpand xmm0, xmm0, xmmword ptr [r14 + r9 + {keep}]",
+        "vpinsrb xmm0, xmm0, ecx, 15",
+        // ---- a row, or a line for the plain reading
+        "vptest ymm4, ymm4",
+        "jnz 60f",
+        "test r10, r10",
+        "jnz 60f",
+        "mov r8, r15",
+        "shl r8, 4",
+        "vmovdqu xmmword ptr [r13 + r8 + {cid}], xmm0",
+        "vmovdqu ymmword ptr [r13 + r8*2 + {ids}], ymm1",
+        "mov dword ptr [r13 + r15*4 + {camp}], eax",
+        "mov qword ptr [r13 + r15*8 + {t}], rbp",
+        "mov qword ptr [r13 + r15*8 + {lp}], rsi",
+        "mov rsi, qword ptr [r13 + {scr}]",
+        "inc r15",
+        "cmp r15, {b}",
+        "jb 2b",
+        "jmp 90f",
+        "60:",
+        "mov rax, qword ptr [r13 + {scr}]",
+        "jmp 71f",
+        "70:",
+        "lea rax, [rsi + rax + 1]",
+        "71:",
+        "mov rcx, qword ptr [r13 + {nc}]",
+        "mov qword ptr [r13 + rcx*8 + {coldp}], rsi",
+        "inc rcx",
+        "mov qword ptr [r13 + {nc}], rcx",
+        "mov rsi, rax",
+        "cmp rcx, {b}",
+        "jb 2b",
+        "90:",
+        "xor eax, eax",
+        "jmp 99f",
+        "80:",
+        "mov eax, 1",
+        "99:",
+        "pop rbp",
+        "pop rbx",
+        b = const B,
+        ahead = const crate::dec::AHEAD,
+        tsform = const offset_of!(Dec, tsform),
+        forms = const offset_of!(Dec, forms),
+        idsh = const offset_of!(Dec, idsh),
+        daybits = const offset_of!(Dec, daybits),
+        d_w0 = const offset_of!(Dec, days) + offset_of!(Day, w0),
+        d_w1 = const offset_of!(Dec, days) + offset_of!(Day, w1),
+        d_tms = const offset_of!(Dec, days) + offset_of!(Day, tms),
+        fsize = const size_of::<Form>(),
+        f_lo = const offset_of!(Form, lo),
+        f_mk = const offset_of!(Form, mk),
+        f_rg = const offset_of!(Form, rg),
+        f_shuf = const offset_of!(Form, shuf),
+        f_wlim = const offset_of!(Form, wlim),
+        f_w2 = const offset_of!(Form, w2),
+        f_w3 = const offset_of!(Form, w3),
+        f_off = const offset_of!(Form, off),
+        f_k0 = const offset_of!(Form, k0),
+        f_kb = const offset_of!(Form, kb),
+        f_dmask = const offset_of!(Form, dmask),
+        f_c0 = const offset_of!(Form, c0),
+        f_bad = const offset_of!(Form, bad),
+        csh = const offset_of!(DecC, csh),
+        idw1 = const offset_of!(DecC, idw1),
+        idw2 = const offset_of!(DecC, idw2),
+        idw3 = const offset_of!(DecC, idw3),
+        clen = const offset_of!(DecC, clen),
+        ctabp = const offset_of!(DecC, ctabp),
+        keep = const offset_of!(DecC, keep),
+        ids = const offset_of!(Batch, ids),
+        camp = const offset_of!(Batch, camp),
+        cid = const offset_of!(Batch, cid),
+        t = const offset_of!(Batch, t),
+        lp = const offset_of!(Batch, lp),
+        coldp = const offset_of!(Batch, coldp),
+        nc = const offset_of!(Batch, nc),
+        scr = const offset_of!(Batch, scr),
+        in("rdi") dec as *const Dec,
+        in("r14") dc as *const DecC,
+        inout("rsi") p => stop,
+        in("rdx") pend,
+        in("r13") bt as *mut Batch,
+        out("r15") rows,
+        out("rax") long,
+        out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm4") _,
+        in("ymm3") _mm256_set1_epi16(0x010A),
+        in("ymm7") ld(dc.idrng.as_ptr()),
+        in("ymm8") ld(dc.idlow.as_ptr()),
+        in("ymm9") _mm256_set1_epi8(10),
+        in("ymm10") _mm256_set1_epi8(39),
+        in("ymm11") ld(dc.idt.as_ptr()),
+        in("ymm12") _mm256_set1_epi8(b'0' as i8),
+        in("ymm13") _mm256_set1_epi8(b'"' as i8),
+        in("ymm14") _mm256_set1_epi8(b'\n' as i8),
+        in("ymm15") _mm256_set1_epi8(b',' as i8),
+    );
+    (stop, rows, long != 0)
+}
+
+/// `clicks` with the line loop of `lines_asm`: the same rows into the same batch
+/// stage, the same lines to the plain reading.
+#[inline(never)]
+pub unsafe fn clicks_a(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, end: usize) {
+    let fx = sh.fx.as_ref().unwrap_unchecked();
+    let dec: &Dec = sh.dec.as_ref().unwrap_unchecked();
+    let dc: &DecC = sh.decc.as_ref().unwrap_unchecked();
+    let mut bt: Batch = std::mem::zeroed();
+    let (mut p, pend) = (d.add(start), d.add(end));
+    while p < pend {
+        bt.nc = 0;
+        let (stop, rows, long) = lines_asm(dec, dc, p, pend, &mut bt);
+        flush(sh, fx, w, d, &bt, rows);
+        for k in 0..bt.nc as usize {
+            cold_from(sh, w, d, (bt.coldp[k] - d as u64) as usize);
+        }
+        p = stop;
+        if long {
+            p = d.add(cold_from(sh, w, d, p as usize - d as usize));
+        }
+    }
 }

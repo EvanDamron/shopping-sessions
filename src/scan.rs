@@ -465,19 +465,16 @@ impl Mapped {
         }
     }
 
-    /// Drops the pages that lie wholly inside `[s, e)` from this process's page
-    /// tables (the file stays in the page cache): done by each thread for what it
-    /// has read, so that nothing is left to tear down at exit.
-    pub fn done(&self, s: usize, e: usize) {
+    /// Drops the file's pages from this process's page tables (the file stays in
+    /// the page cache), so that nothing is left to tear down at exit. Called once
+    /// per file, by the thread that finishes its last piece: every call makes the
+    /// kernel interrupt the other threads to flush their address translations, so
+    /// one call per megabyte read cost more than the reading saved.
+    pub fn release(&self) {
         #[cfg(target_os = "linux")]
         unsafe {
-            let (s, e) = (s.div_ceil(4096) * 4096, e / 4096 * 4096);
-            if e > s {
-                libc::madvise(self.p.add(s) as *mut libc::c_void, e - s, libc::MADV_DONTNEED);
-            }
+            libc::madvise(self.p as *mut libc::c_void, self.len, libc::MADV_DONTNEED);
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = (s, e);
     }
 }
 
