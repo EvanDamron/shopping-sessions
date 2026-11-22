@@ -1435,7 +1435,9 @@ fn phase_a<'a>(
                         // faulted back in there, then left for exit to tear down on one thread).
                         if is_event && eleft[f].fetch_sub(1, Relaxed) == 1 {
                             if let Some(m) = &emaps[f] {
+                                let tr = tl::now();
                                 m.release();
+                                tl::span(31, tr);
                             }
                         }
                     }
