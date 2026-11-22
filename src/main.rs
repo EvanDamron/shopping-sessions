@@ -1266,7 +1266,9 @@ fn phase_a<'a>(
                                         if is_event {
                                             dec5::events(sh, w, d, s, n);
                                         } else {
-                                            dec5::clicks(sh, w, d, s, n);
+                                            // Long click IDs are kept by reference when the lines are read from the mapping.
+                                            let ext = cmaps[f].as_ref().is_some_and(|m| m.contains(d));
+                                            dec5::clicks(sh, w, d, s, n, ext);
                                         }
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
