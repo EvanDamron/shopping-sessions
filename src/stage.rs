@@ -66,6 +66,9 @@ const NONE: u32 = u32::MAX;
 /// search rather than by comparing the click with every session start.
 const SCAN: usize = 256;
 
+/// The sessions `bulk_rows` builds at a time (then on to the next run start).
+const BULK: usize = 512;
+
 /// Piece flags.
 const GENERAL: u32 = 1; // already filed with the general pipeline
 const UNSORTED: u32 = 2;
@@ -995,13 +998,16 @@ fn top_of(cat: &[(u32, u64)]) -> u32 {
     top
 }
 
-/// Builds `x.bulk` for a bucket after `cut`: per session its start, day and row, per
-/// row its columns, and the revenue of each session with a purchase. Rows of runs that
-/// later take another path are built too and left unused.
+/// Builds `x.bulk` for sessions `k0..k1` of a bucket after `cut` (`k0` and `k1` start
+/// runs) and their purchases `p0..p1` of the purchase list: per session its start, day
+/// and row, per row its columns, and the revenue of each session with a purchase. All
+/// of it is numbered from `k0`. Rows of runs that later take another path are built too
+/// and left unused.
 #[cfg_attr(prof, inline(never))]
 #[cfg_attr(not(prof), inline(always))]
-unsafe fn bulk_rows(x: &mut Tls, c: &Cut, off: i32, day0: i64) {
-    let (t, ss, pi, pc) = (x.t, x.ss, x.pi, x.pc);
+unsafe fn bulk_rows(x: &mut Tls, k0: usize, k1: usize, p0: usize, p1: usize, off: i32, day0: i64) {
+    let (t, ss, pi, pc) = (x.t, x.ss.add(k0), x.pi, x.pc);
+    let ns = k1 - k0;
     let bk = &mut x.bulk;
     let (bst, bday, brow, rs, rk) = (bk.st.as_mut_ptr(), bk.day.as_mut_ptr(), bk.row.as_mut_ptr(), bk.rs.as_mut_ptr(), bk.rk.as_mut_ptr());
     // Sessions: a row starts at a run start or where the day differs from the session
@@ -1009,7 +1015,7 @@ unsafe fn bulk_rows(x: &mut Tls, c: &Cut, off: i32, day0: i64) {
     // starts.
     let (mut nr, mut nk) = (0usize, 0usize);
     let mut prev = NONE;
-    for j in 0..c.ns {
+    for j in 0..ns {
         let a = *ss.add(j);
         let start = *t.add((a & M31) as usize) & M31;
         let day = day_of(start, off);
@@ -1022,8 +1028,8 @@ unsafe fn bulk_rows(x: &mut Tls, c: &Cut, off: i32, day0: i64) {
         *brow.add(j) = nr as u32 - 1;
         prev = day;
     }
-    *rs.add(nr) = c.ns as u32;
-    *rk.add(nk) = c.ns as u32;
+    *rs.add(nr) = ns as u32;
+    *rk.add(nk) = ns as u32;
     // Rows: date, sessions and events from the row's first session and the next row's.
     let (rday, rses, rev, rrev, rtop) = (bk.rday.as_mut_ptr(), bk.rses.as_mut_ptr(), bk.rev.as_mut_ptr(), bk.rrev.as_mut_ptr(), bk.rtop.as_mut_ptr());
     for r in 0..nr {
@@ -1039,7 +1045,7 @@ unsafe fn bulk_rows(x: &mut Tls, c: &Cut, off: i32, day0: i64) {
     let cat = &mut bk.cat;
     cat.clear();
     let (mut sj, mut np, mut cr) = (0usize, 0usize, NONE);
-    for q in 0..c.np {
+    for q in p0..p1 {
         let i = *pi.add(q);
         while (*ss.add(sj + 1) & M31) <= i {
             sj += 1;
@@ -1400,13 +1406,29 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
     let (mut k, mut pp, mut ep, mut up) = (0usize, 0usize, 0usize, 0usize);
     let (nesc, nuns) = (x.esc.len(), x.uns.len());
     let mut ends = [NONE; 2];
-    bulk_rows(x, c, env.ctx.dayoff as i32, env.ctx.day0);
+    // `x.bulk` holds the sessions `k0..k1`, a few hundred at a time so that it stays in
+    // cache; `pb` is the first purchase after them.
+    let (mut k0, mut k1, mut pb) = (0usize, 0usize, 0usize);
     let mut qp = 0usize; // sessions with a purchase: the first not before the run at hand
     let mut ri = 0usize; // the run at hand in `x.bulk.rk`
     while k < c.ns {
+        if k == k1 {
+            k0 = k;
+            k1 = (k + BULK).min(c.ns);
+            while (*ss.add(k1) as i32) >= 0 {
+                k1 += 1;
+            }
+            let (p0, e1) = (pb, *ss.add(k1) & M31);
+            while pb < c.np && *pi.add(pb) < e1 {
+                pb += 1;
+            }
+            bulk_rows(x, k0, k1, p0, pb, env.ctx.dayoff as i32, env.ctx.day0);
+            qp = 0;
+            ri = 0;
+        }
         let r0 = (*ss.add(k) & M31) as usize;
         ri += 1;
-        let ke = *x.bulk.rk.get_unchecked(ri) as usize;
+        let ke = k0 + *x.bulk.rk.get_unchecked(ri) as usize;
         let r1 = (*ss.add(ke) & M31) as usize;
         let g = *u.add(r0) >> 4;
         // The columns, the table of user numbers and the click index are read front
@@ -1476,18 +1498,19 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
             if whole(bits, mask) && !unsorted && more.is_empty() {
                 // Its rows are in `x.bulk`.
                 let bk = &x.bulk;
-                while (*bk.ps.get_unchecked(qp) as usize) < k {
+                let (kl, kel) = (k - k0, ke - k0);
+                while (*bk.ps.get_unchecked(qp) as usize) < kl {
                     qp += 1;
                 }
                 let mut qe = qp;
-                while (*bk.ps.get_unchecked(qe) as usize) < ke {
+                while (*bk.ps.get_unchecked(qe) as usize) < kel {
                     qe += 1;
                 }
                 let acc = x.acc;
                 let name = name_of(g, bits, mask, env.fx.uk);
                 let (kc, l) = clicks_of(env, &acc, &mut x.ahead, g);
                 let ids = if mask != 0 { mask } else { bits };
-                person_bulk(st, &acc, env.ctx, name, &mut x.scr, bk, k, ke, (qp, qe), kc, ids, env.wide, |j| (*crec(l, j as usize)).cid);
+                person_bulk(st, &acc, env.ctx, name, &mut x.scr, bk, kl, kel, (qp, qe), kc, ids, env.wide, |j| (*crec(l, j as usize)).cid);
                 qp = qe;
                 x.cnt[0] += (r1 - r0) as u64;
                 x.cnt[2] += 1;
@@ -2203,13 +2226,28 @@ mod tests {
                 xa.uns.clear();
                 let c = cut_plain(&mut xa, n);
                 assert!(!c.down && xa.uns.is_empty(), "round {round}");
-                bulk_rows(&mut xa, &c, ctx.dayoff as i32, ctx.day0);
+                // The bulk arrays a few runs at a time, as `runs` builds them.
                 let (mut k, mut pp, mut qp, mut p) = (0usize, 0usize, 0usize, 0usize);
+                let (mut k0, mut k1, mut pb) = (0usize, 0usize, 0usize);
                 while k < c.ns {
+                    if k == k1 {
+                        k0 = k;
+                        k1 = (k + 1 + r.below(40) as usize).min(c.ns);
+                        while (*xa.ss.add(k1) as i32) >= 0 {
+                            k1 += 1;
+                        }
+                        let (p0, e1) = (pb, *xa.ss.add(k1) & M31);
+                        while pb < c.np && *xa.pi.add(pb) < e1 {
+                            pb += 1;
+                        }
+                        bulk_rows(&mut xa, k0, k1, p0, pb, ctx.dayoff as i32, ctx.day0);
+                        qp = 0;
+                    }
                     let mut ke = k + 1;
                     while (*xa.ss.add(ke) as i32) >= 0 {
                         ke += 1;
                     }
+                    assert_eq!(k0 + *xa.bulk.rk.get_unchecked(1 + (0..k - k0).filter(|&j| *xa.ss.add(k0 + j) & RUN != 0).count()) as usize, ke);
                     let r1 = (*xa.ss.add(ke) & M31) as usize;
                     let mut pe = pp;
                     while pe < c.np && (*xa.pi.add(pe) as usize) < r1 {
@@ -2222,15 +2260,15 @@ mod tests {
                     sessions_into(&xa, k, ke, pp, pe, &mut s.st, &mut s.sn, &mut s.pur);
                     person_rows(&mut want, &xb.acc, &ctx, name, &mut s, kc, allowed, wide, |j| ids[j as usize]);
                     let bk = &xa.bulk;
-                    while (*bk.ps.get_unchecked(qp) as usize) < k {
+                    while (*bk.ps.get_unchecked(qp) as usize) < k - k0 {
                         qp += 1;
                     }
                     let mut qe = qp;
-                    while (*bk.ps.get_unchecked(qe) as usize) < ke {
+                    while (*bk.ps.get_unchecked(qe) as usize) < ke - k0 {
                         qe += 1;
                     }
                     let mut s2 = std::mem::take(&mut xa.scr);
-                    person_bulk(&mut got, &xa.acc, &ctx, name, &mut s2, &xa.bulk, k, ke, (qp, qe), kc, allowed, wide, |j| ids[j as usize]);
+                    person_bulk(&mut got, &xa.acc, &ctx, name, &mut s2, &xa.bulk, k - k0, ke - k0, (qp, qe), kc, allowed, wide, |j| ids[j as usize]);
                     xa.scr = s2;
                     qp = qe;
                     pp = pe;
