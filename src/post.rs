@@ -531,9 +531,12 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl
     lap(&mut tp, &mut sc.sect[7]);
     // The person's events by half-hour slot: first and last time and count per
     // occupied slot (without branches: a slot seen for the first time starts over).
+    let (mut wlo, mut whi) = (usize::MAX, 0usize);
     for &t in ev {
         let s = slot(t);
         let (w, b) = (s >> 6, 1u64 << (s & 63));
+        wlo = wlo.min(w);
+        whi = whi.max(w);
         unsafe {
             let o = sc.occ.get_unchecked_mut(w);
             let m = 0u32.wrapping_sub((*o & b != 0) as u32); // all ones if seen
@@ -557,7 +560,7 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl
     let (mut start, mut sday, mut scnt, mut srev) = (0i64, 0i64, 0u32, 0u64);
     let mut pi = 0;
     // The occupied slots in time order.
-    for w in sc.words.0..sc.words.1 {
+    for w in wlo..=whi {
         let mut bits = unsafe { *sc.occ.get_unchecked(w) };
         if bits == 0 {
             continue;
