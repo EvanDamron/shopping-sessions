@@ -1767,7 +1767,7 @@ fn main() {
                     let tb = tl::now();
                     post::finish(st, &mut scr);
                     tl::span(15, tb);
-                    drop(scr);
+                    scr.release();
                     post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
@@ -1779,7 +1779,7 @@ fn main() {
                     bdone.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let tt = Instant::now();
                     let ttl = tl::now();
-                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
+                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &mut st.rows, ctx.cats).expect("write user_daily");
                     let tw = tt.elapsed();
                     tl::span(16, ttl);
                     let all_buckets_done = || {
@@ -1841,11 +1841,29 @@ fn main() {
                             _ => id::release_long_table_part(part, RP),
                         }
                     }
-                    let (credit, assist, n) = (std::mem::take(&mut st.credit), std::mem::take(&mut st.assist), st.rows.n);
-                    *st = CS::new(0);
+                    // This thread's rows and scratch, the same way (not freed: see mem::release_vec).
+                    let CS { rows, credit, assist, starts, days, tmp, catrev, off, coff, ev, cl, rtmp } = std::mem::replace(st, CS::new(0));
                     st.credit = credit;
                     st.assist = assist;
-                    st.rows.n = n;
+                    st.rows.n = rows.n;
+                    let pq::UserRows { dict, runs, days: rdays, sessions, events, revenue, top_bits, tops, .. } = rows;
+                    mem::release_vec(dict);
+                    mem::release_vec(runs);
+                    mem::release_vec(rdays);
+                    mem::release_vec(sessions);
+                    mem::release_vec(events);
+                    mem::release_vec(revenue);
+                    mem::release_vec(top_bits);
+                    mem::release_vec(tops);
+                    mem::release_vec(starts);
+                    mem::release_vec(days);
+                    mem::release_vec(tmp);
+                    mem::release_vec(catrev);
+                    mem::release_vec(off);
+                    mem::release_vec(coff);
+                    mem::release_vec(ev);
+                    mem::release_vec(cl);
+                    mem::release_vec(rtmp);
                     tl::span(18, tb);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: rows written in {tw:?}, memory returned in {:?}", tr.elapsed());
