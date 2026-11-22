@@ -454,7 +454,9 @@ pub fn setup(
         return None; // the event stage keeps a user number in 27 bits
     }
     let nb = (emax >> xsh) as usize + 1;
-    let gbits = (gmax as usize).div_ceil(512).next_power_of_two().trailing_zeros();
+    // Click buckets: ranges of user numbers narrow enough that a bucket's clicks, as
+    // index entries, stay in cache while they are grouped (SS_CSH sets the shift).
+    let gbits = std::env::var("SS_CSH").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(12).min(20);
     let gper = 1usize << gbits;
     let nxc = (gmax as usize).div_ceil(gper);
     Some(Fx {
