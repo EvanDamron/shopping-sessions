@@ -403,6 +403,7 @@ struct Shared<'a> {
     decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
     dec5: bool,     // the per-line decoders for opaque IDs (dec5.rs), without the fast path
+    scan: bool,     // dec5 finds line structure with a streaming scan of the piece (SS_SCAN=1)
 }
 
 impl Shared<'_> {
@@ -1336,6 +1337,7 @@ fn phase_a<'a>(
         decc: (fx.is_some() && envn("SS_DEC") != Some(0) && envn("SS_DECC") != Some(0)).then(|| decc::DecC::new(lk)),
         deccheck: envn("SS_DECCHECK") == Some(1),
         dec5: cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")) && fx.is_none() && envn("SS_DEC5") != Some(0),
+        scan: envn("SS_SCAN") == Some(1),
         fx,
     };
     let fast = sh.fx.is_some();

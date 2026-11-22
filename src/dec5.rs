@@ -214,13 +214,14 @@ impl EBatch {
 thread_local! {
     static EB: std::cell::RefCell<Box<EBatch>> = std::cell::RefCell::new(EBatch::new());
     static CB: std::cell::RefCell<Box<CBatch>> = std::cell::RefCell::new(CBatch::new());
+    static SC: std::cell::RefCell<Box<Scan>> = std::cell::RefCell::new(Scan::new());
 }
 
 /// Event lines `d[s..e]` (whole lines, 64 readable bytes before and at least 192
 /// after): every line parsed and filed as `crate::events` files it.
 #[inline(never)]
 pub(crate) unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, e: usize) {
-    EB.with(|b| events_in(sh, w, d, s, e, &mut b.borrow_mut()));
+    EB.with(|b| SC.with(|c| events_in(sh, w, d, s, e, &mut b.borrow_mut(), &mut c.borrow_mut())));
 }
 
 /// Comma, quote and newline masks of the 128 bytes at p, as (low, high) words.
@@ -288,6 +289,210 @@ fn fields<const K: usize>(x: u64) -> (u64, u64) {
     let q = unsafe { _pdep_u64(x >> 56, ones) }; // quoted fields
     let s = ((e << 8) + (ones & !0xFF)) + q; // field starts: after each comma (no carries: bytes < 128)
     (s, (e - q) - s)
+}
+
+/// Blocks one refill of the streaming scan (`SS_SCAN=1`) adds, and the entries it
+/// holds (the few kept from before, then at most 64 a block). Small, so that it
+/// stays in L1 with the batch.
+const SBLK: usize = 16;
+const SCAP: usize = SBLK * 64 + 8;
+
+/// The streaming scan of a piece (`SS_SCAN=1`): every 64-byte block of it is
+/// classified once (comma, quote and newline masks), the quote rules `structure`
+/// applies to a line are applied to the whole block with bit arithmetic (the
+/// carries between blocks written out), and the separators (commas and newlines)
+/// are written out in order, each with its position and a tag byte. A line of K
+/// commas is then a run of K comma entries and a newline entry; its packed
+/// structure comes from those positions without looking at its bytes again. A line
+/// that is not such a run (another comma count, 128 bytes or more, a quote out of
+/// place) is read by the per-line code instead, so the result is the same.
+#[repr(C, align(64))]
+struct Scan {
+    pos: [u32; SCAP + 64], // separator positions, from the piece start
+    tag: [u8; SCAP + 64],  // NL | QNEXT | BADL
+    n: usize,              // entries
+    fb: usize,             // the next block to finish, from the piece start
+    m: (u64, u64, u64),    // its comma, quote and newline masks
+    ps: u64,               // the previous block's top separator bit
+    pq: u64,               // the previous block's top quote bit
+    ca: u8,                // an opening quote carried into the block
+    cb: u8,                // a quote fault carried into the block
+}
+
+/// Entry tags: a newline; the field after the separator opens with a quote; the
+/// line this newline ends breaks the quote rules.
+const NL: u64 = 1;
+const QNEXT: u64 = 2;
+const BADL: u64 = 4;
+const ONES8: u64 = 0x0101_0101_0101_0101;
+
+/// Comma, quote and newline masks of the 64 bytes at p.
+#[inline(always)]
+unsafe fn cls(p: *const u8) -> (u64, u64, u64) {
+    let (v0, v1) = (ld(p), ld(p.add(32)));
+    let m = |v: __m256i, x: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 as u64;
+    let w = |x: u8| m(v0, x) | (m(v1, x) << 32);
+    (w(b','), w(b'"'), w(b'\n'))
+}
+
+impl Scan {
+    fn new() -> Box<Scan> {
+        unsafe { Box::new(std::mem::zeroed()) }
+    }
+
+    /// Starts the piece at p (a line start). Entry 0 stands for the newline before
+    /// it; the first line's entries start at 1.
+    #[inline(always)]
+    unsafe fn start(&mut self, p: *const u8) {
+        self.m = cls(p);
+        self.pos[0] = u32::MAX;
+        self.tag[0] = (NL | ((self.m.1 & 1) * QNEXT)) as u8;
+        self.n = 1;
+        self.fb = 0;
+        self.ps = 1;
+        self.pq = 0;
+        self.ca = 0;
+        self.cb = 0;
+    }
+
+    /// Finishes up to SBLK more blocks of the piece at p (those starting before
+    /// `lim`), keeping the entries from `k - 1` on (at most eight: a refill comes
+    /// when fewer than eight are left after k); returns where entry k is now (1).
+    #[inline(never)]
+    unsafe fn fill(&mut self, p: *const u8, lim: usize, k: usize) -> usize {
+        let (pp, tp) = (self.pos.as_mut_ptr(), self.tag.as_mut_ptr());
+        let v = _mm256_loadu_si256(pp.add(k - 1) as *const __m256i);
+        _mm256_storeu_si256(pp as *mut __m256i, v);
+        (tp as *mut u64).write_unaligned((tp.add(k - 1) as *const u64).read_unaligned());
+        self.n -= k - 1;
+        // The state in locals (in registers across the blocks).
+        let (mut b, (mut c, mut q, mut n)) = (self.fb, self.m);
+        let (mut ps, mut pq, mut ca, mut cb) = (self.ps, self.pq, self.ca, self.cb);
+        let bend = lim.min(b + SBLK * 64);
+        let mut pp = self.pos.as_mut_ptr().add(self.n);
+        let mut tp = self.tag.as_mut_ptr().add(self.n);
+        while b < bend {
+            _mm_prefetch(p.add(b + AHEAD) as *const i8, _MM_HINT_T0);
+            let (cn, qn, nn) = cls(p.add(b + 64));
+            let sep = c | n;
+            // The rules of `structure`, on the block: a quote opens a field (right
+            // after a separator) or closes one (right before a separator), never both,
+            // and a field with an opening quote has a closing one (the opening quote,
+            // carried up to the separator that ends its field, lands right after a
+            // closing quote).
+            let st = (sep << 1) | ps; // field starts
+            let o = q & st; // opening quotes
+            let x = q & ((sep >> 1) | (((cn | nn) & 1) << 63)); // closing quotes
+            let x2 = ((q << 1) | pq) & sep; // separators right after a quote
+            let mut a = 0u64;
+            ca = _addcarry_u64(ca, !sep, o, &mut a);
+            let bad = (q & !(o | x)) | (o & x) | ((a & sep) ^ x2);
+            // A fault anywhere in a line marks its newline (carried up to it).
+            let mut l = 0u64;
+            cb = _addcarry_u64(cb, !n, bad & !n, &mut l);
+            let lb = (l | bad) & n;
+            // The field after each separator opens with a quote.
+            let qx = ((o >> 1) | ((qn & (sep >> 63)) << 63)) & sep;
+            ps = sep >> 63;
+            pq = q >> 63;
+            // The entries: eight written unconditionally, a loop for more.
+            let (mut tn, mut tq, mut tb) = (_pext_u64(n, sep), _pext_u64(qx, sep), _pext_u64(lb, sep));
+            let cnt = sep.count_ones() as usize;
+            let mut m = sep;
+            let bb = (b as u64) * 0x1_0000_0001;
+            let mut i = 0;
+            loop {
+                // Two positions per 8-byte store.
+                for j in 0..4 {
+                    let t0 = m.trailing_zeros() as u64;
+                    m &= m.wrapping_sub(1);
+                    let t1 = m.trailing_zeros() as u64;
+                    m &= m.wrapping_sub(1);
+                    (pp.add(i + 2 * j) as *mut u64).write_unaligned((t0 | t1 << 32) + bb);
+                }
+                let t = _pdep_u64(tn, ONES8 * NL) | _pdep_u64(tq, ONES8 * QNEXT) | _pdep_u64(tb, ONES8 * BADL);
+                (tp.add(i) as *mut u64).write_unaligned(t);
+                i += 8;
+                if i >= cnt {
+                    break;
+                }
+                tn >>= 8;
+                tq >>= 8;
+                tb >>= 8;
+            }
+            pp = pp.add(cnt);
+            tp = tp.add(cnt);
+            b += 64;
+            (c, q, n) = (cn, qn, nn);
+        }
+        (self.fb, self.m) = (b, (c, q, n));
+        self.n = tp.offset_from(self.tag.as_ptr()) as usize;
+        (self.ps, self.pq, self.ca, self.cb) = (ps, pq, ca, cb);
+        1
+    }
+
+    /// The entry index of the first separator at or after `at`, from k on (after a
+    /// line read the per-line way, `at` is where the next line starts).
+    #[cold]
+    #[inline(never)]
+    unsafe fn resync(&mut self, p: *const u8, lim: usize, mut k: usize, at: u32) -> usize {
+        loop {
+            if k >= self.n {
+                if self.fb >= lim {
+                    return k;
+                }
+                k = self.fill(p, lim, k);
+                continue;
+            }
+            if self.pos[k] >= at {
+                return k;
+            }
+            k += 1;
+        }
+    }
+
+    /// The packed structure (`structure`) of the line at `r` (from the piece start)
+    /// whose entries start at k, if they are K commas and its newline, the line is
+    /// under 128 bytes and keeps the quote rules.
+    #[inline(always)]
+    unsafe fn line<const K: usize>(&self, k: usize, r: u32) -> Option<u64> {
+        let t = (self.tag.as_ptr().add(k - 1) as *const u64).read_unaligned();
+        let nlb = (ONES8 >> (8 * (7 - K))) & !0xFF; // bytes 1 to K: entries k to k + K - 1
+        let mask = nlb * NL | (NL | BADL) << (8 * (K + 1));
+        let len = self.pos.get_unchecked(k + K).wrapping_sub(r);
+        if (t & mask != NL << (8 * (K + 1))) | (len >= 128) {
+            return None;
+        }
+        let v = _mm256_sub_epi32(_mm256_loadu_si256(self.pos.as_ptr().add(k) as *const __m256i), _mm256_set1_epi32(r as i32));
+        let b = _mm256_shuffle_epi8(
+            v,
+            _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+        );
+        let b = _mm256_permutevar8x32_epi32(b, _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0));
+        let commas = _bzhi_u64(_mm_cvtsi128_si64(_mm256_castsi256_si128(b)) as u64, 8 * K as u32);
+        let fq = _pext_u64(t, (ONES8 >> (8 * (7 - K))) * QNEXT); // bytes 0 to K: fields 0 to K
+        Some(commas | ((len as u64) << 48) | (fq << 56))
+    }
+}
+
+/// One event line at `ls` read the per-line way (the pass-1 step of `events_in`);
+/// returns where the next line starts.
+#[inline(never)]
+unsafe fn event_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, bt: &mut EBatch, nv: usize) -> (usize, usize) {
+    let (c, q, nm) = masks3(d.add(ls));
+    let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
+    let len = nm.trailing_zeros() as usize;
+    if len >= 128 {
+        return (cold_event_from(sh, w, d, ls), nv);
+    }
+    if let Some(x) = structure::<6>(c, q, len) {
+        let (fs, fl) = fields::<6>(x);
+        *bt.lsx.get_unchecked_mut(nv) = ls;
+        *bt.cmx.get_unchecked_mut(nv) = fs;
+        *bt.flx.get_unchecked_mut(nv) = fl;
+        return (ls + len + 1, nv + 1);
+    }
+    (ls + len + 1, nv)
 }
 
 /// The structure of a line of `len` (< 128) bytes from its comma and quote masks,
@@ -382,15 +587,45 @@ unsafe fn structure_slow<const K: usize>(cl: u64, ch: u64, len: usize, (ol, oh):
 }
 
 #[inline(always)]
-unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut EBatch) {
+unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut EBatch, sc: &mut Scan) {
     let win = &sh.win;
     let mut ls = s;
+    let scan = sh.scan && end - s < 1 << 31;
+    let (p0, lim) = (d.add(s), end - s);
+    let mut k = 1usize; // the scan's entry for the next line
+    if scan {
+        sc.start(p0);
+    }
     while ls < end {
         let first = ls;
         // ---- Pass 1: line structure (commas, quotes) of up to BATCH lines.
         let mut nv = 0usize; // well-formed lines
         let mut nl = 0usize;
-        while ls < end && nl < BATCH {
+        // With the streaming scan: from its entries, or the per-line way for a line
+        // that is not a plain run of six commas and a newline.
+        while scan && ls < end && nl < BATCH {
+            nl += 1;
+            if sc.n < k + 8 {
+                k = sc.fill(p0, lim, k);
+            }
+            let r = (ls - s) as u32;
+            match sc.line::<6>(k, r) {
+                Some(x) => {
+                    let (fs, fl) = fields::<6>(x);
+                    *bt.lsx.get_unchecked_mut(nv) = ls;
+                    *bt.cmx.get_unchecked_mut(nv) = fs;
+                    *bt.flx.get_unchecked_mut(nv) = fl;
+                    nv += 1;
+                    ls += ((x >> 48) & 0xFF) as usize + 1;
+                    k += 7;
+                }
+                None => {
+                    (ls, nv) = event_line(sh, w, d, ls, bt, nv);
+                    k = sc.resync(p0, lim, k, (ls - s) as u32);
+                }
+            }
+        }
+        while !scan && ls < end && nl < BATCH {
             nl += 1;
             let p = d.add(ls);
             // The input a few lines ahead: the next line's address is only known at
