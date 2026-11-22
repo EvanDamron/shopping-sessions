@@ -99,6 +99,28 @@ unsafe fn stored(p: *const u8) -> &'static [u8] {
     std::slice::from_raw_parts(p.add(8), (p as *const u64).read() as usize)
 }
 
+/// Whether the interned string at `p` is `b`: lengths, then eight bytes at a time
+/// (no call to a general compare; this runs once per long ID read).
+#[inline(always)]
+unsafe fn stored_eq(p: *const u8, b: &[u8]) -> bool {
+    let n = b.len();
+    if (p as *const u64).read() as usize != n {
+        return false;
+    }
+    let (s, t) = (p.add(8), b.as_ptr());
+    let mut i = 0;
+    let mut diff = 0u64;
+    while i + 8 <= n {
+        diff |= (s.add(i) as *const u64).read_unaligned() ^ (t.add(i) as *const u64).read_unaligned();
+        i += 8;
+    }
+    while i < n {
+        diff |= (*s.add(i) ^ *t.add(i)) as u64;
+        i += 1;
+    }
+    diff == 0
+}
+
 /// Looks `b` up in the long-ID table, adding it if absent; None when the table is
 /// not set up or the string belongs to the sharded maps.
 fn intern_table(b: &[u8], h: u64) -> Option<*const u8> {
@@ -133,7 +155,7 @@ fn intern_table(b: &[u8], h: u64) -> Option<*const u8> {
         }
         if v & (0xFFFF << 48) == tag {
             let p = (v & ((1 << 48) - 1)) as *const u8;
-            if unsafe { stored(p) } == b {
+            if unsafe { stored_eq(p, b) } {
                 return Some(p);
             }
         }
