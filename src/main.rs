@@ -1130,18 +1130,10 @@ fn sort_events(v: &mut [u64], tmp: &mut Vec<u64>) {
 }
 
 /// The ID table from the link files, and whether huge pages are in use.
-fn make_links(
-    files: &[Vec<(File, u64)>; 3],
-    nthreads: usize,
-    scale: usize,
-    envn: &dyn Fn(&str) -> Option<usize>,
-    log: &dyn Fn(&str),
-) -> (Links, bool) {
-    let [event_files, click_files, link_files] = files;
-    let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
-    let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
-    let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
-    let lbytes: u64 = link_files.iter().map(|f| f.1).sum();
+/// Whether the record arenas go on huge pages, and the free memory in 2 MB blocks.
+fn records_huge(files: &[Vec<(File, u64)>; 3], envn: &dyn Fn(&str) -> Option<usize>) -> (bool, Option<usize>) {
+    let ebytes: u64 = files[0].iter().map(|f| f.1).sum();
+    let cbytes: u64 = files[1].iter().map(|f| f.1).sum();
     // Huge pages for the record arenas when the kernel has free 2 MB blocks for what
     // they will touch (~28 bytes per event, ~32 per click) with 50% to spare, or when
     // /proc/buddyinfo cannot be read. On the scorer (THP madvise) a fresh GB costs
@@ -1153,6 +1145,22 @@ fn make_links(
         Some(v) => v == 1,
         None => huge_free.is_none_or(|f| f >= touched + touched / 2),
     };
+    (huge, huge_free)
+}
+
+fn make_links(
+    files: &[Vec<(File, u64)>; 3],
+    nthreads: usize,
+    scale: usize,
+    (huge, huge_free): (bool, Option<usize>),
+    envn: &dyn Fn(&str) -> Option<usize>,
+    log: &dyn Fn(&str),
+) -> (Links, bool) {
+    let [event_files, click_files, link_files] = files;
+    let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
+    let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
+    let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
+    let lbytes: u64 = link_files.iter().map(|f| f.1).sum();
     // About one in eight click and user IDs is longer than 15 bytes (interned).
     id::init_long_table((cbytes / 40 + ebytes / 700) as usize / 8 + 1, huge);
     let est = (ebytes / 72).max(1) as usize;
@@ -1211,6 +1219,71 @@ fn decode(rd: &mut Reader, f: &File, m: Option<&scan::Mapped>, a: u64, b: u64, p
     }
 }
 
+/// What phase A needs that does not depend on the link table: record arenas,
+/// workers, tasks and file mappings. Made on a thread of its own while the links
+/// are built (for the first attempt), so the parse starts right after them.
+struct Prep {
+    pb: usize,
+    db: usize,
+    ev: mem::Arena,
+    dk: mem::Arena,
+    ck: mem::Arena,
+    tasks: Vec<(bool, usize, u64, u64)>,
+    workers: Vec<Worker>,
+    emaps: Vec<Option<scan::Mapped>>,
+    cmaps: Vec<Option<scan::Mapped>>,
+}
+
+fn prep(files: &[Vec<(File, u64)>; 3], fx: Option<&fast::Fx>, huge: bool, nthreads: usize, envn: &dyn Fn(&str) -> Option<usize>) -> Prep {
+    let tsetup = tl::now();
+    let [event_files, click_files, _] = files;
+    let task = envn("SS_TASK").unwrap_or(1 << 20) as u64;
+    let ahead = envn("SS_AHEAD").unwrap_or(2 << 20);
+    let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
+    let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
+    let est = (ebytes / 72).max(1) as usize;
+    // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
+    // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
+    // bucket) stay well inside its share of the L2 cache. Person buckets are person
+    // numbers modulo the bucket count. (The link table always has far more slots than
+    // 512 buckets: see `phase_a`.)
+    let pb = envn("SS_PB").unwrap_or((est / 65_536).next_power_of_two().clamp(64, 512));
+    let db = envn("SS_DB").unwrap_or((est / 32_768).next_power_of_two().clamp(64, 1024));
+    let (pb, db) = (pb.next_power_of_two().max(2), db.next_power_of_two().max(2));
+    // A valid event line is at least 34 bytes, and each thread leaves at most one
+    // partly filled chunk per bucket: this region cannot overflow.
+    let ev = mem::Arena::new((ebytes as usize / 34 + (nthreads * pb + 1) * PCH) * PREC, huge, ahead);
+    let dk = mem::Arena::new(ebytes as usize / 3 + nthreads * db * DCH * 16, huge, ahead);
+    let ck = mem::Arena::new(cbytes as usize / 2 + nthreads * pb * CCH * KREC, huge, ahead);
+    assert!((ebytes / 34 + ((nthreads * pb + 1) * PCH) as u64) < u32::MAX as u64);
+    let mut tasks: Vec<(bool, usize, u64, u64)> = Vec::new();
+    tasks.extend(ranges(event_files, task).into_iter().map(|(f, a, b)| (true, f, a, b)));
+    tasks.extend(ranges(click_files, task).into_iter().map(|(f, a, b)| (false, f, a, b)));
+    let (nb, nxc) = fx.map_or((0, 0), |f| (f.nb, f.nxc));
+    // About one valid click per 45 bytes of click files, shared by the threads.
+    let ncid = (cbytes as usize / 45 / nthreads) * 5 / 4;
+    let workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc, ncid)).collect();
+    // The per-line decoders read the files straight from their mappings, prefetching
+    // a few lines ahead (SS_MMAP=0: through the read buffer, as the indexed path does).
+    // (The same conditions as `Shared::dec` and `Shared::dec5` below.)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    let mapped = (if fx.is_some() { envn("SS_DEC") != Some(0) } else { envn("SS_DEC5") != Some(0) }) && envn("SS_MMAP") != Some(0);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    let mapped = false;
+    let maps = |files: &[(File, u64)]| -> Vec<Option<scan::Mapped>> {
+        files.iter().map(|f| if mapped { scan::Mapped::new(&f.0, f.1) } else { None }).collect()
+    };
+    let (emaps, cmaps) = (maps(event_files), maps(click_files));
+    tl::span(9, tsetup);
+    Prep { pb, db, ev, dk, ck, tasks, workers, emaps, cmaps }
+}
+
+/// The fast path's setup (fast.rs), if the data has the public generator's ID form.
+fn fast_setup(files: &[Vec<(File, u64)>; 3], nthreads: usize, huge: bool, envn: &dyn Fn(&str) -> Option<usize>) -> Option<fast::Fx> {
+    let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
+    fast::setup(&files[0], eb, cb, nthreads, huge, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32, envn("SS_FAST") != Some(2))
+}
+
 /// Phase A: every event and click line parsed and filed. None if the ID table
 /// filled up (far more distinct users than estimated): the caller starts over with
 /// a larger one.
@@ -1219,6 +1292,7 @@ fn phase_a<'a>(
     lk: &'a Lookups,
     (links, huge): (Links, bool),
     fx: Option<fast::Fx>,
+    pre: Option<Prep>,
     files: &[Vec<(File, u64)>; 3],
     ws: i64,
     we: i64,
@@ -1228,20 +1302,8 @@ fn phase_a<'a>(
 ) -> Option<(Shared<'a>, Vec<Worker>, usize, usize, Vec<Option<scan::Mapped>>)> {
     let [event_files, click_files, _] = files;
     let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
-    let task = envn("SS_TASK").unwrap_or(1 << 20) as u64;
-    let ahead = envn("SS_AHEAD").unwrap_or(2 << 20);
-    let ebytes: u64 = event_files.iter().map(|f| f.1).sum();
-    let cbytes: u64 = click_files.iter().map(|f| f.1).sum();
-    let est = (ebytes / 72).max(1) as usize;
-    let tsetup = tl::now();
-
-    // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
-    // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
-    // bucket) stay well inside its share of the L2 cache. Person buckets are person
-    // numbers modulo the bucket count.
-    let pb = envn("SS_PB").unwrap_or((est / 65_536).next_power_of_two().clamp(64, 512));
-    let db = envn("SS_DB").unwrap_or((est / 32_768).next_power_of_two().clamp(64, 1024));
-    let (pb, db) = (pb.next_power_of_two().clamp(2, links.slots()), db.next_power_of_two().max(2));
+    let Prep { pb, db, ev, dk, ck, tasks, mut workers, emaps, cmaps } = pre.unwrap_or_else(|| prep(files, fx.as_ref(), huge, nthreads, envn));
+    assert!(pb <= links.slots());
     let base = ws - WEEK;
     let sh = Shared {
         pbits: pb.trailing_zeros(),
@@ -1251,11 +1313,9 @@ fn phase_a<'a>(
         win: Win::new(base, we),
         evspan: (we - ws) as u64,
         dshift: 64 - db.trailing_zeros(),
-        // A valid event line is at least 34 bytes, and each thread leaves at most one
-        // partly filled chunk per bucket: this region cannot overflow.
-        ev: mem::Arena::new((ebytes as usize / 34 + (nthreads * pb + 1) * PCH) * PREC, huge, ahead),
-        dk: mem::Arena::new(ebytes as usize / 3 + nthreads * db * DCH * 16, huge, ahead),
-        ck: mem::Arena::new(cbytes as usize / 2 + nthreads * pb * CCH * KREC, huge, ahead),
+        ev,
+        dk,
+        ck,
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64, lk)),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
@@ -1264,31 +1324,12 @@ fn phase_a<'a>(
         dec5: cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")) && fx.is_none() && envn("SS_DEC5") != Some(0),
         fx,
     };
-    assert!((ebytes / 34 + ((nthreads * pb + 1) * PCH) as u64) < u32::MAX as u64);
-    let mut tasks: Vec<(bool, usize, u64, u64)> = Vec::new();
-    tasks.extend(ranges(event_files, task).into_iter().map(|(f, a, b)| (true, f, a, b)));
-    tasks.extend(ranges(click_files, task).into_iter().map(|(f, a, b)| (false, f, a, b)));
-    let (nb, nxc) = sh.fx.as_ref().map_or((0, 0), |f| (f.nb, f.nxc));
     let fast = sh.fx.is_some();
-    // About one valid click per 45 bytes of click files, shared by the threads.
-    let ncid = (cbytes as usize / 45 / nthreads) * 5 / 4;
-    let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc, ncid)).collect();
-    // The per-line decoders read the files straight from their mappings, prefetching
-    // a few lines ahead (SS_MMAP=0: through the read buffer, as the indexed path does).
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-    let mapped = (sh.dec.is_some() || sh.dec5) && envn("SS_MMAP") != Some(0);
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-    let mapped = false;
-    let maps = |files: &[(File, u64)]| -> Vec<Option<scan::Mapped>> {
-        files.iter().map(|f| if mapped { scan::Mapped::new(&f.0, f.1) } else { None }).collect()
-    };
-    let (emaps, cmaps) = (maps(event_files), maps(click_files));
     // Tasks left per file: the thread that finishes a file's last one releases its mapping.
     let left = |files: &[(File, u64)], events: bool| -> Vec<AtomicUsize> {
         (0..files.len()).map(|f| AtomicUsize::new(tasks.iter().filter(|t| t.0 == events && t.1 == f).count())).collect()
     };
     let eleft = left(event_files, true);
-    tl::span(9, tsetup);
     {
         let next = AtomicUsize::new(0);
         let (sh, tasks, next, emaps, cmaps, eleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft);
@@ -1460,17 +1501,26 @@ fn main() {
     let files = [csv_files(&data.join("events")), csv_files(&data.join("clicks")), csv_files(&data.join("links"))];
     // The product and campaign tables are read on a thread of their own while the
     // link files are processed.
-    let (lk, first) = std::thread::scope(|sc| {
-        let lk = sc.spawn(|| {
+    // The product and campaign tables, the fast path's sample check and phase A's
+    // arenas, workers and file mappings are made on a thread of their own while the
+    // link files are processed: none of them needs the links.
+    let rh = records_huge(&files, &envn);
+    let (lk, first, (fx0, pre0)) = std::thread::scope(|sc| {
+        let side = sc.spawn(|| {
             let t = tl::now();
-            let r = read_lookups(&data);
+            let lk = read_lookups(&data);
             tl::span(1, t);
-            r
+            let t = tl::now();
+            let fx = (envn("SS_FAST") != Some(0) && lk.channels.len() < 1 << 23).then(|| fast_setup(&files, nthreads, rh.0, &envn)).flatten();
+            tl::span(5, t);
+            let pre = prep(&files, fx.as_ref(), rh.0, nthreads, &envn);
+            (lk, (fx, pre))
         });
         let t = tl::now();
-        let links = make_links(&files, nthreads, 1, &envn, &log);
+        let links = make_links(&files, nthreads, 1, rh, &envn, &log);
         tl::span(4, t);
-        (lk.join().expect("lookups"), links)
+        let (lk, fp) = side.join().expect("lookups");
+        (lk, links, fp)
     });
 
     // All in-window times are stored as u32 milliseconds since `base`.
@@ -1490,21 +1540,22 @@ fn main() {
     // check). Without it the general pipeline runs alone.
     // (The event stage keeps a campaign number in 23 bits.)
     let mut fast_on = envn("SS_FAST") != Some(0) && ncamp < 1 << 23;
+    let mut first_fx = Some((fx0, pre0));
     let (sh, workers, pb, db, mut cs, cmaps) = loop {
-        let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
-        let tfx = tl::now();
-        let fx = if fast_on {
-            let (eb, cb): (u64, u64) = (files[0].iter().map(|f| f.1).sum(), files[1].iter().map(|f| f.1).sum());
-            let fx = fast::setup(&files[0], eb, cb, nthreads, l.1, envn("SS_AHEAD").unwrap_or(2 << 20), envn("SS_XSH").unwrap_or(16) as u32, envn("SS_FAST") != Some(2));
-            if fx.is_some() {
-                log("fast: keys found");
+        let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, records_huge(&files, &envn), &envn, &log));
+        let (fx, pre) = match first_fx.take() {
+            Some((fx, pre)) => (fx, Some(pre)),
+            None => {
+                let tfx = tl::now();
+                let fx = if fast_on { fast_setup(&files, nthreads, l.1, &envn) } else { None };
+                tl::span(5, tfx);
+                (fx, None)
             }
-            fx
-        } else {
-            None
         };
-        tl::span(5, tfx);
-        match phase_a(&lk, l, fx, &files, ws, we, nthreads, &envn, &log) {
+        if fx.is_some() {
+            log("fast: keys found");
+        }
+        match phase_a(&lk, l, fx, pre, &files, ws, we, nthreads, &envn, &log) {
             Some(x) => {
                 if x.0.fx.is_some() {
                     // If many lines did not fit the fast path after all, it is not worth
