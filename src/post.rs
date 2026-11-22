@@ -273,8 +273,15 @@ pub struct Scr {
     sfirst: Vec<u32>, // assists_many: per slot, the first session starting in it or later
     nday: Vec<u32>,   // assists_many: per session, the first later session on another day
     sect: [u64; 10],
+    timing: bool, // SS_SECT: time the sections inside `person` too
     ses: Vec<u16>, // per credit cell (campaign * days + day): sessions not yet in `st.credit`
     asn: Vec<u16>, // per assist cell: assists not yet in `st.assist`
+}
+
+/// Whether SS_SECT asks for section times (read once).
+fn sect_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SS_SECT").is_some())
 }
 
 /// A person's events in one half-hour slot.
@@ -310,6 +317,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         return;
     }
     let mut tc = tsc();
+    sc.timing = sect_on();
     let (pbits, bucket) = (sh.pbits, p as u32); // person number = place << pbits | bucket
     let np = sh.places();
     // The losing copies' positions, as a bitmap.
@@ -470,6 +478,20 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         if let Some(&j) = who.get(k + NAHEAD) {
             sh.links.prefetch_name(j << pbits | bucket);
         }
+        if let Some(&j) = who.get(k + NAHEAD / 2) {
+            // A long name's bytes are elsewhere: once its ID is in cache, fetch them too.
+            let n = sh.links.name(j << pbits | bucket);
+            if n.is_long() {
+                prefetch(n.lo as usize as *const u8);
+            }
+            // That person's first events and clicks.
+            let j = j as usize;
+            unsafe {
+                let (es, cs) = if j == 0 { (0, 0) } else { (*sc.off.get_unchecked(j - 1), *sc.coff.get_unchecked(j - 1)) };
+                prefetch(ev.as_ptr().wrapping_add(es as usize));
+                prefetch(cl.as_ptr().wrapping_add(cs as usize));
+            }
+        }
         let i = i as usize;
         let (es, ee) = (if i == 0 { 0 } else { sc.off[i - 1] as usize }, sc.off[i] as usize);
         let (cs, ce) = (if i == 0 { 0 } else { sc.coff[i - 1] as usize }, sc.coff[i] as usize);
@@ -546,14 +568,18 @@ fn order_clicks(cl: &[PClk], cids: &[*const Id], keys: &mut Vec<u64>, rtmp: &mut
 /// daily rows (rules.md "Events" steps 5 to 7 and "Clicks" steps 4 to 7).
 #[inline]
 fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl: &[PClk], ctx: &Ctx) {
-    let mut tp = tsc();
+    // The time stamps of the sections inside a person are taken only under SS_SECT
+    // (three per person otherwise cost time on every person).
+    let mut tp = if sc.timing { tsc() } else { 0 };
     let mut ck = std::mem::take(&mut sc.ck);
     if cl.is_empty() {
         ck.clear();
     } else {
         order_clicks(cl, &sc.cids, &mut sc.keys, &mut sc.rtmp, &mut ck);
     }
-    lap(&mut tp, &mut sc.sect[7]);
+    if sc.timing {
+        lap(&mut tp, &mut sc.sect[7]);
+    }
     // The person's events by half-hour slot: first and last time and count per
     // occupied slot (without branches: a slot seen for the first time starts over).
     let (mut wlo, mut whi) = (usize::MAX, 0usize);
@@ -631,11 +657,15 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl
     debug_assert_eq!(pi, purch.len());
     end_session(st, sc, &mut sp, &ck, ctx, start, sday, scnt, srev);
     row(st, cur_day + ctx.day0, sp.us, sp.ue, sp.ur);
-    lap(&mut tp, &mut sc.sect[8]);
+    if sc.timing {
+        lap(&mut tp, &mut sc.sect[8]);
+    }
     if !sp.small {
         assists_many(st, sc, &ck, ctx.ndays);
     }
-    lap(&mut tp, &mut sc.sect[9]);
+    if sc.timing {
+        lap(&mut tp, &mut sc.sect[9]);
+    }
     sc.ck = ck;
 }
 
