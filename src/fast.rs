@@ -35,8 +35,8 @@ const MASK40: u64 = (1 << 40) - 1;
 // The generator's scramble: ((v * M1) ^ key) & MASK40, then x ^= x >> 17, then (x * M2) & MASK40.
 const M1: u64 = 0x9E37_79B9_7F4B;
 const M2: u64 = 0xD6E8_FEB8_6659;
-const M1I: u64 = inverse(M1);
-const M2I: u64 = inverse(M2);
+pub const M1I: u64 = inverse(M1);
+pub const M2I: u64 = inverse(M2);
 
 /// The inverse of an odd number modulo 2^64 (Newton's iteration), so also modulo 2^40.
 const fn inverse(a: u64) -> u64 {
