@@ -558,15 +558,15 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                 while i < hi && n < BATCH {
                     // (Runs beside phase A, which adds IDs no link mentions: an entry
                     // still being written is such an ID, and it changes nothing here.)
-                    if let Some((id, p)) = links.linked_at(i) {
+                    if let Some((id, p, root)) = links.linked_at(i) {
                         let un = fx.user_num_of(id);
                         if un != NONE {
                             prefetch_cell(&fx.gt, un >> 9);
-                        } else if p as usize != i {
-                            links.prefetch_slot(p);
+                        } else if !root {
+                            links.prefetch_name(p);
                         }
                         ids[n] = (p, i as u32);
-                        nums[n] = (un, if p as usize == i { un } else { LATER });
+                        nums[n] = (un, if root { un } else { LATER });
                         n += 1;
                     }
                     i += 1;
@@ -580,7 +580,7 @@ pub fn build_gt(fx: &Fx, links: &Links, nthreads: usize) {
                         if fx.gt[(un >> 9) as usize].load(Relaxed) as u32 == ids[k].0 + 1 {
                             nums[k].1 = un;
                         } else {
-                            links.prefetch_slot(ids[k].0);
+                            links.prefetch_name(ids[k].0);
                         }
                     }
                 }
