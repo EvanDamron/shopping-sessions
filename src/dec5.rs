@@ -103,14 +103,12 @@ pub(crate) unsafe fn click_row(sh: &Shared, d: *const u8, f: &[(usize, usize); 4
     Some(CRow { uid: Id::field(d, s1, e1), ts: t as u32, camp, cid: Id::field(d, s0, e0) })
 }
 
-/// Price and category of a valid-looking purchase whose product field is
-/// `[s5, e5)` (raw) and price field runs to the line end `len`.
+/// Price and category of a valid-looking purchase, given the (start, length) of its
+/// product and price fields without quotes.
 #[inline(never)]
-unsafe fn purchase_pc(sh: &Shared, p: *const u8, s5: usize, e5: usize, len: usize) -> Option<u32> {
-    let (s6, e6) = uq(p, e5 + 1, len);
-    let (s5, e5) = uq(p, s5, e5);
-    let v = parse_price(std::slice::from_raw_parts(p.add(s6), e6 - s6))?;
-    Some(v | (sh.lk.products.get(Id::field(p, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24))
+unsafe fn purchase_pc(sh: &Shared, p: *const u8, (s5, l5): (usize, usize), (s6, l6): (usize, usize)) -> Option<u32> {
+    let v = parse_price(std::slice::from_raw_parts(p.add(s6), l6))?;
+    Some(v | (sh.lk.products.get(Id::field(p, s5, s5 + l5)).unwrap_or(sh.lk.unknown_cat) << 24))
 }
 
 /// Files an event row as `crate::events` does.
@@ -190,7 +188,8 @@ struct EBatch {
     ok: [u8; ROWS],
     long: [(u32, u32, u32); ROWS], // valid rows with a long user ID: (row, field start, length)
     lsx: [usize; ROWS], // well-formed lines of the batch: start
-    cmx: [u64; ROWS],   // and structure (`structure`)
+    cmx: [u64; ROWS],   // field starts (`fields`)
+    flx: [u64; ROWS],   // field lengths
     pend: [Pending; ROWS], // valid rows with a long user ID from the batch before
     npend: usize,
 }
@@ -265,6 +264,19 @@ static LM2: [[u64; 2]; 128] = {
     t
 };
 
+/// The start and length of each of the K + 1 fields of a line, quotes removed, one
+/// byte per field, from its packed structure (`structure`): all fields at once with
+/// byte-wise arithmetic in one word each.
+#[inline(always)]
+fn fields<const K: usize>(x: u64) -> (u64, u64) {
+    let lo = (1u64 << (8 * K)) - 1;
+    let ones = 0x0101_0101_0101_0101u64 & ((1u64 << (8 * (K + 1))) - 1);
+    let e = (x & lo) | (((x >> 48) & 0xFF) << (8 * K)); // field ends: the commas, then the length
+    let q = unsafe { _pdep_u64(x >> 56, ones) }; // quoted fields
+    let s = ((e << 8) + (ones & !0xFF)) + q; // field starts: after each comma (no carries: bytes < 128)
+    (s, (e - q) - s)
+}
+
 /// The structure of a line of `len` (< 128) bytes from its comma and quote masks,
 /// packed: its K commas (bytes 0 to K - 1), its length (byte 6) and which of its
 /// fields are quoted (bits 56 and up); None for a malformed line (another comma
@@ -335,8 +347,10 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let lp = ls;
             ls += len + 1;
             if let Some(x) = structure::<6>(c, q, len) {
+                let (fs, fl) = fields::<6>(x);
                 *bt.lsx.get_unchecked_mut(nv) = lp;
-                *bt.cmx.get_unchecked_mut(nv) = x;
+                *bt.cmx.get_unchecked_mut(nv) = fs;
+                *bt.flx.get_unchecked_mut(nv) = fl;
                 nv += 1;
             }
         }
@@ -345,28 +359,24 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
         let mut nlong = 0usize;
         for j in 0..nv {
             let lp = *bt.lsx.get_unchecked(j);
-            let x = *bt.cmx.get_unchecked(j);
             let p = d.add(lp);
-            let cc = |k: u32| ((x >> (8 * k)) & 0xFF) as usize;
-            let qq = |k: u32| ((x >> (56 + k)) & 1) as usize;
-            let (c0, c1, c2, c3, c4, c5, len) = (cc(0), cc(1), cc(2), cc(3), cc(4), cc(5), cc(6));
-            let (s0, e0) = (qq(0), c0 - qq(0));
-            if s0 == e0 {
+            let fs = bt.cmx.as_ptr().add(j) as *const u8; // field starts
+            let fl = bt.flx.as_ptr().add(j) as *const u8; // field lengths
+            let f = |k: usize| (*fs.add(k) as usize, *fl.add(k) as usize);
+            let (s0, l0) = f(0);
+            if l0 == 0 {
                 continue; // empty event_id: dropped before dedup
             }
-            let (kid, kb) = Id::key(p, s0, e0).hash2();
-            let (s1, e1) = (c0 + 1 + qq(1), c1 - qq(1));
-            let ulen = e1 - s1;
-            let (s2, e2) = (c1 + 1 + qq(2), c2 - qq(2));
-            let (s3, e3) = (c2 + 1 + qq(3), c3 - qq(3));
-            let (t, ing_ms, ing) = win.ts_ingest(p.add(s2), e2 - s2, p.add(s3), e3 - s3);
-            let (s4, e4) = (c3 + 1 + qq(4), c4 - qq(4));
+            let (kid, kb) = Id::key(p, s0, s0 + l0).hash2();
+            let (s1, ulen) = f(1);
+            let (s2, l2) = f(2);
+            let (s3, l3) = f(3);
+            let (t, ing_ms, ing) = win.ts_ingest(p.add(s2), l2, p.add(s3), l3);
+            let (s4, tl) = f(4);
             let tw = (p.add(s4) as *const u64).read_unaligned();
-            let tl = e4 - s4;
             let purchase = (tl == 8) & (tw == PURCHASE);
             let typed = purchase | ((tl == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
-            // product_id is not empty: neither `` nor `""`
-            let pfull = c5 - c4 - 1 > 2 * qq(5);
+            let pfull = *fl.add(5) != 0; // product_id is not empty
             let mut ok = typed
                 & (ulen != 0)
                 & pfull
@@ -374,7 +384,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 & (ing_ms.wrapping_sub(t.wrapping_add(win.base)) <= DAY);
             let mut pc = 0u32;
             if purchase & ok {
-                match purchase_pc(sh, p, c4 + 1, c5, len) {
+                match purchase_pc(sh, p, f(5), f(6)) {
                     Some(v) => pc = v,
                     None => ok = false,
                 }
@@ -560,6 +570,7 @@ struct CBatch {
     lc: [(u32, u32, u32); ROWS], // rows with a long click ID
     lsx: [usize; ROWS],
     cmx: [u64; ROWS],
+    flx: [u64; ROWS],
 }
 
 impl CBatch {
@@ -665,8 +676,10 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let lp = ls;
             ls += len + 1;
             if let Some(x) = structure::<3>(c, q, len) {
+                let (fs, fl) = fields::<3>(x);
                 *bt.lsx.get_unchecked_mut(nv) = lp;
-                *bt.cmx.get_unchecked_mut(nv) = x;
+                *bt.cmx.get_unchecked_mut(nv) = fs;
+                *bt.flx.get_unchecked_mut(nv) = fl;
                 nv += 1;
             }
         }
@@ -674,22 +687,20 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
         let (mut n, mut nlu, mut nlc) = (0usize, 0usize, 0usize);
         for j in 0..nv {
             let lp = *bt.lsx.get_unchecked(j);
-            let x = *bt.cmx.get_unchecked(j);
             let p = d.add(lp);
-            let cc = |k: u32| ((x >> (8 * k)) & 0xFF) as usize;
-            let qq = |k: u32| ((x >> (56 + k)) & 1) as usize;
-            let (c0, c1, c2, len) = (cc(0), cc(1), cc(2), cc(6));
-            let (s0, e0) = (qq(0), c0 - qq(0));
-            let (s1, e1) = (c0 + 1 + qq(1), c1 - qq(1));
-            let (clen, ulen) = (e0 - s0, e1 - s1);
+            let fs = bt.cmx.as_ptr().add(j) as *const u8;
+            let fl = bt.flx.as_ptr().add(j) as *const u8;
+            let f = |k: usize| (*fs.add(k) as usize, *fl.add(k) as usize);
+            let ((s0, clen), (s1, ulen)) = (f(0), f(1));
             if (clen == 0) | (ulen == 0) {
                 continue;
             }
-            let Some(camp) = campaign(sh, tab, p, c1 + 1 + qq(2), c2 - qq(2)) else {
+            let (s2, l2) = f(2);
+            let Some(camp) = campaign(sh, tab, p, s2, s2 + l2) else {
                 continue;
             };
-            let (s3, e3) = (c2 + 1 + qq(3), len - qq(3));
-            let t = win.ts(p, s3, e3);
+            let (s3, l3) = f(3);
+            let t = win.ts(p, s3, s3 + l3);
             if t as u64 >= win.span as u64 {
                 continue;
             }
