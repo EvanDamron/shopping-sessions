@@ -421,7 +421,6 @@ struct Batch {
     t: [i64; B],        // ts, ms since the click window's start (i64::MIN: a purchase with a bad price)
     ing: [i64; B],      // ingest_ts, seconds since the click window's start
     pc: [u64; B],       // price and category of a purchase with a good price, else 0
-    line: [u32; B],
     // Filled by `flush`:
     ix: [u64; B], // event number, u64::MAX if either ID's number is out of range
     un: [u64; B], // user number
@@ -431,10 +430,10 @@ struct Batch {
     a: [u64; B],
     w1: [u64; B],
     px: [u64; B],
-    // For `lines_asm`: each row's line and the line after it (addresses), which rows
-    // are purchases, the lines queued for the plain reading, and a few words it
-    // keeps to hand.
-    lp: [u64; B],
+    lp: [u64; B], // where the row's line starts (address)
+    // For `lines_asm`: the line after each row's (address), which rows are
+    // purchases, the lines queued for the plain reading, and a few words it keeps
+    // to hand.
     nx: [u64; B],
     coldp: [u64; B],
     pur: [u8; B],
@@ -460,12 +459,51 @@ unsafe fn load8(p: *const u8) -> u64 {
 /// The general per-line code on the line `[ls, le)` (`le` is its newline).
 #[cold]
 #[inline(never)]
-unsafe fn cold(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) {
-    w.ncold += 1;
-    event_x_line(sh, w, d, ls, le);
+unsafe fn cold(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, _le: usize) {
+    cold_from(sh, w, d, ls);
 }
 
-/// The line starting at `ls`, wherever it ends.
+/// The seven fields of the line `d[ls..le]`, by the rules `split` applies (six
+/// commas; a field has no quote, or exactly two that wrap it), found from masks
+/// instead of a byte loop: Some(None) for a malformed line, None for a line of 96
+/// bytes or more (left to `split`).
+#[inline(always)]
+unsafe fn fields7(d: *const u8, ls: usize, le: usize) -> Option<Option<[(usize, usize); 7]>> {
+    let len = le - ls;
+    if len >= 96 {
+        return None;
+    }
+    let p = d.add(ls);
+    let (v0, v1, v2) = (ld(p), ld(p.add(32)), ld(p.add(64)));
+    let m = |c: u8| -> u128 {
+        let x = _mm256_set1_epi8(c as i8);
+        let f = |v: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, x)) as u32 as u128;
+        (f(v0) | (f(v1) << 32) | (f(v2) << 64)) & ((1u128 << len) - 1)
+    };
+    let (mut c, q) = (m(b','), m(b'"'));
+    if c.count_ones() != 6 {
+        return Some(None);
+    }
+    let mut f = [(0usize, 0usize); 7];
+    let mut s = 0usize;
+    for g in f.iter_mut() {
+        let e = if c != 0 { c.trailing_zeros() as usize } else { len };
+        c &= c.wrapping_sub(1);
+        let quotes = (q >> s) & ((1u128 << (e - s)) - 1);
+        *g = if quotes == 0 {
+            (ls + s, ls + e)
+        } else if e - s >= 2 && quotes == 1 | (1u128 << (e - s - 1)) {
+            (ls + s + 1, ls + e - 1)
+        } else {
+            return Some(None);
+        };
+        s = e + 1;
+    }
+    Some(Some(f))
+}
+
+/// The general per-line code on the line starting at `ls`, wherever it ends;
+/// returns where the next line starts.
 #[cold]
 #[inline(never)]
 unsafe fn cold_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) -> usize {
@@ -474,23 +512,63 @@ unsafe fn cold_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) -> usi
         le += 1;
     }
     w.ncold += 1;
-    event_x_line(sh, w, d, ls, le);
+    match fields7(d, ls, le) {
+        Some(found) => {
+            if sh.deccheck && found != crate::plain_fields::<7>(d, ls, le) {
+                eprintln!("fields differ from the plain reading on: {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(d.add(ls), le - ls)));
+                std::process::exit(3);
+            }
+            if let Some(f) = found {
+                crate::event_x_fields(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &f);
+            }
+        }
+        None => event_x_line(sh, w, d, ls, le),
+    }
     le + 1
 }
 
-/// Price and category of the purchase on the well-formed line `[ls, le)`, as
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// The number written by the `len` (1 to 8) digits that end at `end`; None if one of
+/// them is not a digit.
+#[inline(always)]
+unsafe fn digits(end: *const u8, len: usize) -> Option<u64> {
+    // The digits are the top `len` bytes of the 8 that end there; '0's fill the rest.
+    let keep = u64::MAX << (8 * (8 - len));
+    let w = (load8(end.sub(8)) & keep) | (ZEROS & !keep);
+    let x = w ^ ZEROS;
+    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    // Pairs, then fours, then all eight (the first digit is the lowest byte).
+    let v = x.wrapping_mul(10).wrapping_add(x >> 8);
+    let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32)));
+    Some(v >> 32)
+}
+
+/// Price and category of the purchase on the well-formed line that ends at `le`, as
 /// `price | category << 24`; None for a price the rules do not accept. (About 3% of
-/// lines: the fields are found again the plain way rather than kept in the loop.)
+/// lines: the two fields are found again here rather than kept in the loop.)
 #[inline(never)]
 unsafe fn purchase(sh: &Shared, dec: &Dec, d: *const u8, le: usize) -> Option<u32> {
-    let (mut c, mut i) = ([0usize; 2], le);
-    for k in 0..2 {
-        i -= 1;
-        while *d.add(i) != b',' {
+    // The last two commas, from the 32 bytes that end with the newline (the line has
+    // six commas; if the last two fields do not fit there, a byte loop finds them).
+    let cm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(d.add(le).sub(31)), _mm256_set1_epi8(b',' as i8))) as u32;
+    let rest = cm & (0x7FFF_FFFFu32 >> cm.leading_zeros().min(31));
+    let c = if rest != 0 {
+        [le - cm.leading_zeros() as usize, le - rest.leading_zeros() as usize]
+    } else {
+        let (mut c, mut i) = ([0usize; 2], le);
+        for k in 0..2 {
             i -= 1;
+            while *d.add(i) != b',' {
+                i -= 1;
+            }
+            c[k] = i;
         }
-        c[k] = i;
-    }
+        c
+    };
     // price_cents is after the last comma, product_id before it.
     let (mut s6, mut e6) = (c[0] + 1, le);
     if e6 > s6 && *d.add(s6) == b'"' {
@@ -500,17 +578,23 @@ unsafe fn purchase(sh: &Shared, dec: &Dec, d: *const u8, le: usize) -> Option<u3
     if *d.add(s5) == b'"' {
         (s5, e5) = (s5 + 1, e5 - 1);
     }
-    let price = parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6))?;
+    let price = if e6 - s6 - 1 < 8 {
+        match digits(d.add(e6), e6 - s6) {
+            Some(v) if v >= 1 && v <= 10_000_000 => v as u32,
+            _ => return None,
+        }
+    } else {
+        parse_price(std::slice::from_raw_parts(d.add(s6), e6 - s6))?
+    };
     // The category: from the table by product number for `p` + a number that is
     // there, from the lookup map for anything else.
-    let (mut n, mut i) = (0usize, s5 + 1);
-    if e5 - s5 >= 2 && e5 - s5 <= 8 && *d.add(s5) == b'p' && *d.add(i) != b'0' {
-        while i < e5 && (*d.add(i)).wrapping_sub(b'0') < 10 {
-            n = n * 10 + (*d.add(i) - b'0') as usize;
-            i += 1;
-        }
-        if i == e5 && n < dec.pcat_len && *dec.pcat.add(n) != NOCAT {
-            return Some(price | ((*dec.pcat.add(n) as u32) << 24));
+    let nd = e5 - s5 - 1;
+    if nd.wrapping_sub(1) < 7 && *d.add(s5) == b'p' && *d.add(s5 + 1) != b'0' {
+        if let Some(n) = digits(d.add(e5), nd) {
+            let n = n as usize;
+            if n < dec.pcat_len && *dec.pcat.add(n) != NOCAT {
+                return Some(price | ((*dec.pcat.add(n) as u32) << 24));
+            }
         }
     }
     Some(price | (sh.lk.products.get(Id::field(d, s5, e5)).unwrap_or(sh.lk.unknown_cat) << 24))
@@ -593,33 +677,48 @@ unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, b
     for j in 0..n {
         let idx = *bt.ix.get_unchecked(j);
         if idx == u64::MAX {
-            cold_from(sh, w, d, bt.line[j] as usize);
+            cold_from(sh, w, d, (bt.lp[j] - d as u64) as usize);
             continue;
         }
         let b = (idx >> xsh) as usize;
-        let (mut x0, mut x1) = (*bt.a.get_unchecked(j), *bt.w1.get_unchecked(j));
-        let px = *bt.px.get_unchecked(j);
-        loop {
-            let nrec = *cnt.add(b);
-            let off = nrec as usize & (fast::XCH - 1);
-            if off == 0 {
-                new_chunk(fx, w, b);
-            }
-            *cnt.add(b) = nrec + 1;
-            let k = (nrec & 7) as usize;
-            let buf = wc.add(b * 16);
-            *buf.add(k * 2) = x0;
-            *buf.add(k * 2 + 1) = x1;
-            if k == 7 {
-                crate::mem::stream((*cur.add(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 2);
-            }
-            // A valid purchase: its extension record next (same place and ingest
-            // key, the price and category where the time was).
-            if px == 0 || x0 & fast::EXT != 0 {
-                break;
-            }
-            (x0, x1) = (fast::EXT | (x0 & !fast::XA), (x1 & !0xFFFF_FFFF) | px);
+        let (x0, x1) = (*bt.a.get_unchecked(j), *bt.w1.get_unchecked(j));
+        let nrec = *cnt.add(b);
+        let off = nrec as usize & (fast::XCH - 1);
+        if off == 0 {
+            new_chunk(fx, w, b);
         }
+        *cnt.add(b) = nrec + 1;
+        let k = (nrec & 7) as usize;
+        let buf = wc.add(b * 16);
+        *buf.add(k * 2) = x0;
+        *buf.add(k * 2 + 1) = x1;
+        if k == 7 {
+            crate::mem::stream((*cur.add(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 2);
+        }
+        // A valid purchase: its extension record next (same place and ingest key,
+        // the price and category where the time was).
+        let px = *bt.px.get_unchecked(j);
+        if px != 0 {
+            extension(fx, w, b, fast::EXT | (x0 & !fast::XA), (x1 & !0xFFFF_FFFF) | px);
+        }
+    }
+}
+
+/// Files the extension record of a purchase (3% of events) under bucket `b`.
+#[inline(never)]
+unsafe fn extension(fx: &Fx, w: &mut Worker, b: usize, x0: u64, x1: u64) {
+    let nrec = *w.xcnt.get_unchecked(b);
+    let off = nrec as usize & (fast::XCH - 1);
+    if off == 0 {
+        new_chunk(fx, w, b);
+    }
+    *w.xcnt.get_unchecked_mut(b) = nrec + 1;
+    let k = (nrec & 7) as usize;
+    let buf = (w.xwc.as_mut_ptr() as *mut u64).add(b * 16);
+    *buf.add(k * 2) = x0;
+    *buf.add(k * 2 + 1) = x1;
+    if k == 7 {
+        crate::mem::stream((*w.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 2);
     }
 }
 
@@ -640,7 +739,7 @@ unsafe fn check(sh: &Shared, w: &mut Worker, d: *const u8, bt: &Batch, n: usize)
         if bt.ix[j] == u64::MAX {
             continue;
         }
-        let ls = bt.line[j] as usize;
+        let ls = (bt.lp[j] - d as u64) as usize;
         let mut le = ls;
         while *d.add(le) != b'\n' {
             le += 1;
@@ -806,7 +905,7 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         *bt.t.get_unchecked_mut(nb) = tms;
         *bt.ing.get_unchecked_mut(nb) = ing;
         *bt.pc.get_unchecked_mut(nb) = pc;
-        *bt.line.get_unchecked_mut(nb) = pos as u32;
+        *bt.lp.get_unchecked_mut(nb) = p as u64;
         nb += 1;
         if nb == B {
             flush(sh, fx, dec, w, d, &mut bt, nb);
@@ -854,8 +953,6 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         "2:",
         "cmp rsi, rdx",
         "jae 90f",
-        "cmp r15, {b}",
-        "jae 90f",
         "prefetcht0 byte ptr [rsi + {ahead}]",
         // newline: nl in rax (96 or more: none in the first 96 bytes)
         "vpcmpeqb ymm0, ymm14, ymmword ptr [rsi]",
@@ -872,13 +969,11 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         "cmovc rax, r8",
         "cmp rax, 96",
         "jae 80f",
-        // commas: first 64 bytes in r8, last 32 in r9
+        // commas of the first 64 bytes: r8
         "vpcmpeqb ymm0, ymm15, ymmword ptr [rsi]",
         "vpcmpeqb ymm1, ymm15, ymmword ptr [rsi + 32]",
-        "vpcmpeqb ymm2, ymm15, ymmword ptr [rsi + 64]",
         "vpmovmskb r8d, ymm0",
         "vpmovmskb ecx, ymm1",
-        "vpmovmskb r9d, ymm2",
         "shl rcx, 32",
         "or r8, rcx",
         // c1 rcx, c2 rbx, c3 r12
@@ -893,9 +988,8 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         // what the prefix and quote places must hold
         "vmovdqu xmm0, xmmword ptr [rsi + rcx - 16]",
         "vinserti128 ymm0, ymm0, xmmword ptr [rsi + rbx - 16], 1",
-        "mov rbp, rcx",
-        "shl rbp, 5",
-        "vmovdqu ymm1, ymmword ptr [rdi + rbp + {idr}]",
+        "lea rbp, [rcx*4]",
+        "vmovdqu ymm1, ymmword ptr [rdi + rbp*8 + {idr}]",
         "mov rbp, rbx",
         "sub rbp, rcx",
         "shl rbp, 5",
@@ -947,27 +1041,26 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         "mov r10, qword ptr [rcx + r10*4 + {f_kb}]",
         "mov qword ptr [r13 + {scr} + 24], r10",
         "mov qword ptr [r13 + {scr} + 32], rcx",
-        // ---- the rest of the line. Commas after the third, from the byte after
-        // it: r10; nlr = nl - c3 - 1: r9
-        "shrx r10, r8, r12",
-        "shr r10, 1",
-        "mov ebx, 63",
-        "sub rbx, r12",
-        "shlx r9, r9, rbx",
-        "or r10, r9",
-        "lea r9, [rax - 1]",
-        "sub r9, r12",
-        "bzhi r10, r10, r9",
-        // its quotes, from the 64 bytes that end with the newline, moved to the
-        // same origin: r8
+        // ---- the rest of the line, from the 64 bytes that end with the newline:
+        // its commas (r10) and quotes (r8) moved so that bit 0 is the byte after the
+        // third comma; nlr = nl - c3 - 1 (r9) is where the newline lands
+        "vpcmpeqb ymm0, ymm15, ymmword ptr [rsi + rax - 63]",
+        "vpcmpeqb ymm8, ymm15, ymmword ptr [rsi + rax - 31]",
+        "vpmovmskb r10d, ymm0",
+        "vpmovmskb ebx, ymm8",
+        "shl rbx, 32",
+        "or r10, rbx",
         "vpcmpeqb ymm0, ymm13, ymmword ptr [rsi + rax - 63]",
         "vpcmpeqb ymm8, ymm13, ymmword ptr [rsi + rax - 31]",
         "vpmovmskb r8d, ymm0",
         "vpmovmskb ebx, ymm8",
         "shl rbx, 32",
         "or r8, rbx",
+        "lea r9, [rax - 1]",
+        "sub r9, r12",
         "mov ebx, 63",
         "sub rbx, r9",
+        "shrx r10, r10, rbx",
         "shrx r8, r8, rbx",
         "lea rax, [rsi + rax + 1]",
         "mov qword ptr [r13 + {scr}], rax",
@@ -1025,11 +1118,9 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         // product: not empty
         "shr r9d, 2",
         "and r9d, 1",
-        "add r9d, r9d",
-        "sub rax, rbp",
-        "dec rax",
+        "lea rbp, [rbp + r9*2 + 1]",
         "xor ecx, ecx",
-        "cmp rax, r9",
+        "cmp rax, rbp",
         "sete cl",
         "or r11, rcx",
         // ingest date; the day's start in rbx
@@ -1079,7 +1170,9 @@ unsafe fn lines_asm(dec: &Dec, p: *const u8, pend: *const u8, bt: &mut Batch) ->
         "mov qword ptr [r13 + r15*8 + {nx}], rsi",
         "inc r15",
         "add r14, 16",
-        "jmp 2b",
+        "cmp r14, {b} * 16",
+        "jb 2b",
+        "jmp 90f",
         "60:",
         "mov rax, qword ptr [r13 + {scr}]",
         "jmp 71f",
@@ -1172,11 +1265,10 @@ pub unsafe fn events_a(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, 
     while p < pend {
         bt.nc = 0;
         let (stop, rows, long) = lines_asm(dec, p, pend, &mut bt);
-        let mut purchases = 0u64;
-        for j in 0..rows {
-            bt.line[j] = (bt.lp[j] - d as u64) as u32;
-            purchases |= ((bt.pur[j] != 0) as u64) << j;
-        }
+        // Which rows are purchases, as a bit each.
+        let z = _mm256_setzero_si256();
+        let marked = |i: usize| !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(bt.pur.as_ptr().add(32 * i)), z)) as u32) as u64;
+        let purchases = (marked(0) | (marked(1) << 32)) & (u64::MAX >> ((B - rows) & 63)) & ((rows != 0) as u64).wrapping_neg();
         // The purchases' price and category. A price the rules do not accept puts
         // the row outside every window: the copy is invalid.
         let mut m = purchases;
