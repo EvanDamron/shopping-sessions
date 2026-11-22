@@ -526,9 +526,9 @@ impl Worker {
         let n = f.n;
         let off = n & (PCH as u32 - 1);
         if off == 0 {
-            f.cur = (sh.ev.alloc_offset(PCH * PREC) / PREC) as u32;
-            self.pchunks.get_unchecked_mut(p).push(f.cur);
+            self.new_pchunk(sh, p);
         }
+        let f = self.pfill.get_unchecked_mut(p);
         f.n = n + 1;
         let slot = f.cur + off;
         let k = (n & 15) as usize;
@@ -540,15 +540,40 @@ impl Worker {
         slot
     }
 
+    /// A fresh chunk for person bucket `p`'s events, key bucket `d`'s keys, person
+    /// bucket `p`'s clicks: rare, kept out of line so the filing loops keep their
+    /// registers.
+    #[cold]
+    #[inline(never)]
+    unsafe fn new_pchunk(&mut self, sh: &Shared, p: usize) {
+        let f = self.pfill.get_unchecked_mut(p);
+        f.cur = (sh.ev.alloc_offset(PCH * PREC) / PREC) as u32;
+        self.pchunks.get_unchecked_mut(p).push(f.cur);
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn new_dchunk(&mut self, sh: &Shared, d: usize) {
+        let c = sh.dk.alloc(DCH * 16) as usize;
+        *self.dcur.get_unchecked_mut(d) = c;
+        self.dchunks.get_unchecked_mut(d).push(c);
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn new_cchunk(&mut self, sh: &Shared, p: usize) {
+        let c = sh.ck.alloc(CCH * KREC) as usize;
+        *self.ccur.get_unchecked_mut(p) = c;
+        self.cchunks.get_unchecked_mut(p).push(c);
+    }
+
     /// Files a dedup key under key bucket `d`.
     #[inline(always)]
     unsafe fn push_key(&mut self, sh: &Shared, d: usize, w0: u64, w1: u64) {
         let n = *self.dcnt.get_unchecked(d);
         let off = n as usize & (DCH - 1);
         if off == 0 {
-            let c = sh.dk.alloc(DCH * 16) as usize;
-            *self.dcur.get_unchecked_mut(d) = c;
-            self.dchunks.get_unchecked_mut(d).push(c);
+            self.new_dchunk(sh, d);
         }
         *self.dcnt.get_unchecked_mut(d) = n + 1;
         let k = (n & 3) as usize;
@@ -568,9 +593,7 @@ impl Worker {
         let n = *self.ccnt.get_unchecked(p);
         let off = n as usize & (CCH - 1);
         if off == 0 {
-            let c = sh.ck.alloc(CCH * KREC) as usize;
-            *self.ccur.get_unchecked_mut(p) = c;
-            self.cchunks.get_unchecked_mut(p).push(c);
+            self.new_cchunk(sh, p);
         }
         *self.ccnt.get_unchecked_mut(p) = n + 1;
         let k = (n & 15) as usize;
