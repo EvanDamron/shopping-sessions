@@ -61,9 +61,6 @@ fn chunk_map(sh: &Shared, workers: &[Worker], pb: usize) -> Vec<u64> {
     m
 }
 
-/// Keys ahead of the current one whose table slot is loaded early.
-const KAHEAD: usize = 12;
-
 /// Phase B: per key bucket, the copy with the smallest ingest_ts wins (rules.md
 /// "Events" step 2); the others are listed for phase C to drop.
 pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: usize) -> Kills {
@@ -84,6 +81,7 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                 });
                 let mut tab: Vec<[u64; 2]> = Vec::new();
                 let mut used: Vec<u64> = Vec::new();
+                let (mut seen, mut twice): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
                 let mut kill = |slot: u32| {
                     if slot != NOSLOT {
                         let m = unsafe { *cmap.get_unchecked(slot as usize / PCH) };
@@ -99,28 +97,58 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                     if total == 0 {
                         continue;
                     }
-                    let cap = (total * 2).next_power_of_two().max(64);
-                    let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
-                    if tab.len() < cap {
-                        tab.resize(cap, [0; 2]);
-                    }
-                    used.clear();
-                    used.resize(cap / 64, 0);
-                    let tp = tab.as_mut_ptr();
+                    // Pass 1: a bitmap with 16 positions per key; a position hit a second
+                    // time is marked in `twice`. Only keys at marked positions can have a
+                    // copy, and only they go through the exact table in pass 2.
+                    let nb = (total * 16).next_power_of_two().max(1024);
+                    let bmask = (nb - 1) as u64;
+                    seen.clear();
+                    seen.resize(nb / 64, 0);
+                    twice.clear();
+                    twice.resize(nb / 64, 0);
+                    let mut hits = 0usize;
                     for w in workers {
                         for chunk in w.key_chunks(d) {
-                            let n = chunk.len();
                             let cp = chunk.as_ptr();
-                            for j in 0..n {
+                            for (j, k) in chunk.iter().enumerate() {
                                 unsafe {
                                     if j % 4 == 0 {
                                         // The key stream itself, a kilobyte ahead (chunks are 16 KB).
                                         prefetch(cp.wrapping_add(j + 64));
                                     }
-                                    if j + KAHEAD < n {
-                                        prefetch(tp.add((chunk.get_unchecked(j + KAHEAD)[0] >> shift) as usize));
+                                    let b = (k[0] & bmask) as usize;
+                                    let (wd, m) = (b >> 6, 1u64 << (b & 63));
+                                    let x = *seen.get_unchecked(wd);
+                                    if x & m != 0 {
+                                        *twice.get_unchecked_mut(wd) |= m;
+                                        hits += 1;
+                                    } else {
+                                        *seen.get_unchecked_mut(wd) = x | m;
                                     }
-                                    let [id, v] = *chunk.get_unchecked(j);
+                                }
+                            }
+                        }
+                    }
+                    if hits == 0 {
+                        continue;
+                    }
+                    // Pass 2: the candidates (at most 2 * hits) in an exact table.
+                    let cap = (hits * 4).next_power_of_two().max(64);
+                    let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
+                    if tab.len() < cap {
+                        tab.resize(cap, [0; 2]);
+                    }
+                    used.clear();
+                    used.resize(cap.div_ceil(64), 0);
+                    let tp = tab.as_mut_ptr();
+                    for w in workers {
+                        for chunk in w.key_chunks(d) {
+                            for &[id, v] in chunk {
+                                unsafe {
+                                    let b = (id & bmask) as usize;
+                                    if *twice.get_unchecked(b >> 6) & (1u64 << (b & 63)) == 0 {
+                                        continue;
+                                    }
                                     let mut s = (id >> shift) as usize;
                                     loop {
                                         let (word, bit) = (s >> 6, 1u64 << (s & 63));
