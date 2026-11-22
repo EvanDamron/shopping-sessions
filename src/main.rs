@@ -1374,6 +1374,14 @@ fn main() {
             .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1")
             .exec();
     }
+    // Grow the descriptor table to 1,024 entries now, while there is one thread: growing
+    // it later, with threads running (opening output files), waits for an RCU grace period.
+    #[cfg(unix)]
+    unsafe {
+        if libc::dup2(2, 1023) == 1023 {
+            libc::close(1023);
+        }
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let envn = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -1582,6 +1590,7 @@ fn main() {
                             None => bucket(st, sh, workers, ctx, order[k]),
                         }
                     }
+                    post::finish(st, &mut scr);
                     drop(scr);
                     post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
