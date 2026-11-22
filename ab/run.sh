@@ -14,22 +14,22 @@ run() { # binary dataset [VAR=value ...]: prints wall ms
   env "$@" DATA_DIR=$S/$d OUTPUT_DIR=$S/o $b >/dev/null 2>$S/err
   echo $(( ($(now) - t) / 1000000 ))
 }
-A=""; B=""; C=""; A6=""; B6=""; C6=""; D6=""
+A=""; B=""; C=""; M=""; A6=""; B6=""; C6=""; D6=""; M6=""
 for i in 1 2 3; do
-  A="$A$(run /app/sessions_old g20) "; B="$B$(run /app/sessions g20) "; C="$C$(run /app/sessions g20 GLIBC_TUNABLES=) "
+  A="$A$(run /app/sessions_old g20) "; B="$B$(run /app/sessions g20) "; C="$C$(run /app/sessions g20 GLIBC_TUNABLES=) "; M="$M$(run /app/sessions g20 SS_MMAP=1) "
 done
 for i in 1 2 3; do
   A6="$A6$(run /app/sessions_old g60) "; B6="$B6$(run /app/sessions g60) "
-  C6="$C6$(run /app/sessions g60 GLIBC_TUNABLES=) "; D6="$D6$(run /app/sessions g60 SS_HUGE=0) "
+  C6="$C6$(run /app/sessions g60 GLIBC_TUNABLES=) "; D6="$D6$(run /app/sessions g60 SS_HUGE=0) "; M6="$M6$(run /app/sessions g60 SS_MMAP=1) "
 done
 run /app/sessions g60 >/dev/null
 ph=$(grep -E 'links: [0-9]|phase A parsed|stage:|phase B|phase C|wrote' $S/err | sed -E 's/^\[ *([0-9.]+)s\] (links|phase A|stage|phase B|phase C|wrote).*/\2=\1/; s/phase /p/' | tr '\n' ' ')
 rm -rf $S/o $S/g20 $S/g60
 cat > $S/rows.txt <<ROWS
 DIAG1 gen20=${g20}ms gen60=${g60}ms free2M=${free2m}MB nproc=$(nproc)
-DIAG2 g20 old56effae=$A new10673bc=$B new_noMallocTHP=$C
+DIAG2 g20 old56effae=$A new10673bc=$B new_noMallocTHP=$C new_mmap=$M
 DIAG3 g60 old56effae=$A6 new10673bc=$B6
-DIAG4 g60 new_noMallocTHP=$C6 new_SS_HUGE0=$D6
+DIAG4 g60 new_noMallocTHP=$C6 new_SS_HUGE0=$D6 new_mmap=$M6
 DIAG5 g60 new phases: $ph
 ROWS
 DIAG_ROWS_FILE=$S/rows.txt exec /app/sessions
