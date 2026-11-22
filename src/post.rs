@@ -64,20 +64,28 @@ fn chunk_map(sh: &Shared, workers: &[Worker], pb: usize) -> Vec<u64> {
 /// Phase B: per key bucket, the copy with the smallest ingest_ts wins (rules.md
 /// "Events" step 2); the others are listed for phase C to drop.
 pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: usize) -> Kills {
+    let tsu = crate::tl::now();
     let cmap = chunk_map(sh, workers, pb);
     let mut lists: Vec<Vec<Vec<u32>>> = (0..nthreads).map(|_| (0..pb).map(|_| Vec::new()).collect()).collect();
     let next = AtomicUsize::new(0);
     let done = std::sync::Barrier::new(nthreads);
     let (next, done, cmap) = (&next, &done, &cmap);
+    crate::tl::span(13, tsu);
     std::thread::scope(|sc| {
         for (ti, kl) in lists.iter_mut().enumerate() {
             sc.spawn(move || {
                 // Once every thread is done with the keys, each gives back its share.
                 let c0 = thread_cpu_ns();
+                let tw0 = crate::tl::now();
                 let _free = Defer(|| {
                     CPU_B.fetch_add(thread_cpu_ns() - c0, Relaxed);
+                    crate::tl::span(10, tw0);
+                    let t = crate::tl::now();
                     done.wait();
+                    crate::tl::span(11, t);
+                    let t = crate::tl::now();
                     sh.dk.release_part(ti, nthreads);
+                    crate::tl::span(12, t);
                 });
                 let mut tab: Vec<[u64; 2]> = Vec::new();
                 let mut used: Vec<u64> = Vec::new();

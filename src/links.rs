@@ -361,6 +361,8 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         for _ in 0..nthreads.min(tasks.len().max(1)) {
             let (b, next) = (&b, &next);
             sc.spawn(move || {
+                let ttl = crate::tl::now();
+                let _tl = crate::Defer(|| crate::tl::span(2, ttl));
                 let mut rd = Reader::new(buf);
                 let mut ids = [(Id::EMPTY, Id::EMPTY, 0u64, 0u64); BATCH];
                 let mut n = 0usize;
@@ -465,6 +467,8 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         for _ in 0..nthreads {
             let (b, next, counter) = (&b, &next, &counter);
             sc.spawn(move || {
+                let ttl = crate::tl::now();
+                let _tl = crate::Defer(|| crate::tl::span(3, ttl));
                 let (mut num, mut end) = (0u32, 0u32);
                 let mut number_of = |r: u32| -> u32 {
                     let e = b.entry(r as usize);
