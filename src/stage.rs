@@ -129,6 +129,9 @@ struct Scr {
     touched: Vec<u32>,
     reached: Vec<u64>,
     slot_of: Vec<u32>, // per campaign: its place in `touched` + 1, or 0
+    piv: Vec<u32>,     // the last start of each block of 16 sessions
+    sday: Vec<u8>,     // per session: which of the person's days it is on
+    dmask: Vec<u64>,   // per day, `words` words: the sessions on it
 }
 
 /// One thread's campaign counts for whole persons. A campaign's days are one row of
@@ -254,8 +257,11 @@ impl Tls {
         let len = bytes.div_ceil(H) * H;
         let raw = mem::map(len + H);
         let base = ((raw as usize + H - 1) & !(H - 1)) as *mut u8;
-        // Small and hot: always worth a huge page.
-        mem::hugepages(base, len);
+        // Small and hot: worth a huge page (SS_HUGE=0 turns the request off, as for
+        // the ID table).
+        if std::env::var_os("SS_HUGE").is_none_or(|v| v != "0") {
+            mem::hugepages(base, len);
+        }
         unsafe {
             let slots = base as *mut Slot;
             for i in 0..cap + 16 {
@@ -331,7 +337,9 @@ unsafe fn place(tab: *mut Slot, pcs: *mut u32, l: &[(usize, u32)]) {
         let rs = c as *const XRec;
         for i in 0..n {
             let r = &*rs.add(i);
-            // (The place of a record a few ahead is fetched early.)
+            // (The place of a record a few ahead is fetched early, and the records
+            // themselves further ahead.)
+            prefetch_read(rs.add(i + 48));
             prefetch_write(tab.add((((*rs.add((i + AHEAD).min(n - 1))).a >> XLO) & 0xFFFF) as usize));
             let at = ((r.a >> XLO) & 0xFFFF) as usize;
             let s = tab.add(at);
@@ -404,6 +412,8 @@ unsafe fn readout_wide(x: &mut Tls, cap: usize) -> usize {
     let zero = _mm512_setzero_si512();
     let far = _mm512_set1_epi32(FAR as i32);
     let low9 = _mm512_set1_epi32(511);
+    const { assert!(INVALID == ODDU << 1 && ODDU >= 1 << 36) };
+    let mark_shift = _mm_cvtsi32_si128(ODDU.trailing_zeros() as i32 - 32);
     let (t, u) = (x.t, x.u);
     let mut n = 0usize;
     let mut at = 0usize;
@@ -415,9 +425,10 @@ unsafe fn readout_wide(x: &mut Tls, cap: usize) -> usize {
             let b = _mm512_permutex2var_epi32(z2, i, z3);
             _mm512_inserti64x4::<1>(a, _mm512_castsi512_si256(b))
         };
-        // The user word's two halves: the marks are the top two bits of the high half.
+        // The user word's two halves: the marks are two bits of the high half
+        // (wherever fast.rs puts ODDU and, right above it, INVALID).
         let (lo, hi, vt) = (col(ilo), col(ihi), col(it));
-        let marks = _mm512_srli_epi32::<30>(hi);
+        let marks = _mm512_and_si512(_mm512_srl_epi32(hi, mark_shift), _mm512_set1_epi32(3));
         let valid = _mm512_cmpeq_epi32_mask(marks, zero);
         let odd = _mm512_cmpeq_epi32_mask(marks, _mm512_set1_epi32(1));
         let alias = _mm512_and_si512(lo, low9);
@@ -585,23 +596,35 @@ fn text_key(n: u64) -> u64 {
     ((n * P36[8 - len]) << 4) | len as u64
 }
 
-/// The ID "u" + base 36 of `n`.
+/// Every pair of base-36 digits, as two bytes.
+static PAIRS: [[u8; 2]; 1296] = {
+    let d = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut t = [[0u8; 2]; 1296];
+    let mut i = 0;
+    while i < 1296 {
+        t[i] = [d[i / 36], d[i % 36]];
+        i += 1;
+    }
+    t
+};
+
+/// The ID "u" + base 36 of `n` (below 2^40: at most 8 digits).
 #[inline]
 fn user_text(n: u64) -> Id {
-    let mut buf = [0u8; 32];
-    let mut at = 16;
-    let mut v = n;
-    loop {
-        at -= 1;
-        buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
-        v /= 36;
-        if v == 0 {
-            break;
-        }
+    // Eight digits, two at a time, then the leading zeros are skipped.
+    let (hi, lo) = ((n / 1_679_616) as u32, (n % 1_679_616) as u32);
+    let mut buf = [0u8; 40];
+    buf[8..10].copy_from_slice(&PAIRS[(hi / 1296) as usize]);
+    buf[10..12].copy_from_slice(&PAIRS[(hi % 1296) as usize]);
+    buf[12..14].copy_from_slice(&PAIRS[(lo / 1296) as usize]);
+    buf[14..16].copy_from_slice(&PAIRS[(lo % 1296) as usize]);
+    let mut len = 1;
+    for p in &P36[1..8] {
+        len += (n >= *p) as usize;
     }
-    at -= 1;
+    let at = 16 - len - 1;
     buf[at] = b'u';
-    unsafe { Id::short(buf.as_ptr().add(at), 16 - at) }
+    unsafe { Id::short(buf.as_ptr().add(at), len + 1) }
 }
 
 /// Whether a run with alias codes `bits` is one whole person, given the aliases the
@@ -659,31 +682,38 @@ unsafe fn reach_plain(st: *const u32, m: usize, ts: u32) -> (usize, usize) {
     (a, b)
 }
 
+/// As `reach_plain`. `piv[k]` is the last start of the k-th block of 16 (u32::MAX
+/// past the last full block; 16 entries): the blocks wholly before a time are counted
+/// from it, and only the block the time falls in is compared start by start.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,popcnt")]
 #[inline]
-unsafe fn reach_wide(st: *const u32, m: usize, ts: u32) -> (usize, usize) {
+unsafe fn reach_wide(st: *const u32, piv: *const u32, m: usize, ts: u32) -> (usize, usize) {
     use core::arch::x86_64::*;
     if m > SCAN {
         return reach_plain(st, m, ts);
     }
     let (x, y) = (_mm512_set1_epi32(ts as i32), _mm512_set1_epi32((ts + WEEK) as i32));
-    let (mut a, mut b) = (0u32, 0u32);
-    let mut i = 0;
-    while i < m {
-        let v = _mm512_loadu_si512(st.add(i) as *const __m512i);
-        a += (_mm512_cmplt_epu32_mask(v, x) as u32).count_ones();
-        b += (_mm512_cmple_epu32_mask(v, y) as u32).count_ones();
-        i += 16;
+    if m <= 16 {
+        let v = _mm512_loadu_si512(st as *const __m512i);
+        return ((_mm512_cmplt_epu32_mask(v, x) as u32).count_ones() as usize, (_mm512_cmple_epu32_mask(v, y) as u32).count_ones() as usize);
     }
-    (a as usize, b as usize)
+    let p = _mm512_loadu_si512(piv as *const __m512i);
+    let ba = (_mm512_cmplt_epu32_mask(p, x) as u32).count_ones() as usize;
+    let bb = (_mm512_cmple_epu32_mask(p, y) as u32).count_ones() as usize;
+    let va = _mm512_loadu_si512(st.add(16 * ba) as *const __m512i);
+    let vb = _mm512_loadu_si512(st.add(16 * bb) as *const __m512i);
+    (
+        16 * ba + (_mm512_cmplt_epu32_mask(va, x) as u32).count_ones() as usize,
+        16 * bb + (_mm512_cmple_epu32_mask(vb, y) as u32).count_ones() as usize,
+    )
 }
 
 /// The person's clicks, in any order: for each, the sessions it reaches. The first of
 /// them takes it as a candidate for its credit; all of them are noted as reached by
 /// its campaign. Returns whether any click reaches a session.
 macro_rules! click_pass {
-    ($s:ident, $kc:ident, $ids:ident, $m:ident, $words:ident, $cid:ident, $reach:ident) => {{
+    ($s:ident, $kc:ident, $ids:ident, $m:ident, $words:ident, $cid:ident, $reach:expr) => {{
         let stp = $s.st.as_ptr();
         let mut any = false;
         for r in $kc {
@@ -730,25 +760,12 @@ macro_rules! click_pass {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,popcnt")]
 unsafe fn click_pass_wide(s: &mut Scr, kc: &[Kc], ids: u32, m: usize, words: usize, cid: &impl Fn(u32) -> Id) -> bool {
-    click_pass!(s, kc, ids, m, words, cid, reach_wide)
+    let piv = s.piv.as_ptr();
+    click_pass!(s, kc, ids, m, words, cid, |st, m, ts| reach_wide(st, piv, m, ts))
 }
 
 unsafe fn click_pass_plain(s: &mut Scr, kc: &[Kc], ids: u32, m: usize, words: usize, cid: &impl Fn(u32) -> Id) -> bool {
     click_pass!(s, kc, ids, m, words, cid, reach_plain)
-}
-
-/// How many of the sessions `a..b` are in the set `set`.
-#[inline(always)]
-unsafe fn count_in(set: *const u64, words: usize, a: usize, b: usize) -> u32 {
-    if words == 1 {
-        return ((*set >> a) & (u64::MAX >> (64 - (b - a)))).count_ones();
-    }
-    let mut n = 0;
-    for wi in a / 64..=(b - 1) / 64 {
-        let (lo, hi) = (a.max(wi * 64) - wi * 64, b.min(wi * 64 + 64) - wi * 64);
-        n += ((*set.add(wi) >> lo) & (u64::MAX >> (64 - (hi - lo)))).count_ones();
-    }
-    n
 }
 
 /// One whole person from their session list (`s.st`, `s.sn`), purchases (`s.pur`) and
@@ -771,6 +788,13 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         for i in 0..16 {
             *end.add(i) = u32::MAX;
         }
+        if wide && m > 16 && m <= SCAN {
+            s.piv.clear();
+            s.piv.resize(16, u32::MAX);
+            for k in 0..m / 16 {
+                s.piv[k] = *s.st.get_unchecked(16 * k + 15);
+            }
+        }
         s.top.clear();
         s.top.resize(m, (0, 0, 0));
         if s.slot_of.len() < ctx.organic as usize {
@@ -792,7 +816,8 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         // The rows are appended to six columns that are not in cache: the lines the
         // next few persons' rows will land on are fetched now.
         let r = &st.rows;
-        prefetch_write(r.dict.as_ptr().wrapping_add(r.dict.len() + 256));
+        prefetch_write(r.dict.as_ptr().wrapping_add(r.dict.len() + 128));
+        prefetch_write((r.runs.as_ptr() as *const u8).wrapping_add(r.runs.len() * 4 + 64));
         prefetch_write((r.days.as_ptr() as *const u8).wrapping_add(r.days.len() * 4 + 128));
         prefetch_write((r.sessions.as_ptr() as *const u8).wrapping_add(r.sessions.len() * 4 + 128));
         prefetch_write((r.events.as_ptr() as *const u8).wrapping_add(r.events.len() * 4 + 128));
@@ -802,11 +827,17 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let (mut cur, mut us, mut ue, mut ur) = (NONE, 0u32, 0u32, 0u64);
     let mut pp = 0usize;
     let npur = s.pur.len();
-    begin_person(st, name);
     // The click the session at hand could be credited to: (time, campaign).
     let (mut have, mut cts, mut ccamp) = (false, 0u32, 0u32);
+    begin_person(st, name);
     st.catrev.clear();
     s.days.clear();
+    if clicks {
+        s.dmask.clear();
+        if s.sday.len() < m {
+            s.sday.resize(m, 0);
+        }
+    }
     for j in 0..m {
         let start = *s.st.get_unchecked(j);
         let day = day_of(start, off);
@@ -819,6 +850,14 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
             ue = 0;
             ur = 0;
             s.days.push((day, j as u32));
+            if clicks {
+                s.dmask.resize(s.dmask.len() + words, 0);
+            }
+        }
+        if clicks {
+            let di = s.days.len() - 1;
+            *s.sday.get_unchecked_mut(j) = di as u8;
+            *s.dmask.get_unchecked_mut(di * words + j / 64) |= 1 << (j % 64);
         }
         let mut rev = 0u64;
         while pp < npur && s.pur.get_unchecked(pp).0 == j as u32 {
@@ -854,19 +893,25 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         }
     }
     flush(st, name, cur as i64 + ctx.day0, us, ue, ur, ctx);
-    if !kc.is_empty() {
-        // Assists: per campaign, the sessions it reached, counted day by day.
-        let nd = s.days.len();
+    if clicks {
+        // Assists: per campaign, the sessions it reached, counted day by day: the
+        // first reached session left names a day, that day's sessions are counted
+        // and taken out, until none is left.
         for (k, &c) in s.touched.iter().enumerate() {
-            let set = s.reached.as_ptr().add(k * words);
-            for di in 0..nd {
-                let (d, a) = *s.days.get_unchecked(di);
-                let b = if di + 1 < nd { s.days.get_unchecked(di + 1).1 as usize } else { m };
-                let n = count_in(set, words, a as usize, b);
-                if n != 0 {
-                    *acc.assist.add(((c as usize) << wsh) + d as usize) += n;
+            let row = acc.assist.add((c as usize) << wsh);
+            for w in 0..words {
+                let mut set = *s.reached.get_unchecked(k * words + w);
+                while set != 0 {
+                    let di = *s.sday.get_unchecked(w * 64 + set.trailing_zeros() as usize) as usize;
+                    let on = *s.dmask.get_unchecked(di * words + w);
+                    *row.add(s.days.get_unchecked(di).0 as usize) += (set & on).count_ones();
+                    set &= !on;
                 }
             }
+            *s.slot_of.get_unchecked_mut(c as usize) = 0;
+        }
+    } else if !kc.is_empty() {
+        for &c in &s.touched {
             *s.slot_of.get_unchecked_mut(c as usize) = 0;
         }
     }
@@ -1007,11 +1052,17 @@ unsafe fn replay(env: &Env, x: &mut Tls, w: &mut Worker, b: usize, g: u32) {
 #[cfg_attr(not(prof), inline(always))]
 unsafe fn sessions_into(x: &Tls, k: usize, ke: usize, pp: usize, pe: usize, st: &mut Vec<u32>, sn: &mut Vec<u32>, pur: &mut Vec<(u32, u32)>) {
     let (t, ss) = (x.t, x.ss);
-    for j in k..ke {
-        let a = *ss.add(j) & M31;
-        st.push(*t.add(a as usize) & M31);
-        sn.push((*ss.add(j + 1) & M31) - a);
+    let n = ke - k;
+    st.reserve(n);
+    sn.reserve(n);
+    let (ps, pn) = (st.as_mut_ptr().add(st.len()), sn.as_mut_ptr().add(sn.len()));
+    for j in 0..n {
+        let a = *ss.add(k + j) & M31;
+        *ps.add(j) = *t.add(a as usize) & M31;
+        *pn.add(j) = (*ss.add(k + j + 1) & M31) - a;
     }
+    st.set_len(st.len() + n);
+    sn.set_len(sn.len() + n);
     session_tail(x, k, ke, pp, pe, pur);
 }
 
@@ -1071,6 +1122,13 @@ unsafe fn runs(b: usize, n: usize, c: &Cut, env: &Env, x: &mut Tls, st: &mut CS,
         }
         let r1 = (*ss.add(ke) & M31) as usize;
         let g = *u.add(r0) >> 4;
+        // The columns, the table of user numbers and the click index are read front
+        // to back, a person at a time: what the next few persons need is fetched now.
+        prefetch_read(x.t.add(r1 + 192));
+        prefetch_read(u.add(r1 + 192));
+        prefetch_read(gt.as_ptr().add(g as usize + 24));
+        prefetch_read(env.coff.as_ptr().add(g as usize + 48));
+        prefetch_read(env.kc.add(*env.coff.get_unchecked(g as usize + 1) as usize + 96));
         let mut bits = 0u32;
         for i in r0..r1 {
             bits |= 1 << (*u.add(i) & 15);
@@ -1201,7 +1259,7 @@ unsafe fn event_bucket(b: usize, env: &Env, x: &mut Tls, st: &mut CS, w: &mut Wo
 /// Click bucket `c` into the click index: its clicks, grouped by user number, go to
 /// `kc` from place `base` on, and each user number's start is noted in `off`. Clicks of
 /// user numbers that take the general path are filed there.
-unsafe fn click_bucket(c: usize, env: &Env, off: &mut [u32], kc: *mut Kc, base: u32, cnt: &mut Vec<u32>, w: &mut Worker) {
+unsafe fn click_bucket(c: usize, env: &Env, off: &mut [u32], kc: *mut Kc, base: u32, cnt: &mut Vec<u32>, tmp: &mut Vec<(Kc, u32)>, w: &mut Worker) {
     let fx = env.fx;
     let l = &env.li.cl[c];
     let span = off.len();
@@ -1212,28 +1270,31 @@ unsafe fn click_bucket(c: usize, env: &Env, off: &mut [u32], kc: *mut Kc, base: 
     let g0 = (c * fx.gper) as u32;
     cnt.clear();
     cnt.resize(span, 0);
-    let mut total = 0usize;
-    for &(p, n) in l {
+    // One reading of the click records: each leaves its index entry and its user
+    // number in `tmp`, in cache, from where the entries are then grouped.
+    tmp.clear();
+    for (ci, &(p, n)) in l.iter().enumerate() {
         let rs = std::slice::from_raw_parts(p as *const CRec, n as usize);
-        for r in rs {
-            *cnt.get_unchecked_mut((r.who - g0) as usize) += 1;
+        tmp.reserve(rs.len());
+        let out = tmp.as_mut_ptr().add(tmp.len());
+        for (i, r) in rs.iter().enumerate() {
+            let k = r.who - g0;
+            *cnt.get_unchecked_mut(k as usize) += 1;
+            *out.add(i) = (Kc { ts: r.ts, ca: (r.camp << 9) | r._pad, j: (ci * CCH + i) as u32 }, k);
         }
-        total += n as usize;
+        tmp.set_len(tmp.len() + rs.len());
     }
-    mem::populate(kc.add(base as usize) as *mut u8, total * std::mem::size_of::<Kc>());
+    mem::populate(kc.add(base as usize) as *mut u8, tmp.len() * std::mem::size_of::<Kc>());
     let mut sum = base;
     for k in 0..span {
         off[k] = sum;
         sum += cnt[k];
         cnt[k] = off[k];
     }
-    for (ci, &(p, n)) in l.iter().enumerate() {
-        let rs = std::slice::from_raw_parts(p as *const CRec, n as usize);
-        for (i, r) in rs.iter().enumerate() {
-            let at = cnt.get_unchecked_mut((r.who - g0) as usize);
-            *kc.add(*at as usize) = Kc { ts: r.ts, ca: (r.camp << 9) | r._pad, j: (ci * CCH + i) as u32 };
-            *at += 1;
-        }
+    for &(e, k) in tmp.iter() {
+        let at = cnt.get_unchecked_mut(k as usize);
+        *kc.add(*at as usize) = e;
+        *at += 1;
     }
     // (After filing, cnt[k] is the end of user number k's clicks.)
     for k in 0..span {
@@ -1354,7 +1415,8 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
     let nclicks = cbase[nxc] as usize;
     let kc_bytes = (nclicks + 16) * std::mem::size_of::<Kc>();
     let kc = mem::map(kc_bytes) as *mut Kc;
-    if fx.huge || std::env::var_os("SS_KCHUGE").is_some() {
+    let kc_huge = fx.huge || std::env::var_os("SS_KCHUGE").is_some();
+    if kc_huge {
         mem::hugepages(kc as *mut u8, kc_bytes);
     }
     let mut coff = vec![0u32; nxc * gper + 1];
@@ -1430,16 +1492,16 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
                     // The click index first: every bucket of events reads it.
                     let tc = Instant::now();
                     let mut x = Tls::new(cap, ti, ctx);
-                    let mut cnt = Vec::new();
+                    let (mut cnt, mut tmp) = (Vec::new(), Vec::new());
                     loop {
                         let c = nextc.fetch_add(1, Relaxed);
                         if c >= nxc {
                             break;
                         }
                         let off = std::slice::from_raw_parts_mut(pcoff.0.add(c * gper), gper);
-                        click_bucket(c, env, off, env.kc as *mut Kc, cbase[c], &mut cnt, w);
+                        click_bucket(c, env, off, env.kc as *mut Kc, cbase[c], &mut cnt, &mut tmp, w);
                     }
-                    drop(cnt);
+                    drop((cnt, tmp));
                     x.tm[4] += tc.elapsed().as_nanos() as u64;
                     gate.wait();
                     loop {
@@ -1529,11 +1591,15 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
                     w.finish(sh);
                     // This thread's campaign counts join the general pipeline's.
                     fold_counts(&x.acc, st, env.ctx);
-                    // The click index is done with: each thread returns its share.
-                    let part = (kc_bytes / nthreads) & !4095;
-                    let lo = part * x.ti;
-                    let hi = if x.ti + 1 == nthreads { kc_bytes } else { lo + part };
-                    mem::release((env.kc as *mut u8).add(lo), hi - lo);
+                    // The click index is done with. On small pages each thread returns
+                    // its share now, so that exit does not have to, on one thread; on
+                    // huge pages there is next to nothing to return and it is left.
+                    if !kc_huge {
+                        let part = (kc_bytes / nthreads) & !4095;
+                        let lo = part * x.ti;
+                        let hi = if x.ti + 1 == nthreads { kc_bytes } else { lo + part };
+                        mem::release((env.kc as *mut u8).add(lo), hi - lo);
+                    }
                     x.tm[5] += t.elapsed().as_nanos() as u64;
                 });
             }
@@ -1737,7 +1803,8 @@ mod tests {
                 }
                 let (a, b) = (&got.rows, &want.rows);
                 assert_eq!(a.n, b.n, "round {round} wide {wide}");
-                assert_eq!((&a.dict, &a.days, &a.sessions, &a.events), (&b.dict, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
+                assert_eq!((&a.dict, &a.runs, a.ndict), (&b.dict, &b.runs, b.ndict), "round {round} wide {wide}");
+                assert_eq!((&a.days, &a.sessions, &a.events), (&b.days, &b.sessions, &b.events), "round {round} wide {wide}");
                 assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round} wide {wide}");
                 assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
                 assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
