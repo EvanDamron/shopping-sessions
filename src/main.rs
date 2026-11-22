@@ -1199,11 +1199,10 @@ fn phase_a<'a>(
     let (nb, nxc) = sh.fx.as_ref().map_or((0, 0), |f| (f.nb, f.nxc));
     let fast = sh.fx.is_some();
     let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc)).collect();
-    // SS_MMAP=1: the per-line decoders read the files straight from their mappings
-    // instead of through the read buffer. (Measured equal on the development host,
-    // so it is off unless asked for.)
+    // The per-line decoders read the files straight from their mappings, prefetching
+    // a few lines ahead (SS_MMAP=0: through the read buffer, as the indexed path does).
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-    let mapped = sh.dec.is_some() && envn("SS_MMAP") == Some(1);
+    let mapped = sh.dec.is_some() && envn("SS_MMAP") != Some(0);
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
     let mapped = false;
     let maps = |files: &[(File, u64)]| -> Vec<Option<scan::Mapped>> {
