@@ -213,6 +213,27 @@ impl Win {
         }
     }
 
+    /// As `ts` for the `n` bytes at p: F1 and 13-digit F3 are both worked out and
+    /// one is chosen by the length, without a branch on the form; anything that is
+    /// neither, or fails its checks, goes to `ts`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    #[inline(always)]
+    pub unsafe fn ts_bl(&self, p: *const u8, n: usize) -> i64 {
+        let (w0, w5) = (load8(p), load8(p.add(5)));
+        let (mok, m) = self.month(w0);
+        let (d, part, hms) = dhms(p.add(8));
+        let ok1 = hms & mok & (d >= m.lo) & (d <= m.hi) & (*p.add(19) == b'Z') & (n == 20);
+        let v1 = ((m.day0 + d) * 86_400 + part) * 1000 - self.base;
+        let ok3 = digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) & (n == 13);
+        let v3 = ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base;
+        let t = if n == 20 { v1 } else { v3 };
+        if ok1 | ok3 {
+            t
+        } else {
+            self.ts(p, 0, n)
+        }
+    }
+
     /// A `ts` field to ms since `base`; FAIL if it is not a timestamp. The caller
     /// checks the window (a FAIL is outside every window).
     #[inline(always)]
@@ -312,6 +333,8 @@ mod tests {
         let n = buf.len();
         buf.extend_from_slice(&[b','; 40]);
         let fast = unsafe { w.ts(buf.as_ptr(), 0, n) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+        assert_eq!(fast, unsafe { w.ts_bl(buf.as_ptr(), n) }, "ts_bl {s:?}");
         let slow = match crate::ts::parse_ts(s.as_bytes()) {
             Some(t) => t.checked_sub(w.base).unwrap_or(i64::MAX),
             None => FAIL,
