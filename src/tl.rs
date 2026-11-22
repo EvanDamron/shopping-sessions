@@ -11,7 +11,19 @@ static N: AtomicUsize = AtomicUsize::new(0);
 static REC: [[AtomicU64; 3]; CAP] = [const { [const { AtomicU64::new(0) }; 3] }; CAP];
 
 thread_local! {
-    static TID: u64 = unsafe { libc::gettid() as u64 };
+    static TID: u64 = tid();
+}
+
+/// The OS thread id (Linux); elsewhere a per-thread counter, which is enough to tell lanes apart.
+#[cfg(target_os = "linux")]
+fn tid() -> u64 {
+    unsafe { libc::gettid() as u64 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tid() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Relaxed)
 }
 
 /// Now in ns (CLOCK_MONOTONIC), or 0 when tracing is off.
