@@ -151,7 +151,12 @@ struct IdMap {
 
 impl IdMap {
     fn new() -> IdMap {
-        IdMap { slots: vec![(Id::EMPTY, 0); 16], mask: 15, len: 0 }
+        IdMap::with_capacity(0)
+    }
+    /// Room for `n` keys without growing (the size growing to `n` keys would reach).
+    fn with_capacity(n: usize) -> IdMap {
+        let cap = ((n + 1) * 4).next_power_of_two().max(16);
+        IdMap { slots: vec![(Id::EMPTY, 0); cap], mask: cap - 1, len: 0 }
     }
     #[inline(always)]
     fn get(&self, k: Id) -> Option<u32> {
@@ -221,13 +226,22 @@ fn read_lookups(data: &Path) -> Lookups {
             }
         });
     }
-    let mut cats: Vec<Vec<u8>> = prods.iter().map(|p| p.1.to_vec()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
-    let mut products = IdMap::new();
+    // The distinct categories first (a few dozen), then each product's index among
+    // them, sorted by name: sorting and searching all 50,000 product rows' copies took
+    // about 20 ms, on the side thread that runs while the links are built.
+    let mut index: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
     for p in &prods {
-        products.insert(Id::intern(p.0), cats.binary_search_by(|c| c[..].cmp(p.1)).unwrap() as u32);
+        index.entry(p.1).or_insert(0);
+    }
+    index.entry(b"unknown").or_insert(0);
+    let mut cats: Vec<Vec<u8>> = index.keys().map(|c| c.to_vec()).collect();
+    cats.sort();
+    for (k, c) in cats.iter().enumerate() {
+        *index.get_mut(&c[..]).unwrap() = k as u32;
+    }
+    let mut products = IdMap::with_capacity(prods.len());
+    for p in &prods {
+        products.insert(Id::intern(p.0), index[p.1]);
     }
     let unknown_cat = cats.binary_search_by(|c| c[..].cmp(b"unknown")).unwrap() as u32;
 
