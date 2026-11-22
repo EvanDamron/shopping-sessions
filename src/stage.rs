@@ -136,6 +136,27 @@ struct Scr {
     sday: Vec<u8>,     // per session: which of the person's days it is on
     dmask: Vec<u64>,   // per day, `words` words: the sessions on it
     camp: Vec<u32>,    // per session: the campaign it is credited to (`person_bulk`)
+    dayv: Vec<u32>,    // per session: its day (`person_rows` with few clicks)
+    few: Few,
+}
+
+/// The most clicks (after the alias filter) a person can have for `few_pass_*`.
+const FEW: usize = 16;
+/// Persons with more clicks than this in the index are not gathered for `few_pass_*`.
+const GATHER: usize = 64;
+
+/// A person's clicks gathered for `few_pass_*` (`few_gather`): per click its time,
+/// time + 7 days, campaign and place in the click bucket. Places `n` to `FEW - 1` hold
+/// time u32::MAX and time + 7 days 0, so no session ever has them in reach.
+/// `camp[FEW]` is the organic campaign, taken when no click is in reach.
+#[derive(Default)]
+#[repr(C, align(64))]
+struct Few {
+    ts: [u32; FEW + 1],
+    tw: [u32; FEW],
+    camp: [u32; FEW + 1],
+    j: [u32; FEW + 1],
+    n: usize,
 }
 
 /// A bucket's sessions and rows, built for the whole bucket before its runs are walked
@@ -829,7 +850,17 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let off = ctx.dayoff as i32;
     let m = s.st.len();
     let words = m.div_ceil(64);
-    let clicks = !kc.is_empty() && click_setup(s, ctx, kc, ids, m, words, wide, &cid);
+    // Few clicks: credit and assists of every session first (`few_pass`).
+    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids, ctx.organic);
+    let few = gathered && s.few.n != 0;
+    if few {
+        s.dayv.clear();
+        s.dayv.extend(s.st.iter().map(|&t| day_of(t, off)));
+        s.camp.clear();
+        s.camp.reserve(m);
+        few_pass(&s.few, s.st.as_ptr(), s.dayv.as_ptr(), m, acc, s.camp.as_mut_ptr(), wide, &cid);
+    }
+    let clicks = !kc.is_empty() && !gathered && click_setup(s, ctx, kc, ids, m, words, wide, &cid);
     prefetch_rows(st);
     let (mut cur, mut us, mut ue, mut ur) = (NONE, 0u32, 0u32, 0u64);
     let mut pp = 0usize;
@@ -881,7 +912,9 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         ue += *s.sn.get_unchecked(j);
         ur += rev;
         let mut camp = ctx.organic;
-        if clicks {
+        if few {
+            camp = *s.camp.as_ptr().add(j);
+        } else if clicks {
             let top = *s.top.get_unchecked(j);
             if top.0 != 0 {
                 have = true;
@@ -900,7 +933,7 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         }
     }
     flush(st, name, cur as i64 + ctx.day0, us, ue, ur, ctx);
-    assists(s, acc, words, clicks, !kc.is_empty());
+    assists(s, acc, words, clicks, !kc.is_empty() && !gathered);
 }
 
 /// The click pass of a person whose `m` session starts are in `s.st` (person_rows,
@@ -941,6 +974,159 @@ unsafe fn click_setup(s: &mut Scr, ctx: &Ctx, kc: &[Kc], ids: u32, m: usize, wor
         let _ = wide;
         click_pass_plain(s, kc, ids, m, words, cid)
     }
+}
+
+/// Gathers the person's clicks (those of `kc` whose alias is in `ids`) into `f`, if
+/// `kc` has at most `GATHER` entries and at most `FEW` of them are the person's.
+/// Returns whether it did; `f.n` may then be 0.
+#[inline(always)]
+unsafe fn few_gather(f: &mut Few, kc: &[Kc], ids: u32, org: u32) -> bool {
+    if kc.len() > GATHER {
+        return false;
+    }
+    // Every click is written at place n (FEW at most), and n moves on for the
+    // person's own: no branch per click.
+    let mut n = 0usize;
+    for r in kc {
+        let a = r.ca & 511;
+        let keep = (a < 16) & ((ids >> (a & 15)) & 1 != 0);
+        let at = n.min(FEW);
+        *f.ts.get_unchecked_mut(at) = r.ts;
+        *f.camp.get_unchecked_mut(at) = r.ca >> 9;
+        *f.j.get_unchecked_mut(at) = r.j;
+        n += keep as usize;
+    }
+    if n > FEW {
+        return false;
+    }
+    for i in 0..FEW {
+        let pad = i >= n;
+        let ts = if pad { u32::MAX } else { f.ts[i] };
+        f.ts[i] = ts;
+        f.tw[i] = if pad { 0 } else { ts.wrapping_add(WEEK) };
+    }
+    f.camp[FEW] = org;
+    f.n = n;
+    true
+}
+
+/// Credit and assists of one session for `few_pass_*`, given over the gathered clicks
+/// the mask of those in reach with no later one in reach (`tie`) and the mask of those
+/// in reach with no earlier one of the same campaign in reach (`first`). Adds the
+/// assists of the session's day `day` and returns the campaign it is credited to.
+#[inline(always)]
+unsafe fn few_session(f: &Few, tie: u32, mut first: u32, day: u32, acc: &Acc, cid: &impl Fn(u32) -> Id) -> u32 {
+    // No click in reach: place FEW, organic.
+    let mut camp = *f.camp.get_unchecked((tie | 1 << FEW).trailing_zeros() as usize);
+    if tie & tie.wrapping_sub(1) != 0 {
+        camp = few_tie(f, tie, cid);
+    }
+    while first != 0 {
+        let c = *f.camp.get_unchecked(first.trailing_zeros() as usize);
+        *acc.assist.add(((c as usize) << acc.wsh) + day as usize) += 1;
+        first &= first - 1;
+    }
+    camp
+}
+
+/// The campaign of the credited click among clicks at the same latest time (`tie`, two
+/// or more): the smallest click_id, the first in index order among equal ones, as
+/// `click_pass` picks it. The IDs are read only if the campaigns differ.
+#[cold]
+#[inline(never)]
+unsafe fn few_tie(f: &Few, tie: u32, cid: &impl Fn(u32) -> Id) -> u32 {
+    let mut best = tie.trailing_zeros() as usize;
+    let c0 = f.camp[best];
+    let mut rest = tie & (tie - 1);
+    let mut same = true;
+    while rest != 0 {
+        same &= f.camp[rest.trailing_zeros() as usize] == c0;
+        rest &= rest - 1;
+    }
+    if same {
+        return c0;
+    }
+    let mut rest = tie & (tie - 1);
+    while rest != 0 {
+        let i = rest.trailing_zeros() as usize;
+        if f.j[i] != f.j[best] && cid(f.j[i]).less(&cid(f.j[best])) {
+            best = i;
+        }
+        rest &= rest - 1;
+    }
+    f.camp[best]
+}
+
+/// Credit and assists of a person with few clicks (gathered in `f`, `f.n` > 0) and `m`
+/// sessions with starts `st` and days `day`: each session's campaign goes to `out`, its
+/// assists to `acc`. Per session, over all clicks at once: those in reach (at or before
+/// the start, within 7 days), of them those with no later one in reach (the credited
+/// click, or a tie) and those with no earlier one of the same campaign in reach (one
+/// assist each). Per person, per click: the clicks later than it, and the earlier ones
+/// of its campaign.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+unsafe fn few_pass_wide(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, cid: &impl Fn(u32) -> Id) {
+    use core::arch::x86_64::*;
+    let n = f.n;
+    let tsv = _mm512_loadu_si512(f.ts.as_ptr() as *const __m512i);
+    let twv = _mm512_loadu_si512(f.tw.as_ptr() as *const __m512i);
+    let cv = _mm512_loadu_si512(f.camp.as_ptr() as *const __m512i);
+    let valid = ((1u32 << n) - 1) as __mmask16;
+    // Lane i: bit k set if click k is later than click i (`later`), or is before it
+    // with the same campaign (`twin`).
+    let (mut later, mut twin) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+    for k in 0..n {
+        let bit = _mm512_set1_epi32(1 << k);
+        let lt = _mm512_cmplt_epu32_mask(tsv, _mm512_set1_epi32(*f.ts.get_unchecked(k) as i32));
+        later = _mm512_mask_or_epi32(later, lt, later, bit);
+        let above = valid & !(((2u32 << k) - 1) as __mmask16);
+        let eq = _mm512_mask_cmpeq_epi32_mask(above, cv, _mm512_set1_epi32(*f.camp.get_unchecked(k) as i32));
+        twin = _mm512_mask_or_epi32(twin, eq, twin, bit);
+    }
+    for j in 0..m {
+        let s = _mm512_set1_epi32(*st.add(j) as i32);
+        let r = _mm512_mask_cmpge_epu32_mask(_mm512_cmple_epu32_mask(tsv, s), twv, s);
+        let rv = _mm512_set1_epi32(r as i32);
+        let tie = r & !_mm512_mask_test_epi32_mask(r, later, rv);
+        let first = r & !_mm512_mask_test_epi32_mask(r, twin, rv);
+        *out.add(j) = few_session(f, tie as u32, first as u32, *day.add(j), acc, cid);
+    }
+}
+
+/// As `few_pass_wide`, a click at a time.
+unsafe fn few_pass_plain(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, cid: &impl Fn(u32) -> Id) {
+    let n = f.n;
+    let (mut later, mut twin) = ([0u32; FEW], [0u32; FEW]);
+    for k in 0..n {
+        for i in 0..FEW {
+            later[i] |= ((f.ts[k] > f.ts[i]) as u32) << k;
+            twin[i] |= ((i > k && f.camp[i] == f.camp[k]) as u32) << k;
+        }
+    }
+    for j in 0..m {
+        let s = *st.add(j);
+        let mut r = 0u32;
+        for i in 0..FEW {
+            r |= ((f.ts[i] <= s && f.tw[i] >= s) as u32) << i;
+        }
+        let (mut hl, mut ht) = (0u32, 0u32);
+        for i in 0..FEW {
+            hl |= ((later[i] & r != 0) as u32) << i;
+            ht |= ((twin[i] & r != 0) as u32) << i;
+        }
+        *out.add(j) = few_session(f, r & !hl, r & !ht, *day.add(j), acc, cid);
+    }
+}
+
+#[inline(always)]
+unsafe fn few_pass(f: &Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, out: *mut u32, wide: bool, cid: &impl Fn(u32) -> Id) {
+    #[cfg(target_arch = "x86_64")]
+    if wide {
+        return few_pass_wide(f, st, day, m, acc, out, cid);
+    }
+    let _ = wide;
+    few_pass_plain(f, st, day, m, acc, out, cid)
 }
 
 /// The rows are appended to columns that are not in cache: the lines the next few
@@ -1092,7 +1278,10 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     let m = ke - k;
     let words = m.div_ceil(64);
     let mut clicks = false;
-    if !kc.is_empty() {
+    // Few clicks (`few_pass`): none of the person's leaves every session organic.
+    let gathered = !kc.is_empty() && few_gather(&mut s.few, kc, ids, ctx.organic);
+    let few = gathered && s.few.n != 0;
+    if !kc.is_empty() && !gathered {
         s.st.clear();
         put(&mut s.st, bk.st.as_ptr().add(k), m);
         clicks = click_setup(s, ctx, kc, ids, m, words, wide, &cid);
@@ -1139,7 +1328,16 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
     rw.n = n0 + nr;
     // Credit: without clicks every session is organic, counted a row at a time.
     let org = ctx.organic;
-    if clicks {
+    if few {
+        s.camp.clear();
+        s.camp.reserve(m);
+        let cp = s.camp.as_mut_ptr();
+        let day = bk.day.as_ptr().add(k);
+        few_pass(&s.few, bk.st.as_ptr().add(k), day, m, acc, cp, wide, &cid);
+        for j in 0..m {
+            *acc.sess.add(((*cp.add(j) as usize) << wsh) + *day.add(j) as usize) += 1;
+        }
+    } else if clicks {
         s.camp.clear();
         s.camp.reserve(m);
         let cp = s.camp.as_mut_ptr();
@@ -1182,13 +1380,13 @@ unsafe fn person_bulk(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
         let rev = *bk.pr.get_unchecked(qq);
         if rev > 0 {
             let j = *bk.ps.get_unchecked(qq) as usize;
-            let camp = if clicks { *s.camp.as_ptr().add(j - k) } else { org };
+            let camp = if clicks || few { *s.camp.as_ptr().add(j - k) } else { org };
             let cell = ((camp as usize) << wsh) + *bk.day.get_unchecked(j) as usize;
             *acc.purch.add(cell) += 1;
             *acc.rev.add(cell) += rev;
         }
     }
-    assists(s, acc, words, clicks, !kc.is_empty());
+    assists(s, acc, words, clicks, !kc.is_empty() && !gathered);
 }
 
 /// Appends `n` values from `src` to `v`; up to eight are copied as one block (`src`
@@ -2140,6 +2338,122 @@ mod tests {
                 assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round} wide {wide}");
                 assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
                 assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
+            }
+        }
+    }
+
+    #[test]
+    fn few_clicks_match_the_click_pass() {
+        // `person_rows` with few clicks (`few_pass`) against the same person with the
+        // click pass: 65 more clicks of an alias not in `allowed` change nothing but
+        // take `kc` over `GATHER`. Both against the general pipeline's person().
+        let cats: Vec<Vec<u8>> = [&b"apparel"[..], b"books", b"garden"].iter().map(|c| c.to_vec()).collect();
+        let ctx = ctx(&cats);
+        let cells = (ctx.organic as usize + 1) * ctx.ndays;
+        let mut r = Rnd(0x7e57_c11c_5eed_0042);
+        let x = Tls::new(64, 0, &ctx);
+        let wides: &[bool] = if wide_ok() { &[false, true] } else { &[false] };
+        let allowed = 0b1101u32;
+        for round in 0..20_000 {
+            // Sessions: 1 to 300, over 30 minutes from the last event before, all in the
+            // 14-day window; one to three events each.
+            let m = match round % 50 {
+                0 => 300,
+                1 => 1 + r.below(300) as usize,
+                _ => 1 + r.below(12) as usize,
+            };
+            let room = (14 * DAY as u64 - 1 - m as u64 * (MIN30 as u64 + 3001)) / m as u64;
+            let room = if round % 3 == 0 { room.min(4 * 3_600_000) } else { room };
+            let mut ev: Vec<(u32, u32)> = Vec::new();
+            let mut t = WEEK as u64 + r.below(room + 1);
+            for _ in 0..m {
+                for e in 0..1 + r.below(3) {
+                    let pc = if r.below(4) == 0 { (1 + r.below(900) as u32) | ((r.below(3) as u32) << 24) } else { 0 };
+                    ev.push((t as u32 + e as u32 * 1000, pc));
+                }
+                t += MIN30 as u64 + 3001 + r.below(room + 1);
+            }
+            let (st, _, sn, pur) = sessions(&ev);
+            assert_eq!(st.len(), m);
+            // Clicks: 0 to 70 in the index, some of other aliases; few campaigns, so
+            // campaigns repeat within reach.
+            let nk = match round % 10 {
+                0 => r.below(71) as usize,
+                1 => 17 + r.below(4) as usize,
+                _ => r.below(19) as usize,
+            };
+            let wide_camps = r.below(2) == 0;
+            let ncamp = 1 + r.below(if wide_camps { ctx.organic as u64 } else { 4 });
+            let mut ids: Vec<Id> = Vec::new();
+            let mut kc: Vec<Kc> = Vec::new();
+            while kc.len() < nk {
+                let s0 = st[r.below(m as u64) as usize];
+                let ts = match r.below(9) {
+                    0 => s0,
+                    1 => s0 + 1,
+                    2 => s0 - WEEK,
+                    3 => s0 - WEEK - 1,
+                    4 => s0 - 1,
+                    5 => s0 - r.below(WEEK as u64) as u32,
+                    6 => r.below((22 * DAY) as u64) as u32,
+                    _ => s0 - r.below(3_600_000) as u32,
+                };
+                let camp = r.below(ncamp) as u32;
+                let alias = match r.below(10) {
+                    0 => 1,
+                    1 => 16 + r.below(300) as u32,
+                    _ => [0, 2, 3][r.below(3) as usize],
+                };
+                let id = Id::intern(format!("k{}", r.below(1_000_000)).as_bytes());
+                kc.push(Kc { ts, ca: (camp << 9) | alias, j: ids.len() as u32 });
+                ids.push(id);
+                match r.below(8) {
+                    // A copy of the click (same time, campaign and ID).
+                    0 => {
+                        kc.push(Kc { ts, ca: (camp << 9) | alias, j: ids.len() as u32 });
+                        ids.push(id);
+                    }
+                    // Another click at the same instant: another ID, maybe another campaign.
+                    1 => {
+                        let other = Id::intern(format!("k{}", r.below(1_000_000)).as_bytes());
+                        kc.push(Kc { ts, ca: (r.below(ncamp) as u32) << 9 | alias, j: ids.len() as u32 });
+                        ids.push(other);
+                    }
+                    _ => {}
+                }
+            }
+            let mut padded = kc.clone();
+            for _ in 0..65 {
+                padded.push(Kc { ts: st[0], ca: 1 << 9 | 1, j: 0 });
+            }
+            let name = user_text(r.below(1 << 40));
+            let mut want = CS::new(cells);
+            let evs: Vec<u64> = ev.iter().map(|e| ((e.0 as u64) << 32) | e.1 as u64).collect();
+            let mut cl: Vec<Clk> = kc
+                .iter()
+                .filter(|k| (k.ca & 511) < 16 && (allowed >> (k.ca & 511)) & 1 != 0)
+                .map(|k| Clk { ts: k.ts, camp: k.ca >> 9, cid: ids[k.j as usize] })
+                .collect();
+            cl.sort_by_key(|c| c.ts);
+            crate::person(&mut want, name, &evs, &cl, &ctx);
+            for &wide in wides {
+                for list in [&kc, &padded] {
+                    let mut got = CS::new(cells);
+                    let mut s = Scr { st: st.clone(), sn: sn.clone(), pur: pur.clone(), ..Scr::default() };
+                    unsafe {
+                        person_rows(&mut got, &x.acc, &ctx, name, &mut s, list, allowed, wide, |j| ids[j as usize]);
+                        fold_counts(&x.acc, &mut got, &ctx);
+                        let rows = (ctx.organic as usize + 1) << x.acc.wsh;
+                        std::ptr::write_bytes(x.acc.rev, 0, rows);
+                        std::ptr::write_bytes(x.acc.sess, 0, rows);
+                        std::ptr::write_bytes(x.acc.assist, 0, rows);
+                        std::ptr::write_bytes(x.acc.purch, 0, rows);
+                    }
+                    let path = list.len();
+                    assert_eq!(got.rows.n, want.rows.n, "round {round} wide {wide} clicks {path}");
+                    assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide} clicks {path}");
+                    assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide} clicks {path}");
+                }
             }
         }
     }
