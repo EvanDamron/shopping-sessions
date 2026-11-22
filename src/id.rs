@@ -195,6 +195,41 @@ impl Id {
             h.write(b);
             h.finish()
         };
+        Id::intern_long(b, h)
+    }
+
+    /// What `intern` computes first for a long ID: the hash of its `len` bytes at
+    /// `p`, read eight at a time (reads up to 7 bytes past the end).
+    #[inline(always)]
+    pub unsafe fn long_hash(p: *const u8, len: usize) -> u64 {
+        let mut x = K3 ^ len as u64;
+        let mut i = 0;
+        while i + 8 <= len {
+            x = mum(x ^ (p.add(i) as *const u64).read_unaligned(), K1);
+            i += 8;
+        }
+        if i < len {
+            let w = (p.add(i) as *const u64).read_unaligned() & (u64::MAX >> (8 * (8 - (len - i))));
+            x = mum(x ^ w, K1);
+        }
+        x
+    }
+
+    /// Starts loading the long-ID table slot a lookup with hash `h` reads first.
+    #[inline(always)]
+    pub fn prefetch_long(h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(t) = LTAB.get() {
+            unsafe { core::arch::x86_64::_mm_prefetch(t.slots.as_ptr().add((h as usize) & t.mask) as *const i8, core::arch::x86_64::_MM_HINT_T0) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = h;
+    }
+
+    /// `intern` for an ID of more than 15 bytes whose `long_hash` is `h`.
+    #[inline(never)]
+    pub fn intern_long(b: &[u8], h: u64) -> Id {
+        debug_assert!(b.len() > 15);
         if let Some(p) = intern_table(b, h) {
             return Id { lo: p as u64, hi: 0xFF << 56 };
         }

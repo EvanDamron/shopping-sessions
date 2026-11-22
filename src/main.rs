@@ -15,6 +15,8 @@
 mod dec;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 mod decc;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod dec5;
 mod fast;
 mod id;
 mod links;
@@ -370,6 +372,7 @@ struct Shared<'a> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
     decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
+    dec5: bool,     // the per-line decoders for opaque IDs (dec5.rs), without the fast path
 }
 
 /// Per bucket: records so far, and where the current chunk starts.
@@ -407,6 +410,8 @@ struct Worker {
     nodd: u64,      // lines whose IDs took the general path
     ncold: u64,     // event lines the per-line decoder handed to the plain reading
     nccold: u64,    // click lines the click-line decoder handed to the plain reading
+    nfast: u64,     // event lines the v5 decoder (dec5.rs) took on its fast path
+    ncfast: u64,    // click lines it took on its fast path
 }
 
 impl Worker {
@@ -437,6 +442,8 @@ impl Worker {
             nodd: 0,
             ncold: 0,
             nccold: 0,
+            nfast: 0,
+            ncfast: 0,
         }
     }
 
@@ -1201,6 +1208,7 @@ fn phase_a<'a>(
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         decc: (fx.is_some() && envn("SS_DEC") != Some(0) && envn("SS_DECC") != Some(0)).then(|| decc::DecC::new(lk)),
         deccheck: envn("SS_DECCHECK") == Some(1),
+        dec5: cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")) && fx.is_none() && envn("SS_DEC5") != Some(0),
         fx,
     };
     assert!((ebytes / 34 + ((nthreads * pb + 1) * PCH) as u64) < u32::MAX as u64);
@@ -1213,7 +1221,7 @@ fn phase_a<'a>(
     // The per-line decoders read the files straight from their mappings, prefetching
     // a few lines ahead (SS_MMAP=0: through the read buffer, as the indexed path does).
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-    let mapped = sh.dec.is_some() && envn("SS_MMAP") != Some(0);
+    let mapped = (sh.dec.is_some() || sh.dec5) && envn("SS_MMAP") != Some(0);
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
     let mapped = false;
     let maps = |files: &[(File, u64)]| -> Vec<Option<scan::Mapped>> {
@@ -1250,6 +1258,23 @@ fn phase_a<'a>(
                         }
                         let (is_event, f, a, b) = tasks[t];
                         match (is_event, fast) {
+                            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+                            (_, false) if sh.dec5 => {
+                                let go = |d: *const u8, s: usize, n: usize| unsafe {
+                                    if !sh.links.full.load(Relaxed) {
+                                        if is_event {
+                                            dec5::events(sh, w, d, s, n);
+                                        } else {
+                                            dec5::clicks(sh, w, d, s, n);
+                                        }
+                                        if w.added >= 256 {
+                                            sh.links.added(&mut w.added);
+                                        }
+                                    }
+                                };
+                                let (fs, ms) = if is_event { (event_files, &emaps) } else { (click_files, &cmaps) };
+                                decode(&mut rd, &fs[f].0, ms[f].as_ref(), a, b, bufsz, go);
+                            }
                             (true, false) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (true, true) if sh.dec.is_some() => {
@@ -1313,6 +1338,16 @@ fn phase_a<'a>(
         return None;
     }
     log(&format!("phase A parsed ({pb} person buckets, {db} key buckets)"));
+    if sh.dec5 {
+        let sum = |f: fn(&Worker) -> u64| -> u64 { workers.iter().map(f).sum() };
+        log(&format!(
+            "dec5: event lines {} fast, {} plain; click lines {} fast, {} plain",
+            sum(|w| w.nfast),
+            sum(|w| w.ncold),
+            sum(|w| w.ncfast),
+            sum(|w| w.nccold)
+        ));
+    }
     if envn("SS_STOP") == Some(1) {
         std::process::exit(0); // test hook: time the parse alone
     }
