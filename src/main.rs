@@ -1698,7 +1698,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
 /// Starts a person's user_id dictionary entry; `flush` then appends that person's
 /// rows, which must follow consecutively.
 #[inline]
-pub fn begin_person(st: &mut CS, name: Id) {
+pub(crate) fn begin_person(st: &mut CS, name: Id) {
     let r = &mut st.rows;
     let nb = name.bytes();
     r.dict.extend_from_slice(&(nb.len() as u32).to_le_bytes());
