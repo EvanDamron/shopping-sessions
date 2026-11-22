@@ -79,6 +79,16 @@ impl Links {
         prefetch(unsafe { self.tab.add((h >> self.shift) as usize) });
     }
 
+    /// As `prefetch`, and the slot after it too: a lookup that does not stop at its
+    /// first slot reads the next one, which is in the next cache line for every
+    /// other slot.
+    #[inline(always)]
+    pub fn prefetch2(&self, h: u64) {
+        let i = (h >> self.shift) as usize;
+        prefetch(unsafe { self.tab.add(i) });
+        prefetch(unsafe { self.tab.add((i + 1) & self.mask) });
+    }
+
     /// Starts loading slot `i`.
     #[inline(always)]
     pub fn prefetch_slot(&self, i: u32) {

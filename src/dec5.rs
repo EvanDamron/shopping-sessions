@@ -300,6 +300,8 @@ struct EBatch {
     long: [(u32, u32, u32); ROWS], // valid rows with a long user ID: (row, field start, length)
     lsx: [usize; ROWS], // well-formed lines of the batch: start
     cmx: [u64; ROWS],   // and structure (`structure`)
+    pend: [Pending; ROWS], // valid rows with a long user ID from the batch before
+    npend: usize,
 }
 
 impl EBatch {
@@ -321,7 +323,7 @@ impl EBatch {
 
 thread_local! {
     static EB: std::cell::RefCell<Box<EBatch>> = std::cell::RefCell::new(EBatch::new());
-    static CB: std::cell::RefCell<CBatch> = std::cell::RefCell::new(CBatch::new());
+    static CB: std::cell::RefCell<Box<CBatch>> = std::cell::RefCell::new(CBatch::new());
 }
 
 /// Event lines `d[s..e]` (whole lines, 64 readable bytes before and at least 192
@@ -360,34 +362,61 @@ unsafe fn cold_event_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) 
     le + 1
 }
 
-/// The structure of the event line of `len` (< 128) bytes at p, packed: its six
-/// commas (bytes 0 to 5), its length (byte 6) and which of its seven fields are
-/// quoted (bits 56 to 62); None for a malformed line (another comma count, or a
-/// quote anywhere but around a whole field).
+/// `(1 << len) - 1` for `len` below 128, as (low, high) words.
+static LM2: [[u64; 2]; 128] = {
+    let mut t = [[0u64; 2]; 128];
+    let mut i = 0;
+    while i < 128 {
+        let m = (1u128 << i) - 1;
+        t[i] = [m as u64, (m >> 64) as u64];
+        i += 1;
+    }
+    t
+};
+
+/// The structure of a line of `len` (< 128) bytes from its comma and quote masks,
+/// packed: its K commas (bytes 0 to K - 1), its length (byte 6) and which of its
+/// fields are quoted (bits 56 and up); None for a malformed line (another comma
+/// count, or a quote anywhere but around a whole field). Worked on the two 64-bit
+/// halves of the line with the carries between them written out.
 #[inline(always)]
-unsafe fn structure(c: [u64; 2], q: [u64; 2], len: usize) -> Option<u64> {
-    let lm = *LM.get_unchecked(len);
-    let c = (c[0] as u128 | ((c[1] as u128) << 64)) & lm;
-    let q = (q[0] as u128 | ((q[1] as u128) << 64)) & lm;
-    let sp = c | lm.wrapping_add(1);
-    let starts = ((sp << 1) | 1) & lm.wrapping_add(lm).wrapping_add(1); // field starts, at most `len`
-    let open = q & starts;
-    let close = q & (sp >> 1);
-    let ends_open = (!sp).wrapping_add(open) & sp;
-    let bad = (q ^ (open | close)) | (open & close) | (ends_open ^ (close << 1));
-    if (c.count_ones() != 6) | (bad != 0) {
+unsafe fn structure<const K: usize>(c: [u64; 2], q: [u64; 2], len: usize) -> Option<u64> {
+    let [ml, mh] = *LM2.get_unchecked(len);
+    let (cl, ch) = (c[0] & ml, c[1] & mh);
+    let (ql, qh) = (q[0] & ml, q[1] & mh);
+    // Separators: the commas and the newline at `len`.
+    let long = ((ml as i64) >> 63) as u64; // all ones when len >= 64
+    let (spl, sph) = (cl | ml.wrapping_add(1), ch | (mh.wrapping_add(1) & long));
+    // A quote may only open a field (right after a separator or at the line start)
+    // or close one (right before a separator); no quote does both, and a field that
+    // has an opening quote has a closing one (the opening quote, carried up to the
+    // separator that ends its field, lands right after a closing quote).
+    let (stl, sth) = ((cl << 1) | 1, (ch << 1) | (cl >> 63)); // field starts
+    let (ol, oh) = (ql & stl, qh & sth);
+    let (xl, xh) = (ql & ((spl >> 1) | (sph << 63)), qh & (sph >> 1));
+    let (al, carry) = (!spl).overflowing_add(ol);
+    let ah = (!sph).wrapping_add(oh).wrapping_add(carry as u64);
+    let (el, eh) = (al & spl, ah & sph);
+    let (x2l, x2h) = (xl << 1, (xh << 1) | (xl >> 63));
+    let bad = (ql ^ (ol | xl)) | (qh ^ (oh | xh)) | (ol & xl) | (oh & xh) | (el ^ x2l) | (eh ^ x2h);
+    let na = cl.count_ones();
+    if (na + ch.count_ones() != K as u32) | (bad != 0) {
         return None;
     }
-    let mut m = c;
-    let mut x = (len as u64) << 48;
-    for k in 0..6 {
-        x |= (m.trailing_zeros() as u64) << (8 * k);
+    // Comma positions as bytes: those of the low half, then those of the high half.
+    let (mut m, mut plo) = (cl, 0u64);
+    let (mut n, mut phi) = (ch, 0u64);
+    for k in 0..K {
+        plo |= (m.trailing_zeros() as u64) << (8 * k);
         m &= m.wrapping_sub(1);
+        phi |= (n.trailing_zeros() as u64) << (8 * k);
+        n &= n.wrapping_sub(1);
     }
+    let pos = _bzhi_u64(plo, 8 * na) | ((phi + 0x4040_4040_4040_4040) << (8 * na));
+    let pos = _bzhi_u64(pos, 8 * K as u32);
     // Quoted fields: the opening quotes, gathered from the field starts.
-    let (sl, sh) = (starts as u64, (starts >> 64) as u64);
-    let fq = _pext_u64(open as u64, sl) | (_pext_u64((open >> 64) as u64, sh) << sl.count_ones());
-    Some(x | (fq << 56))
+    let fq = _pext_u64(ol, stl) | (_pext_u64(oh, sth) << stl.count_ones());
+    Some(pos | ((len as u64) << 48) | (fq << 56))
 }
 
 #[inline(always)]
@@ -414,7 +443,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             }
             let lp = ls;
             ls += len + 1;
-            if let Some(x) = structure(c, q, len) {
+            if let Some(x) = structure::<6>(c, q, len) {
                 *bt.lsx.get_unchecked_mut(nv) = lp;
                 *bt.cmx.get_unchecked_mut(nv) = x;
                 nv += 1;
@@ -463,7 +492,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 let uid = Id::short(p.add(s1), ulen);
                 let h = uid.hash();
                 if ok {
-                    sh.links.prefetch(h);
+                    sh.links.prefetch2(h);
                 }
                 *bt.ulo.get_unchecked_mut(n) = uid.lo;
                 *bt.uhi.get_unchecked_mut(n) = uid.hi;
@@ -482,17 +511,22 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             *bt.ok.get_unchecked_mut(n) = ok as u8;
             n += 1;
         }
-        // Long user IDs of valid rows: interned (their table slots were prefetched),
-        // then their person's table line prefetched.
-        for &(row, at, len) in bt.long.get_unchecked(..nlong) {
-            let row = row as usize;
-            let uid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.uh.get_unchecked(row));
-            let h = uid.hash();
-            *bt.ulo.get_unchecked_mut(row) = uid.lo;
-            *bt.uhi.get_unchecked_mut(row) = uid.hi;
-            *bt.uh.get_unchecked_mut(row) = h;
-            sh.links.prefetch(h);
+        // Valid rows with a long user ID wait one batch: their interned strings are
+        // prefetched now (the table slots were, during pass 2), they are interned
+        // at the start of the next batch's filing and filed at its end, after their
+        // person's table line had time to arrive. (With the self-check on, at once.)
+        for &(row, _, _) in bt.long.get_unchecked(..nlong) {
+            Id::prefetch_long_string(*bt.uh.get_unchecked(row as usize));
         }
+        let np = bt.npend;
+        for i in 0..np {
+            let pr = bt.pend.get_unchecked_mut(i);
+            let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
+            pr.uid = uid;
+            pr.uh = uid.hash();
+            sh.links.prefetch2(pr.uh);
+        }
+        let mut li = 0usize;
         for j in 0..n {
             let bucket = (*bt.kb.get_unchecked(j) >> sh.dshift) as usize;
             let ti = *bt.ti.get_unchecked(j);
@@ -502,16 +536,81 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 w.push_key(sh, bucket, kid, ing | NOSLOT as u64);
                 continue;
             }
+            if li < nlong && bt.long.get_unchecked(li).0 as usize == j {
+                li += 1;
+                continue; // a long user ID: filed later
+            }
             let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
             let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
             w.push_key(sh, bucket, kid, ing | slot as u64);
+        }
+        for i in 0..np {
+            let pr = *bt.pend.get_unchecked(i);
+            file_pending(sh, w, &pr);
+        }
+        // This batch's long rows become the pending ones.
+        for (i, &(row, at, len)) in bt.long.get_unchecked(..nlong).iter().enumerate() {
+            let j = row as usize;
+            *bt.pend.get_unchecked_mut(i) = Pending {
+                kid: *bt.kid.get_unchecked(j),
+                kb: *bt.kb.get_unchecked(j),
+                ti: *bt.ti.get_unchecked(j),
+                uh: *bt.uh.get_unchecked(j),
+                uid: Id::EMPTY,
+                pc: *bt.pc.get_unchecked(j),
+                at,
+                len,
+            };
+        }
+        bt.npend = nlong;
+        if sh.deccheck {
+            // Resolve this batch's long rows now, so the check sees their IDs.
+            for i in 0..nlong {
+                let pr = bt.pend.get_unchecked_mut(i);
+                let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
+                let row = bt.long.get_unchecked(i).0 as usize;
+                *bt.ulo.get_unchecked_mut(row) = uid.lo;
+                *bt.uhi.get_unchecked_mut(row) = uid.hi;
+            }
         }
         w.nfast += n as u64;
         if sh.deccheck {
             check_batch_events(sh, d, first, ls, bt, n);
         }
     }
+    // The piece ends: the pending rows are filed now (their bytes are in it).
+    for i in 0..bt.npend {
+        let pr = bt.pend.get_unchecked_mut(i);
+        let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
+        pr.uid = uid;
+        pr.uh = uid.hash();
+        let pr = *pr;
+        file_pending(sh, w, &pr);
+    }
+    bt.npend = 0;
+}
+
+/// A valid event row with a long user ID, waiting to be filed.
+#[derive(Clone, Copy)]
+struct Pending {
+    kid: u64,
+    kb: u64,
+    ti: u64,
+    uh: u64, // the hash of the ID's bytes; once interned, the ID's table hash
+    uid: Id,
+    pc: u32,
+    at: u32,
+    len: u32,
+}
+
+/// Files a pending row (its ID interned) as `crate::events` files a valid event.
+#[inline(always)]
+unsafe fn file_pending(sh: &Shared, w: &mut Worker, pr: &Pending) {
+    let bucket = (pr.kb >> sh.dshift) as usize;
+    let who = sh.links.person(pr.uid, pr.uh, &mut w.added);
+    let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: pr.ti as u32, pc: pr.pc });
+    w.push_key(sh, bucket, pr.kid, (pr.ti & !0xFFFF_FFFF) | slot as u64);
 }
 
 /// Test hook: a row the decoder made, against the plain reading of its line.
@@ -558,18 +657,78 @@ unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: 
 }
 
 /// Rows of a click batch.
+#[repr(C, align(64))]
 struct CBatch {
-    r: Vec<CRow>,
-    uh: Vec<u64>,
-    lu: Vec<(u32, u32, u8)>, // rows with a long user ID: (row, field start, length)
-    lc: Vec<(u32, u32, u8)>, // rows with a long click ID
-    nl: Vec<u32>,
+    ulo: [u64; ROWS],
+    uhi: [u64; ROWS],
+    uh: [u64; ROWS],
+    clo: [u64; ROWS],
+    chi: [u64; ROWS],
+    tc: [u64; ROWS], // ts | campaign << 32
+    lu: [(u32, u32, u32); ROWS], // rows with a long user ID: (row, field start, length)
+    lc: [(u32, u32, u32); ROWS], // rows with a long click ID
+    lsx: [usize; ROWS],
+    cmx: [u64; ROWS],
 }
 
 impl CBatch {
-    fn new() -> CBatch {
-        CBatch { r: Vec::with_capacity(STRETCH), uh: Vec::with_capacity(STRETCH), lu: Vec::with_capacity(STRETCH), lc: Vec::with_capacity(STRETCH), nl: vec![0; STRETCH + 8] }
+    fn new() -> Box<CBatch> {
+        unsafe { Box::new(std::mem::zeroed()) }
     }
+    fn row(&self, j: usize) -> CRow {
+        CRow {
+            uid: Id { lo: self.ulo[j], hi: self.uhi[j] },
+            ts: self.tc[j] as u32,
+            camp: (self.tc[j] >> 32) as u32,
+            cid: Id { lo: self.clo[j], hi: self.chi[j] },
+        }
+    }
+}
+
+/// Campaign index by number, for the campaigns named `c_` + a number written
+/// without leading zeros (u32::MAX: no such campaign); built once from the lookups.
+static CAMPS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+fn camps(sh: &Shared) -> &'static [u32] {
+    CAMPS.get_or_init(|| {
+        let mut t = Vec::new();
+        for (id, v) in sh.lk.campaigns.entries() {
+            let b = id.bytes();
+            if b.len() < 3 || b.len() > 9 || &b[..2] != b"c_" || !b[2..].iter().all(u8::is_ascii_digit) || (b[2] == b'0' && b.len() > 3) {
+                continue;
+            }
+            let n = b[2..].iter().fold(0usize, |n, &c| n * 10 + (c - b'0') as usize);
+            if n >= t.len() {
+                t.resize(n + 1, u32::MAX);
+            }
+            t[n] = v;
+        }
+        t
+    })
+}
+
+/// The campaign of the field `[s, e)` of the line at p, as `lk.campaigns.get` gives
+/// it: a field `c_` + 1 to 7 digits without a leading zero is looked up by number,
+/// anything else in the map.
+#[inline(always)]
+unsafe fn campaign(sh: &Shared, tab: &[u32], p: *const u8, s: usize, e: usize) -> Option<u32> {
+    let n = e - s;
+    let nd = n.wrapping_sub(2);
+    if (nd.wrapping_sub(1) < 7) && ((p.add(s) as *const u16).read_unaligned() == u16::from_le_bytes(*b"c_")) && ((*p.add(s + 2) != b'0') | (nd == 1)) {
+        // The digits are the top `nd` bytes of the 8 that end at e; '0's fill the rest.
+        let keep = u64::MAX << (8 * (8 - nd));
+        let w = ((p.add(e - 8) as *const u64).read_unaligned() & keep) | (0x3030_3030_3030_3030 & !keep);
+        let x = w ^ 0x3030_3030_3030_3030;
+        if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 == 0 {
+            let v = x.wrapping_mul(10).wrapping_add(x >> 8);
+            let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+                .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32)));
+            let num = (v >> 32) as usize;
+            let c = *tab.get(num).unwrap_or(&u32::MAX);
+            return (c != u32::MAX).then_some(c);
+        }
+    }
+    sh.lk.campaigns.get(Id::field(p, s, e))
 }
 
 /// Click lines `d[s..e]`: every line parsed and filed as `crate::clicks` files it.
@@ -578,118 +737,144 @@ pub(crate) unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, s: usize,
     CB.with(|b| clicks_in(sh, w, d, s, e, &mut b.borrow_mut()));
 }
 
+/// The plain reading of the click line at `ls` whose newline the window did not
+/// reach; returns where the next line starts.
+#[cold]
+#[inline(never)]
+unsafe fn cold_click_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) -> usize {
+    let mut le = ls + 128;
+    while *d.add(le) != b'\n' {
+        le += 1;
+    }
+    cold_click(sh, w, d, ls, le);
+    le + 1
+}
+
 #[inline(always)]
 unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut CBatch) {
     let win = &sh.win;
-    let mut a = s;
-    while a < end {
-        let b = (a + STRETCH).min(end);
-        let nn = newlines(d, a, b, bt.nl.as_mut_ptr(), 0);
-        let nlp = bt.nl.as_ptr();
-        let (nn, b) = if nn > 0 && *nlp.add(nn - 1) as usize == b - 1 {
-            (nn, b)
-        } else {
-            let mut le = b;
-            while *d.add(le) != b'\n' {
-                le += 1;
-            }
-            *bt.nl.as_mut_ptr().add(nn) = le as u32;
-            (nn + 1, le + 1)
-        };
-        let nlp = bt.nl.as_ptr();
-        bt.r.clear();
-        bt.uh.clear();
-        bt.lu.clear();
-        bt.lc.clear();
-        let mut ls = a;
-        for k in 0..nn {
-            let le = *nlp.add(k) as usize;
-            let len = le - ls;
+    let tab = camps(sh);
+    let mut ls = s;
+    while ls < end {
+        let first = ls;
+        // ---- Pass 1: line structure.
+        let mut nv = 0usize;
+        let mut nl = 0usize;
+        while ls < end && nl < BATCH {
+            nl += 1;
             let p = d.add(ls);
+            _mm_prefetch(p.add(AHEAD) as *const i8, _MM_HINT_T0);
+            let (c, q, nm) = masks3(p);
+            let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
+            let len = nm.trailing_zeros() as usize;
             if len >= 128 {
-                cold_click(sh, w, d, ls, le);
-                ls = le + 1;
+                ls = cold_click_from(sh, w, d, ls);
                 continue;
             }
-            let Some(f) = split_window::<4, 3>(p, len) else {
-                ls = le + 1;
-                continue;
-            };
-            let (s0, e0) = f[0];
-            let (s1, e1) = f[1];
+            let lp = ls;
+            ls += len + 1;
+            if let Some(x) = structure::<3>(c, q, len) {
+                *bt.lsx.get_unchecked_mut(nv) = lp;
+                *bt.cmx.get_unchecked_mut(nv) = x;
+                nv += 1;
+            }
+        }
+        // ---- Pass 2: fields.
+        let (mut n, mut nlu, mut nlc) = (0usize, 0usize, 0usize);
+        for j in 0..nv {
+            let lp = *bt.lsx.get_unchecked(j);
+            let x = *bt.cmx.get_unchecked(j);
+            let p = d.add(lp);
+            let cc = |k: u32| ((x >> (8 * k)) & 0xFF) as usize;
+            let qq = |k: u32| ((x >> (56 + k)) & 1) as usize;
+            let (c0, c1, c2, len) = (cc(0), cc(1), cc(2), cc(6));
+            let (s0, e0) = (qq(0), c0 - qq(0));
+            let (s1, e1) = (c0 + 1 + qq(1), c1 - qq(1));
             let (clen, ulen) = (e0 - s0, e1 - s1);
-            if clen == 0 || ulen == 0 {
-                ls = le + 1;
+            if (clen == 0) | (ulen == 0) {
                 continue;
             }
-            let Some(camp) = sh.lk.campaigns.get(Id::field(p, f[2].0, f[2].1)) else {
-                ls = le + 1;
+            let Some(camp) = campaign(sh, tab, p, c1 + 1 + qq(2), c2 - qq(2)) else {
                 continue;
             };
-            let t = win.ts_bl(p.add(f[3].0), f[3].1 - f[3].0);
+            let (s3, e3) = (c2 + 1 + qq(3), len - qq(3));
+            let t = win.ts_bl(p.add(s3), e3 - s3);
             if t as u64 >= win.span as u64 {
-                ls = le + 1;
                 continue;
             }
-            let row = bt.r.len() as u32;
-            let (uid, uh) = if ulen <= 15 {
+            if ulen <= 15 {
                 let uid = Id::short(p.add(s1), ulen);
                 let h = uid.hash();
-                sh.links.prefetch(h);
-                (uid, h)
+                sh.links.prefetch2(h);
+                *bt.ulo.get_unchecked_mut(n) = uid.lo;
+                *bt.uhi.get_unchecked_mut(n) = uid.hi;
+                *bt.uh.get_unchecked_mut(n) = h;
             } else {
                 let h = Id::long_hash(p.add(s1), ulen);
                 Id::prefetch_long(h);
-                bt.lu.push((row, (ls + s1) as u32, ulen as u8));
-                (Id::EMPTY, h)
-            };
-            let cid = if clen <= 15 {
-                Id::short(p.add(s0), clen)
+                *bt.uh.get_unchecked_mut(n) = h;
+                *bt.lu.get_unchecked_mut(nlu) = (n as u32, (lp + s1) as u32, ulen as u32);
+                nlu += 1;
+            }
+            if clen <= 15 {
+                let cid = Id::short(p.add(s0), clen);
+                *bt.clo.get_unchecked_mut(n) = cid.lo;
+                *bt.chi.get_unchecked_mut(n) = cid.hi;
             } else {
-                bt.lc.push((row, (ls + s0) as u32, clen as u8));
-                Id::prefetch_long(Id::long_hash(p.add(s0), clen));
-                Id::EMPTY
-            };
-            bt.r.push(CRow { uid, ts: t as u32, camp, cid });
-            bt.uh.push(uh);
-            ls = le + 1;
+                let h = Id::long_hash(p.add(s0), clen);
+                Id::prefetch_long(h);
+                *bt.clo.get_unchecked_mut(n) = h; // until interned
+                *bt.lc.get_unchecked_mut(nlc) = (n as u32, (lp + s0) as u32, clen as u32);
+                nlc += 1;
+            }
+            *bt.tc.get_unchecked_mut(n) = t as u32 as u64 | (camp as u64) << 32;
+            n += 1;
         }
-        for &(row, at, len) in bt.lu.iter() {
+        for &(row, at, len) in bt.lu.get_unchecked(..nlu) {
             let row = row as usize;
-            let r = bt.r.get_unchecked_mut(row);
-            r.uid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.uh.get_unchecked(row));
-            let h = r.uid.hash();
+            let uid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.uh.get_unchecked(row));
+            let h = uid.hash();
+            *bt.ulo.get_unchecked_mut(row) = uid.lo;
+            *bt.uhi.get_unchecked_mut(row) = uid.hi;
             *bt.uh.get_unchecked_mut(row) = h;
-            sh.links.prefetch(h);
+            sh.links.prefetch2(h);
         }
-        for &(row, at, len) in bt.lc.iter() {
-            let b = std::slice::from_raw_parts(d.add(at as usize), len as usize);
-            bt.r.get_unchecked_mut(row as usize).cid = Id::intern_long(b, Id::long_hash(b.as_ptr(), b.len()));
+        for &(row, at, len) in bt.lc.get_unchecked(..nlc) {
+            let row = row as usize;
+            let cid = Id::intern_long(std::slice::from_raw_parts(d.add(at as usize), len as usize), *bt.clo.get_unchecked(row));
+            *bt.clo.get_unchecked_mut(row) = cid.lo;
+            *bt.chi.get_unchecked_mut(row) = cid.hi;
         }
-        for j in 0..bt.r.len() {
-            let r = *bt.r.get_unchecked(j);
-            file_click(sh, w, &r, *bt.uh.get_unchecked(j));
+        for j in 0..n {
+            let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
+            let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
+            let tc = *bt.tc.get_unchecked(j);
+            let cid = Id { lo: *bt.clo.get_unchecked(j), hi: *bt.chi.get_unchecked(j) };
+            w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
         }
-        w.ncfast += bt.r.len() as u64;
+        w.ncfast += n as u64;
         if sh.deccheck {
-            check_batch_clicks(sh, d, a, nn, nlp, bt);
+            check_batch_clicks(sh, d, first, ls, bt, n);
         }
-        a = b;
     }
 }
 
-/// Test hook: every click line of a stretch against the plain reading.
+/// Test hook: every click line of a batch `d[a..b)` against the plain reading.
 #[cold]
 #[inline(never)]
-unsafe fn check_batch_clicks(sh: &Shared, d: *const u8, a: usize, nn: usize, nlp: *const u32, bt: &CBatch) {
+unsafe fn check_batch_clicks(sh: &Shared, d: *const u8, a: usize, b: usize, bt: &CBatch, n: usize) {
     let mut ls = a;
     let mut j = 0;
-    for k in 0..nn {
-        let le = *nlp.add(k) as usize;
+    while ls < b {
+        let mut le = ls;
+        while *d.add(le) != b'\n' {
+            le += 1;
+        }
         if le - ls < 128 {
             if let Some(p) = plain_fields::<4>(d, ls, le).and_then(|f| click_row(sh, d, &f)) {
-                if bt.r.get(j) != Some(&p) {
-                    eprintln!("click decoder differs from the plain reading on: {:?}\n  decoder {:?}\n  plain   {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(d.add(ls), le - ls)), bt.r.get(j), p);
+                let mine = (j < n).then(|| bt.row(j));
+                if mine != Some(p) {
+                    eprintln!("click decoder differs from the plain reading on: {:?}\n  decoder {:?}\n  plain   {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(d.add(ls), le - ls)), mine, p);
                     std::process::exit(3);
                 }
                 j += 1;
@@ -697,8 +882,8 @@ unsafe fn check_batch_clicks(sh: &Shared, d: *const u8, a: usize, nn: usize, nlp
         }
         ls = le + 1;
     }
-    if j != bt.r.len() {
-        eprintln!("click decoder kept {} rows of a stretch, the plain reading {}", bt.r.len(), j);
+    if j != n {
+        eprintln!("click decoder kept {} rows of a batch, the plain reading {}", n, j);
         std::process::exit(3);
     }
 }
