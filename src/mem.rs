@@ -84,6 +84,36 @@ pub unsafe fn stream(dst: *mut u8, src: *const u8, lines: usize) {
     std::ptr::copy_nonoverlapping(src, dst, lines * 64);
 }
 
+/// As `stream`, for a buffer whose last `T` 32-bit words are given in registers
+/// instead of read from `src` (`src` holds the rest; its tail is not read).
+/// Reading words just stored would wait for those stores to reach the cache, as a
+/// load is not forwarded from several smaller stores. `T` is 3 or 4.
+#[inline(always)]
+pub unsafe fn stream_tail<const T: usize>(dst: *mut u8, src: *const u8, lines: usize, tail: [u32; T]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        let last = lines * 2 - 1;
+        for i in 0..last {
+            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_load_si256(src.add(32 * i) as *const __m256i));
+        }
+        let mut t = [0u32; 8];
+        t[8 - T..].copy_from_slice(&tail);
+        let given = _mm256_loadu_si256(t.as_ptr() as *const __m256i);
+        let old = _mm256_load_si256(src.add(32 * last) as *const __m256i);
+        let v = if T == 3 { _mm256_blend_epi32::<0b1110_0000>(old, given) } else { _mm256_blend_epi32::<0b1111_0000>(old, given) };
+        _mm256_stream_si256(dst.add(32 * last) as *mut __m256i, v);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let w = src as *mut u32;
+        for (i, &x) in tail.iter().enumerate() {
+            *w.add(lines * 16 - T + i) = x;
+        }
+        stream(dst, src, lines);
+    }
+}
+
 /// Makes streaming stores visible to other threads' loads.
 #[inline(always)]
 pub fn stream_done() {
