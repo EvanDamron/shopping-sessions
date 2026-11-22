@@ -1237,9 +1237,14 @@ fn phase_a<'a>(
                             (true, false) => rd.run(&event_files[f].0, a, b, |rd| unsafe { events(sh, w, rd) }),
                             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
                             (true, true) if sh.dec.is_some() => {
+                                let asm = sh.dec.as_ref().is_some_and(|d| d.asm);
                                 let go = |d: *const u8, s: usize, n: usize| unsafe {
                                     if !sh.links.full.load(Relaxed) {
-                                        dec::events(sh, w, d, s, n);
+                                        if asm {
+                                            dec::events_a(sh, w, d, s, n);
+                                        } else {
+                                            dec::events(sh, w, d, s, n);
+                                        }
                                         if w.added >= 256 {
                                             sh.links.added(&mut w.added);
                                         }
