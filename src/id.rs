@@ -184,6 +184,27 @@ type LongMap = HashMap<&'static [u8], usize, std::hash::BuildHasherDefault<LongH
 const SHARDS: usize = 64;
 static LONG: [Mutex<Option<LongMap>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
 
+/// The 128 bits spelled by the 32 lowercase hexadecimal digits at p (each digit's
+/// value in turn, four bits each); None if any of the 32 bytes is not one.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    let dg = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8)); // '0'..'9' -> 0..9
+    let lt = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8)); // 'a'..'f' -> 0..5
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(dg, _mm256_set1_epi8(9)), dg);
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(lt, _mm256_set1_epi8(5)), lt);
+    if _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != -1 {
+        return None;
+    }
+    let val = _mm256_blendv_epi8(_mm256_add_epi8(lt, _mm256_set1_epi8(10)), dg, isd);
+    // Pairs of digits to bytes (first digit high), then the 16 bytes together.
+    let pairs = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0110));
+    let packed = _mm256_permute4x64_epi64(_mm256_packus_epi16(pairs, pairs), 0b1000);
+    Some((_mm256_extract_epi64::<0>(packed) as u64, _mm256_extract_epi64::<1>(packed) as u64))
+}
+
 impl Id {
     pub const EMPTY: Id = Id { lo: 0, hi: 0 };
 
@@ -299,10 +320,17 @@ impl Id {
     pub unsafe fn key(d: *const u8, s: usize, e: usize) -> Id {
         let len = e - s;
         if len <= 15 {
-            Id::short(d.add(s), len)
-        } else {
-            Id::hashed(std::slice::from_raw_parts(d.add(s), len))
+            return Id::short(d.add(s), len);
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if len == 33 && *d.add(s) == b'e' {
+            // `e` + 32 lowercase hexadecimal digits (the generator's long event IDs):
+            // the 128 bits they spell, a key that is distinct for distinct such IDs.
+            if let Some((lo, hi)) = hex32(d.add(s + 1)) {
+                return Id { lo, hi };
+            }
+        }
+        Id::hashed(std::slice::from_raw_parts(d.add(s), len))
     }
 
     /// The key of an event ID of more than 15 bytes: its bytes eight at a time (the
@@ -389,6 +417,36 @@ impl Id {
 #[cfg(test)]
 mod tests {
     use super::Id;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn hex_keys() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let digits = b"0123456789abcdef";
+        let mut seen = std::collections::HashMap::new();
+        for _ in 0..20_000 {
+            let mut t = [0u8; 64];
+            t[0] = b'e';
+            let mut want: u128 = 0;
+            for i in 0..32 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let d = (x % 16) as usize;
+                t[1 + i] = digits[d];
+                want = want << 4 | d as u128;
+            }
+            let k = unsafe { Id::key(t.as_ptr(), 0, 33) };
+            // Distinct hex strings give distinct keys.
+            assert_eq!(*seen.entry((k.lo, k.hi)).or_insert(want), want);
+            // Any byte that is not a lowercase hex digit falls back to the hashed key.
+            for bad in [b'g', b'A', b'F', b'/', b':', b'`', b' '] {
+                let mut u = t;
+                u[1 + (x % 32) as usize] = bad;
+                assert_eq!(unsafe { Id::key(u.as_ptr(), 0, 33) }, Id::hashed(&u[..33]));
+            }
+        }
+    }
 
     #[test]
     fn long_keys_as_before() {
