@@ -1225,7 +1225,7 @@ fn phase_a<'a>(
     nthreads: usize,
     envn: &dyn Fn(&str) -> Option<usize>,
     log: &dyn Fn(&str),
-) -> Option<(Shared<'a>, Vec<Worker>, usize, usize)> {
+) -> Option<(Shared<'a>, Vec<Worker>, usize, usize, Vec<Option<scan::Mapped>>)> {
     let [event_files, click_files, _] = files;
     let bufsz = envn("SS_BUF").unwrap_or(64 << 10);
     let task = envn("SS_TASK").unwrap_or(1 << 20) as u64;
@@ -1287,11 +1287,11 @@ fn phase_a<'a>(
     let left = |files: &[(File, u64)], events: bool| -> Vec<AtomicUsize> {
         (0..files.len()).map(|f| AtomicUsize::new(tasks.iter().filter(|t| t.0 == events && t.1 == f).count())).collect()
     };
-    let (eleft, cleft) = (left(event_files, true), left(click_files, false));
+    let eleft = left(event_files, true);
     tl::span(9, tsetup);
     {
         let next = AtomicUsize::new(0);
-        let (sh, tasks, next, emaps, cmaps, eleft, cleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft, &cleft);
+        let (sh, tasks, next, emaps, cmaps, eleft) = (&sh, &tasks, &next, &emaps, &cmaps, &eleft);
         std::thread::scope(|sc| {
             if let Some(f) = &sh.fx {
                 // The fast path's table of user numbers is only needed after phase A:
@@ -1374,9 +1374,12 @@ fn phase_a<'a>(
                             (false, true) => rd.run(&click_files[f].0, a, b, |rd| unsafe { clicks_x(sh, w, rd) }),
                         }
                         tl::span(if is_event { 6 } else { 7 }, ttask);
-                        let (maps, left) = if is_event { (emaps, eleft) } else { (cmaps, cleft) };
-                        if left[f].fetch_sub(1, Relaxed) == 1 {
-                            if let Some(m) = &maps[f] {
+                        // An event file's mapping is released by the thread that finishes its last
+                        // piece. Click files stay mapped until phase C is done: long click IDs point
+                        // into them and phase C's tie-breaks read them (a released mapping was
+                        // faulted back in there, then left for exit to tear down on one thread).
+                        if is_event && eleft[f].fetch_sub(1, Relaxed) == 1 {
+                            if let Some(m) = &emaps[f] {
                                 m.release();
                             }
                         }
@@ -1397,6 +1400,7 @@ fn phase_a<'a>(
         if let Some(f) = &sh.fx {
             f.release_part(0, 1);
         }
+        scan::release_maps_part(&cmaps, 0, 1);
         return None;
     }
     log(&format!("phase A parsed ({pb} person buckets, {db} key buckets)"));
@@ -1413,7 +1417,7 @@ fn phase_a<'a>(
     if envn("SS_STOP") == Some(1) {
         std::process::exit(0); // test hook: time the parse alone
     }
-    Some((sh, workers, pb, db))
+    Some((sh, workers, pb, db, cmaps))
 }
 
 fn main() {
@@ -1486,7 +1490,7 @@ fn main() {
     // check). Without it the general pipeline runs alone.
     // (The event stage keeps a campaign number in 23 bits.)
     let mut fast_on = envn("SS_FAST") != Some(0) && ncamp < 1 << 23;
-    let (sh, workers, pb, db, mut cs) = loop {
+    let (sh, workers, pb, db, mut cs, cmaps) = loop {
         let l = links.take().unwrap_or_else(|| make_links(&files, nthreads, scale, &envn, &log));
         let tfx = tl::now();
         let fx = if fast_on {
@@ -1513,6 +1517,7 @@ fn main() {
                     log(&format!("decoder: {ccold} click lines read the plain way"));
                     if odd * 20 > fit {
                         x.0.ev.release_part(0, 1);
+                        scan::release_maps_part(&x.4, 0, 1);
                         x.0.dk.release_part(0, 1);
                         x.0.ck.release_part(0, 1);
                         x.0.links.release_part(0, 1);
@@ -1521,7 +1526,7 @@ fn main() {
                         continue;
                     }
                 }
-                let (sh, mut workers, pb, db) = x;
+                let (sh, mut workers, pb, db, cmaps) = x;
                 let mut cs: Vec<CS> = (0..nthreads).map(|_| CS::new((ncamp + 1) * ctx.ndays)).collect();
                 // ---- Fast path: the event stage (stage.rs) turns the events filed by
                 // number into rows, run by run; what does not fit is filed for phases B
@@ -1533,6 +1538,7 @@ fn main() {
                     if !ok || full {
                         log(if full { "stage: ID table full, starting over" } else { "stage: events are not numbered user by user, starting over without the fast path" });
                         sh.ev.release_part(0, 1);
+                        scan::release_maps_part(&cmaps, 0, 1);
                         sh.dk.release_part(0, 1);
                         sh.ck.release_part(0, 1);
                         sh.links.release_part(0, 1);
@@ -1545,7 +1551,7 @@ fn main() {
                         continue;
                     }
                 }
-                break (sh, workers, pb, db, cs);
+                break (sh, workers, pb, db, cs, cmaps);
             }
             None => scale *= 4,
         }
@@ -1640,7 +1646,7 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
     {
-        let (sh, workers, ctx, ud, kills) = (&sh, &workers, &ctx, &ud, &kills);
+        let (sh, workers, ctx, ud, kills, cmaps) = (&sh, &workers, &ctx, &ud, &kills, &cmaps);
         // Largest buckets first, so a whale's bucket never starts last.
         let mut order: Vec<usize> = (0..pb).collect();
         order.sort_by_key(|&p| std::cmp::Reverse(workers.iter().map(|w| w.event_count(p) + w.click_count(p)).sum::<usize>()));
@@ -1689,6 +1695,7 @@ fn main() {
                     let tr = Instant::now();
                     sh.ev.release_part(ti, nthreads);
                     sh.ck.release_part(ti, nthreads);
+                    scan::release_maps_part(cmaps, ti, nthreads);
                     sh.links.release_part(ti, nthreads);
                     if let Some(f) = &sh.fx {
                         f.release_part(ti, nthreads);
