@@ -387,6 +387,7 @@ impl Reader {
 /// buffered reader.
 pub struct Mapped {
     p: *const u8,
+    len: usize,
     pub lo: u64,
     pub hi: u64,
 }
@@ -394,7 +395,9 @@ unsafe impl Send for Mapped {}
 unsafe impl Sync for Mapped {}
 
 impl Mapped {
-    /// None if the file cannot be mapped or is too small to have a zone.
+    /// None if the file cannot be mapped, is too small to have a zone, or has no
+    /// newline in its last page (then nothing says where its last whole line ends
+    /// without reading on, and the buffered reader takes all of it).
     pub fn new(f: &File, len: u64) -> Option<Mapped> {
         #[cfg(target_os = "linux")]
         unsafe {
@@ -408,10 +411,14 @@ impl Mapped {
                 return None;
             }
             let p = p as *const u8;
-            // The last newline of the file, if its last page has one.
-            let last = memrchr(b'\n', std::slice::from_raw_parts(p.add(len - 4096), 4096)).map(|k| len - 4096 + k);
-            let hi = last.map_or(len - 4096, |l| l.min(len - 4096)) as u64;
-            Some(Mapped { p, lo: 64, hi })
+            // Every position below `hi` has a newline at or after it, and at least a
+            // page of the file after it.
+            let Some(k) = memrchr(b'\n', std::slice::from_raw_parts(p.add(len - 4096), 4096)) else {
+                libc::munmap(p as *mut libc::c_void, len);
+                return None;
+            };
+            let hi = (len - 4096 + k).min(len - 4096) as u64;
+            Some(Mapped { p, len, lo: 64, hi })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -434,15 +441,7 @@ impl Mapped {
         }
         // Every position below `hi` has a newline at or after it (see `new`).
         unsafe {
-            let nl = |from: usize| -> usize {
-                let mut i = from;
-                loop {
-                    match memchr(b'\n', std::slice::from_raw_parts(self.p.add(i), 4096)) {
-                        Some(k) => return i + k,
-                        None => i += 4096,
-                    }
-                }
-            };
+            let nl = |from: usize| -> usize { from + memchr(b'\n', std::slice::from_raw_parts(self.p.add(from), self.len - from)).unwrap() };
             let start = nl(a - 1) + 1;
             if start >= b {
                 return None;
