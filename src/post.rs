@@ -102,7 +102,7 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                     if d >= db {
                         break;
                     }
-                    let total: usize = workers.iter().map(|w| w.dcnt[d] as usize).sum();
+                    let total: usize = workers.iter().map(|w| w.dfill[d].n as usize).sum();
                     if total == 0 {
                         continue;
                     }

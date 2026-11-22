@@ -371,7 +371,7 @@ const KREC: usize = std::mem::size_of::<KRec>();
 /// read-for-ownership miss for nearly every line written.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct WcK([u64; 8]); // 4 dedup keys
+struct WcK([u64; 16]); // 8 dedup keys
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct WcE([u32; 48]); // 16 event records
@@ -419,14 +419,21 @@ struct Fill {
     cur: u32,
 }
 
+/// Per key bucket: keys so far, and where the current chunk is (one cache line
+/// holds both, so a key's flush does not miss on a second array).
+#[derive(Clone, Copy, Default)]
+struct DFill {
+    n: u32,
+    cur: usize,
+}
+
 /// One thread's phase A output: chunk lists per bucket.
 struct Worker {
     pfill: Vec<Fill>,       // per person bucket: events; `cur` is the chunk's first slot
     pwc: Vec<WcE>,
     pchunks: Vec<Vec<u32>>, // per person bucket: first slot of each chunk
-    dcnt: Vec<u32>,         // per key bucket: keys so far
+    dfill: Vec<DFill>,      // per key bucket: keys so far, and the current chunk
     dwc: Vec<WcK>,
-    dcur: Vec<usize>, // per key bucket: current chunk
     dchunks: Vec<Vec<usize>>,
     ccnt: Vec<u32>, // per person bucket: clicks so far
     cwc: Vec<WcC>,
@@ -458,9 +465,8 @@ impl Worker {
             pfill: vec![Fill::default(); pb],
             pwc: vec![WcE([0; 48]); pb],
             pchunks: (0..pb).map(|_| Vec::new()).collect(),
-            dcnt: vec![0; db],
-            dwc: vec![WcK([0; 8]); db],
-            dcur: vec![0; db],
+            dfill: vec![DFill::default(); db],
+            dwc: vec![WcK([0; 16]); db],
             dchunks: (0..db).map(|_| Vec::new()).collect(),
             ccnt: vec![0; pb],
             cwc: vec![WcC([0; 32]); pb],
@@ -548,9 +554,11 @@ impl Worker {
         let slot = f.cur + off;
         let k = (n & 15) as usize;
         let w = self.pwc.as_mut_ptr().add(p) as *mut PRec;
-        w.add(k).write(r);
         if k == 15 {
-            mem::stream(sh.ev.base().add((slot - 15) as usize * PREC), w as *const u8, 3);
+            // The buffer's last record goes out from registers (`stream_tail`).
+            mem::stream_tail(sh.ev.base().add((slot - 15) as usize * PREC), w as *const u8, 3, [r.who, r.t, r.pc]);
+        } else {
+            w.add(k).write(r);
         }
         slot
     }
@@ -570,7 +578,7 @@ impl Worker {
     #[inline(never)]
     unsafe fn new_dchunk(&mut self, sh: &Shared, d: usize) {
         let c = sh.dk.alloc(DCH * 16) as usize;
-        *self.dcur.get_unchecked_mut(d) = c;
+        self.dfill.get_unchecked_mut(d).cur = c;
         self.dchunks.get_unchecked_mut(d).push(c);
     }
 
@@ -585,18 +593,21 @@ impl Worker {
     /// Files a dedup key under key bucket `d`.
     #[inline(always)]
     unsafe fn push_key(&mut self, sh: &Shared, d: usize, w0: u64, w1: u64) {
-        let n = *self.dcnt.get_unchecked(d);
+        let n = self.dfill.get_unchecked(d).n;
         let off = n as usize & (DCH - 1);
         if off == 0 {
             self.new_dchunk(sh, d);
         }
-        *self.dcnt.get_unchecked_mut(d) = n + 1;
-        let k = (n & 3) as usize;
+        self.dfill.get_unchecked_mut(d).n = n + 1;
+        let k = (n & 7) as usize;
         let w = self.dwc.as_mut_ptr().add(d) as *mut u64;
-        *w.add(2 * k) = w0;
-        *w.add(2 * k + 1) = w1;
-        if k == 3 {
-            mem::stream((*self.dcur.get_unchecked(d) as *mut u8).add((off - 3) * 16), w as *const u8, 1);
+        if k == 7 {
+            // The buffer's last key goes out from registers (`stream_tail`).
+            let t = [w0 as u32, (w0 >> 32) as u32, w1 as u32, (w1 >> 32) as u32];
+            mem::stream_tail((self.dfill.get_unchecked(d).cur as *mut u8).add((off - 7) * 16), w as *const u8, 2, t);
+        } else {
+            *w.add(2 * k) = w0;
+            *w.add(2 * k + 1) = w1;
         }
     }
 
@@ -613,9 +624,11 @@ impl Worker {
         *self.ccnt.get_unchecked_mut(p) = n + 1;
         let k = (n & 15) as usize;
         let w = self.cwc.as_mut_ptr().add(p) as *mut KRec;
-        w.add(k).write(KRec { who, ts, camp, cref });
         if k == 15 {
-            mem::stream((*self.ccur.get_unchecked(p) as *mut u8).add((off - 15) * KREC), w as *const u8, 4);
+            // The buffer's last record goes out from registers (`stream_tail`).
+            mem::stream_tail((*self.ccur.get_unchecked(p) as *mut u8).add((off - 15) * KREC), w as *const u8, 4, [who, ts, camp, cref]);
+        } else {
+            w.add(k).write(KRec { who, ts, camp, cref });
         }
     }
 
@@ -637,12 +650,12 @@ impl Worker {
                 std::ptr::copy_nonoverlapping(self.cwc.as_ptr().add(p) as *const u8, dst, k * KREC);
             }
         }
-        for d in 0..self.dcnt.len() {
-            let n = self.dcnt[d] as usize;
-            let k = n & 3;
+        for d in 0..self.dfill.len() {
+            let n = self.dfill[d].n as usize;
+            let k = n & 7;
             if k != 0 {
                 let off = (n - k) & (DCH - 1);
-                let dst = (self.dcur[d] as *mut u8).add(off * 16);
+                let dst = (self.dfill[d].cur as *mut u8).add(off * 16);
                 std::ptr::copy_nonoverlapping(self.dwc.as_ptr().add(d) as *const u8, dst, k * 16);
             }
         }
@@ -699,7 +712,7 @@ impl Worker {
 
     /// Dedup keys of key bucket `d`, as (identity, ingest << 32 | slot) pairs.
     fn key_chunks<'a>(&'a self, d: usize) -> impl Iterator<Item = &'a [[u64; 2]]> + 'a {
-        let total = self.dcnt[d] as usize;
+        let total = self.dfill[d].n as usize;
         self.dchunks[d].iter().enumerate().map(move |(i, &c)| {
             let n = (total - i * DCH).min(DCH);
             unsafe { std::slice::from_raw_parts(c as *const [u64; 2], n) }
@@ -1664,7 +1677,7 @@ fn main() {
                         if d >= db {
                             break;
                         }
-                        let total: usize = workers.iter().map(|w| w.dcnt[d] as usize).sum();
+                        let total: usize = workers.iter().map(|w| w.dfill[d].n as usize).sum();
                         if total == 0 {
                             continue;
                         }
