@@ -6,7 +6,7 @@
 //! reads the bucket, through a bitmap of the bucket's positions.
 
 use crate::id::Id;
-use crate::{begin_person, flush, Clk, Ctx, Defer, Shared, Worker, CS, DAY, MIN30, NOSLOT, PCH, WEEK};
+use crate::{begin_person, Clk, Ctx, Defer, Shared, Worker, CS, DAY, MIN30, NOSLOT, PCH, WEEK};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// CPU time of this thread so far, in ns.
@@ -369,6 +369,8 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     lap(&mut tc, &mut sc.sect[5]);
     // After filing, off[i] and coff[i] are the ends of person i's rows; the starts
     // are the previous person's ends.
+    // A person has at most one row per session, and a session at least one event.
+    reserve_rows(st, sum as usize);
     let ev = std::mem::take(&mut sc.ev);
     let cl = std::mem::take(&mut sc.cl);
     let who = std::mem::take(&mut sc.who);
@@ -524,7 +526,7 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx
                 sday = (start + ctx.dayoff).div_euclid(DAY);
                 if sday != cur_day {
                     if cur_day >= 0 {
-                        flush(st, name, cur_day + ctx.day0, sp.us, sp.ue, sp.ur, ctx);
+                        row(st, cur_day + ctx.day0, sp.us, sp.ue, sp.ur);
                     }
                     cur_day = sday;
                     sp.us = 0;
@@ -551,7 +553,7 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx
     }
     debug_assert_eq!(pi, purch.len());
     end_session(st, sc, &mut sp, &ck, ctx, start, sday, scnt, srev);
-    flush(st, name, cur_day + ctx.day0, sp.us, sp.ue, sp.ur, ctx);
+    row(st, cur_day + ctx.day0, sp.us, sp.ue, sp.ur);
     sc.purch = purch;
     lap(&mut tp, &mut sc.sect[8]);
     if !sp.small {
@@ -559,6 +561,53 @@ fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u64], cl: &[Clk], ctx: &Ctx
     }
     lap(&mut tp, &mut sc.sect[9]);
     sc.ck = ck;
+}
+
+/// Appends one user_daily row (as `main::flush`); the bucket reserved room for it.
+#[inline(always)]
+fn row(st: &mut CS, day: i64, us: u32, ue: u32, ur: u64) {
+    let mut top = u32::MAX;
+    let mut best = 0u64;
+    for &(c, r) in &st.catrev {
+        if r > best || (r == best && c < top) {
+            best = r;
+            top = c;
+        }
+    }
+    st.catrev.clear();
+    let r = &mut st.rows;
+    #[inline(always)]
+    fn put<T>(v: &mut Vec<T>, x: T) {
+        debug_assert!(v.len() < v.capacity());
+        unsafe {
+            v.as_mut_ptr().add(v.len()).write(x);
+            v.set_len(v.len() + 1);
+        }
+    }
+    unsafe { *r.runs.last_mut().unwrap_unchecked() += 1 };
+    put(&mut r.days, day as i32);
+    put(&mut r.sessions, us as i32);
+    put(&mut r.events, ue as i32);
+    put(&mut r.revenue, ur as i64);
+    if r.n % 8 == 0 {
+        put(&mut r.top_bits, 0);
+    }
+    if top != u32::MAX {
+        unsafe { *r.top_bits.last_mut().unwrap_unchecked() |= 1 << (r.n % 8) };
+        put(&mut r.tops, top as u16);
+    }
+    r.n += 1;
+}
+
+/// Room for `n` more user_daily rows.
+fn reserve_rows(st: &mut CS, n: usize) {
+    let r = &mut st.rows;
+    r.days.reserve(n);
+    r.sessions.reserve(n);
+    r.events.reserve(n);
+    r.revenue.reserve(n);
+    r.top_bits.reserve(n / 8 + 2);
+    r.tops.reserve(n);
 }
 
 /// A person's running state across sessions: the day row so far and where the
