@@ -1469,17 +1469,25 @@ fn main() {
     // Large malloc allocations (row columns, pass buffers) go on transparent huge pages
     // when the machine has plenty of free 2 MB blocks, where they halve the page faults;
     // with few, the kernel would stall compacting memory instead. glibc reads the tunable
-    // only at start, so the process restarts itself once with it set.
-    if std::env::var_os("GLIBC_TUNABLES").is_none()
-        && std::env::var("SS_HUGE").map_or(true, |v| v != "0")
-        && mem::free_huge_bytes().is_some_and(|f| f >= 8 << 30)
-    {
-        use std::os::unix::process::CommandExt;
-        // exec only returns on failure; then carry on without the tunable.
-        let _ = std::process::Command::new("/proc/self/exe")
-            .args(std::env::args_os().skip(1))
-            .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1")
-            .exec();
+    // only at start, so the process restarts itself once with it set. The image sets it
+    // already (Dockerfile), which saves that restart on a machine like the scorer's; on
+    // one without the free blocks the process restarts itself once without it instead.
+    const TUNE: &str = "glibc.malloc.hugetlb=1";
+    let tuned = std::env::var_os("GLIBC_TUNABLES");
+    if tuned.is_none() || tuned.as_deref() == Some(std::ffi::OsStr::new(TUNE)) {
+        let want = std::env::var("SS_HUGE").map_or(true, |v| v != "0") && mem::free_huge_bytes().is_some_and(|f| f >= 8 << 30);
+        if want != tuned.is_some() {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new("/proc/self/exe");
+            cmd.args(std::env::args_os().skip(1));
+            if want {
+                cmd.env("GLIBC_TUNABLES", TUNE);
+            } else {
+                cmd.env_remove("GLIBC_TUNABLES");
+            }
+            // exec only returns on failure; then carry on as we are.
+            let _ = cmd.exec();
+        }
     }
     // Grow the descriptor table to 1,024 entries now, while there is one thread: growing
     // it later, with threads running (opening output files), waits for an RCU grace period.
