@@ -2,7 +2,7 @@
 //! general pipeline's phases B and C.
 //!
 //! Phase A (main.rs, fast.rs) leaves every event line with a generator-shaped event ID
-//! as a 24-byte `XRec` in the bucket of its event number, and every click with a
+//! as a 16-byte `XRec` in the bucket of its event number, and every click with a
 //! generator-shaped user ID as a `CRec` in the bucket of its user number. This module
 //! turns those into rows and campaign counts in one pass per bucket:
 //!
@@ -31,7 +31,7 @@
 //! summaries are joined once all buckets are done, and a joined run that fails a check
 //! is read again from its buckets (`replay`).
 
-use crate::fast::{scramble, Fx, XRec, COMPLEX, EXTRA, INVALID, ODDU, XCH};
+use crate::fast::{scramble, Fx, XRec, COMPLEX, EXT, EXTRA, INVALID, ODDU, XA, XCH, XLO};
 use crate::id::Id;
 use crate::mem;
 use crate::{begin_person, flush, CRec, Ctx, PRec, Shared, Worker, CCH, CS};
@@ -332,14 +332,17 @@ unsafe fn place(tab: *mut Slot, pcs: *mut u32, l: &[(usize, u32)]) {
         for i in 0..n {
             let r = &*rs.add(i);
             // (The place of a record a few ahead is fetched early.)
-            prefetch_write(tab.add((*rs.add((i + AHEAD).min(n - 1))).lo as usize));
-            let at = r.lo as usize;
+            prefetch_write(tab.add((((*rs.add((i + AHEAD).min(n - 1))).a >> XLO) & 0xFFFF) as usize));
+            let at = ((r.a >> XLO) & 0xFFFF) as usize;
             let s = tab.add(at);
-            if r.ing < (*s).ing {
-                *s = Slot { a: r.a, t: r.t | ((r.pc != 0) as u32) << 31, ing: r.ing };
-                if r.pc != 0 {
-                    *pcs.add(at) = r.pc;
+            if r.a & EXT != 0 {
+                // The price of the purchase filed just before: the event's if that
+                // copy (or an identical one) holds the place.
+                if r.ing == (*s).ing {
+                    *pcs.add(at) = r.t;
                 }
+            } else if r.ing < (*s).ing {
+                *s = Slot { a: r.a & XA, t: r.t, ing: r.ing };
             }
         }
     }
@@ -1734,7 +1737,7 @@ mod tests {
                 }
                 let (a, b) = (&got.rows, &want.rows);
                 assert_eq!(a.n, b.n, "round {round} wide {wide}");
-                assert_eq!((&a.names, &a.days, &a.sessions, &a.events), (&b.names, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
+                assert_eq!((&a.dict, &a.days, &a.sessions, &a.events), (&b.dict, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
                 assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round} wide {wide}");
                 assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
                 assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
