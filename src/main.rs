@@ -1779,7 +1779,7 @@ fn main() {
                     bdone.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let tt = Instant::now();
                     let ttl = tl::now();
-                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &st.rows, ctx.cats).expect("write user_daily");
+                    pq::write_user(&ud.join(format!("part-{ti:05}.parquet")), &mut st.rows, ctx.cats).expect("write user_daily");
                     let tw = tt.elapsed();
                     tl::span(16, ttl);
                     let all_buckets_done = || {
