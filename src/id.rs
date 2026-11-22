@@ -5,8 +5,10 @@
 //! interned once and stored as a pointer with the marker length 0xFF, so equal
 //! values still mean equal strings. The empty string is all zeros.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[repr(C)]
@@ -36,6 +38,107 @@ static MASK: [(u64, u64); 16] = {
 fn mum(a: u64, b: u64) -> u64 {
     let m = (a as u128).wrapping_mul(b as u128);
     (m as u64) ^ ((m >> 64) as u64)
+}
+
+/// The table of interned long IDs: open addressing over tagged pointers, filled by
+/// compare-and-swap, sized once at start from the input. A slot holds 0 (empty),
+/// CLOSED, or the address of an interned string (`[len: u64][bytes]`) with 16 bits of
+/// the string's hash on top. A string's probe sequence ends at its entry or at the
+/// first 0 or CLOSED slot. Past 70% full, a thread that reaches a 0 slot closes it
+/// and interns the string in the sharded maps instead; a slot only ever changes from
+/// 0 to an address or to CLOSED, so every thread finds a given string in one place.
+struct LongTable {
+    slots: &'static [AtomicU64],
+    mask: usize,
+    used: AtomicUsize,
+    limit: usize,
+}
+
+const CLOSED: u64 = 1;
+static LTAB: OnceLock<LongTable> = OnceLock::new();
+
+/// Sizes the long-ID table for about `expected` distinct long IDs.
+pub fn init_long_table(expected: usize, huge: bool) {
+    let n = (expected.max(1 << 14) * 2).next_power_of_two();
+    let bytes = n * 8;
+    let p = crate::mem::map(bytes);
+    if huge {
+        crate::mem::hugepages(p, bytes);
+    }
+    let slots = unsafe { std::slice::from_raw_parts(p as *const AtomicU64, n) };
+    let _ = LTAB.set(LongTable { slots, mask: n - 1, used: AtomicUsize::new(0), limit: n / 10 * 7 });
+}
+
+thread_local! {
+    /// This thread's space for interned strings: (next free byte, bytes left).
+    static ARENA: Cell<(*mut u8, usize)> = const { Cell::new((std::ptr::null_mut(), 0)) };
+}
+
+/// A copy of `b` as `[len: u64][bytes]`, 8-byte aligned, that lives to process exit.
+fn store(b: &[u8]) -> *const u8 {
+    let need = (8 + b.len()).div_ceil(8) * 8;
+    ARENA.with(|a| {
+        let (mut p, mut left) = a.get();
+        if left < need {
+            let chunk = need.max(1 << 20);
+            p = Box::leak(vec![0u64; chunk / 8].into_boxed_slice()).as_mut_ptr() as *mut u8;
+            left = chunk;
+        }
+        unsafe {
+            (p as *mut u64).write(b.len() as u64);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), p.add(8), b.len());
+        }
+        a.set((unsafe { p.add(need) }, left - need));
+        p as *const u8
+    })
+}
+
+/// The bytes of an interned string at `p`.
+#[inline(always)]
+unsafe fn stored(p: *const u8) -> &'static [u8] {
+    std::slice::from_raw_parts(p.add(8), (p as *const u64).read() as usize)
+}
+
+/// Looks `b` up in the long-ID table, adding it if absent; None when the table is
+/// not set up or the string belongs to the sharded maps.
+fn intern_table(b: &[u8], h: u64) -> Option<*const u8> {
+    let t = LTAB.get()?;
+    let tag = h & (0xFFFF << 48);
+    let mut i = (h as usize) & t.mask;
+    let mut mine: *const u8 = std::ptr::null();
+    loop {
+        let slot = &t.slots[i];
+        let v = slot.load(Ordering::Acquire);
+        if v == CLOSED {
+            return None;
+        }
+        if v == 0 {
+            let full = t.used.load(Ordering::Relaxed) >= t.limit;
+            let new = if full {
+                CLOSED
+            } else {
+                if mine.is_null() {
+                    mine = store(b);
+                }
+                mine as u64 | tag
+            };
+            match slot.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) if full => return None,
+                Ok(_) => {
+                    t.used.fetch_add(1, Ordering::Relaxed);
+                    return Some(mine);
+                }
+                Err(_) => continue, // someone took this slot: look at what it holds
+            }
+        }
+        if v & (0xFFFF << 48) == tag {
+            let p = (v & ((1 << 48) - 1)) as *const u8;
+            if unsafe { stored(p) } == b {
+                return Some(p);
+            }
+        }
+        i = (i + 1) & t.mask;
+    }
 }
 
 /// Hashes a long ID's bytes (the map below is keyed by them) eight bytes at a time.
@@ -86,13 +189,16 @@ impl Id {
             t[..b.len()].copy_from_slice(b);
             return unsafe { Id::short(t.as_ptr(), b.len()) };
         }
-        let shard = {
+        let h = {
             use std::hash::Hasher;
             let mut h = LongHasher::default();
             h.write(b);
-            (h.finish() >> 58) as usize
+            h.finish()
         };
-        let mut g = LONG[shard].lock().unwrap();
+        if let Some(p) = intern_table(b, h) {
+            return Id { lo: p as u64, hi: 0xFF << 56 };
+        }
+        let mut g = LONG[(h >> 58) as usize].lock().unwrap();
         let map = g.get_or_insert_with(LongMap::default);
         let p = match map.get(b) {
             Some(&p) => p,

@@ -1095,6 +1095,8 @@ fn make_links(
         Some(v) => v == 1,
         None => huge_free.is_none_or(|f| f >= touched + touched / 2),
     };
+    // About one in eight click and user IDs is longer than 15 bytes (interned).
+    id::init_long_table((cbytes / 40 + ebytes / 700) as usize / 8 + 1, huge);
     let est = (ebytes / 72).max(1) as usize;
     let ltasks = ranges(link_files, 256 << 10);
     let lfiles: Vec<&File> = link_files.iter().map(|f| &f.0).collect();
