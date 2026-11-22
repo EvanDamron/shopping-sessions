@@ -6,7 +6,7 @@
 //! reads the bucket, through a bitmap of the bucket's positions.
 
 use crate::id::Id;
-use crate::{begin_person, Clk, PRec, Ctx, Defer, Shared, Worker, CS, DAY, MIN30, NOSLOT, PCH, WEEK};
+use crate::{begin_person, PRec, Ctx, Defer, Shared, Worker, CS, DAY, MIN30, NOSLOT, PCH, WEEK};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// CPU time of this thread so far, in ns.
@@ -229,6 +229,15 @@ fn lap(t: &mut u64, acc: &mut u64) {
     *t = n;
 }
 
+/// A click of the bucket: time, campaign, and where its click_id is (worker << 32 |
+/// place in that worker's `cids`).
+#[derive(Clone, Copy, Default)]
+pub struct PClk {
+    ts: u32,
+    camp: u32,
+    r: u64,
+}
+
 /// One phase C thread's working memory.
 #[derive(Default)]
 pub struct Scr {
@@ -238,7 +247,8 @@ pub struct Scr {
     plist: Vec<PRec>, // the bucket's purchases (`who` = person within the bucket)
     poff: Vec<u32>,   // per person: start of their purchases (as `off`)
     pev: Vec<u64>,    // the bucket's purchases by person: `t << 32 | pc`
-    cl: Vec<Clk>,
+    cl: Vec<PClk>,
+    cids: Vec<*const Id>, // per worker: its click_ids (`Worker::cids`)
     dead: Vec<u64>,  // bitmap over the bucket's record positions
     stamp: Vec<u32>, // per campaign: the last session it assisted
     sid: u32,
@@ -292,8 +302,8 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
         return;
     }
     let mut tc = tsc();
-    let first = (p as u32) << sh.pshift; // the bucket's first person number
-    let np = 1usize << sh.pshift;
+    let (pbits, bucket) = (sh.pbits, p as u32); // person number = place << pbits | bucket
+    let np = sh.places();
     // The losing copies' positions, as a bitmap.
     let nchunks: usize = workers.iter().map(|w| w.pchunks[p].len()).sum();
     sc.dead.clear();
@@ -314,7 +324,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
             for (k, e) in chunk.iter().enumerate() {
                 // A dead copy counts for nobody (the count is shifted out of the last slot).
                 let dead = unsafe { *bits.get_unchecked(k >> 6) } >> (k & 63) & 1 != 0;
-                let i = if dead { np } else { (e.who - first) as usize };
+                let i = if dead { np } else { (e.who >> pbits) as usize };
                 unsafe { *sc.off.get_unchecked_mut(i) += 1 };
             }
             base += PCH;
@@ -334,7 +344,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 let has = unsafe { *sc.off.get_unchecked(i + 1) != *sc.off.get_unchecked(i) };
                 unsafe { *sc.coff.get_unchecked_mut(if has { i } else { np }) += 1 };
             }
@@ -358,15 +368,17 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     lap(&mut tc, &mut sc.sect[3]);
     // File the clicks first: it needs the event starts untouched to tell who has events.
     sc.cl.clear();
-    sc.cl.resize(csum as usize, Clk { ts: 0, camp: 0, cid: Id::EMPTY });
-    for w in workers {
+    sc.cl.resize(csum as usize, PClk { ts: 0, camp: 0, r: 0 });
+    sc.cids.clear();
+    sc.cids.extend(workers.iter().map(|w| w.cids.as_ptr()));
+    for (wi, w) in workers.iter().enumerate() {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 unsafe {
                     if *sc.off.get_unchecked(i + 1) != *sc.off.get_unchecked(i) {
                         let at = sc.coff.get_unchecked_mut(i);
-                        *sc.cl.get_unchecked_mut(*at as usize) = Clk { ts: c.ts, camp: c.camp, cid: c.cid };
+                        *sc.cl.get_unchecked_mut(*at as usize) = PClk { ts: c.ts, camp: c.camp, r: (wi as u64) << 32 | c.cref as u64 };
                         *at += 1;
                     }
                 }
@@ -386,7 +398,7 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
                 let dead = unsafe { *bits.get_unchecked(k >> 6) } >> (k & 63) & 1 != 0;
                 if !dead {
                     unsafe {
-                        let i = e.who - first;
+                        let i = e.who >> pbits;
                         let at = sc.off.get_unchecked_mut(i as usize);
                         *sc.ev.get_unchecked_mut(*at as usize) = e.t;
                         *at += 1;
@@ -444,17 +456,17 @@ pub fn bucket(st: &mut CS, sc: &mut Scr, sh: &Shared, workers: &[Worker], kills:
     }
     const NAHEAD: usize = 8;
     for &i in who.iter().take(NAHEAD) {
-        sh.links.prefetch_slot(first + i);
+        sh.links.prefetch_name(i << pbits | bucket);
     }
     for (k, &i) in who.iter().enumerate() {
         if let Some(&j) = who.get(k + NAHEAD) {
-            sh.links.prefetch_slot(first + j);
+            sh.links.prefetch_name(j << pbits | bucket);
         }
         let i = i as usize;
         let (es, ee) = (if i == 0 { 0 } else { sc.off[i - 1] as usize }, sc.off[i] as usize);
         let (cs, ce) = (if i == 0 { 0 } else { sc.coff[i - 1] as usize }, sc.coff[i] as usize);
         let (ps, pe) = (if i == 0 { 0 } else { sc.poff[i - 1] as usize }, sc.poff[i] as usize);
-        let name = sh.links.name(first + i as u32);
+        let name = sh.links.name((i as u32) << pbits | bucket);
         person(st, sc, name, &ev[es..ee], &mut pev[ps..pe], &cl[cs..ce], ctx);
     }
     sc.ev = ev;
@@ -483,7 +495,8 @@ pub fn finish(st: &mut CS, sc: &mut Scr) {
 /// A person's clicks as `ts << 32 | campaign`, in crediting order: by time, and
 /// within one instant the smallest click_id last, so the last click at or before a
 /// session start is the one that session credits (rules.md "Clicks" step 4).
-fn order_clicks(cl: &[Clk], keys: &mut Vec<u64>, rtmp: &mut Vec<u64>, out: &mut Vec<u64>) {
+fn order_clicks(cl: &[PClk], cids: &[*const Id], keys: &mut Vec<u64>, rtmp: &mut Vec<u64>, out: &mut Vec<u64>) {
+    let cid = |c: &PClk| unsafe { *cids[(c.r >> 32) as usize].add(c.r as u32 as usize) };
     out.clear();
     if cl.len() == 1 {
         out.push((cl[0].ts as u64) << 32 | cl[0].camp as u64);
@@ -506,7 +519,7 @@ fn order_clicks(cl: &[Clk], keys: &mut Vec<u64>, rtmp: &mut Vec<u64>, out: &mut 
             let g = &mut keys[a..b];
             for x in 1..g.len() {
                 let mut y = x;
-                while y > 0 && cl[g[y - 1] as u32 as usize].cid.less(&cl[g[y] as u32 as usize].cid) {
+                while y > 0 && cid(&cl[g[y - 1] as u32 as usize]).less(&cid(&cl[g[y] as u32 as usize])) {
                     g.swap(y - 1, y);
                     y -= 1;
                 }
@@ -520,13 +533,13 @@ fn order_clicks(cl: &[Clk], keys: &mut Vec<u64>, rtmp: &mut Vec<u64>, out: &mut 
 /// One person's events and clicks (both unordered): sessions, credit, assists,
 /// daily rows (rules.md "Events" steps 5 to 7 and "Clicks" steps 4 to 7).
 #[inline]
-fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl: &[Clk], ctx: &Ctx) {
+fn person(st: &mut CS, sc: &mut Scr, name: Id, ev: &[u32], purch: &mut [u64], cl: &[PClk], ctx: &Ctx) {
     let mut tp = tsc();
     let mut ck = std::mem::take(&mut sc.ck);
     if cl.is_empty() {
         ck.clear();
     } else {
-        order_clicks(cl, &mut sc.keys, &mut sc.rtmp, &mut ck);
+        order_clicks(cl, &sc.cids, &mut sc.keys, &mut sc.rtmp, &mut ck);
     }
     lap(&mut tp, &mut sc.sect[7]);
     // The person's events by half-hour slot: first and last time and count per

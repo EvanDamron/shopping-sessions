@@ -310,7 +310,19 @@ struct PRec {
     pc: u32,
 }
 
-/// A valid click, filed under its person.
+/// A valid click, filed under its person: its click_id is in the filing thread's
+/// `Worker::cids` at `cref` (read only to break a same-instant tie).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct KRec {
+    who: u32,
+    ts: u32,
+    camp: u32,
+    cref: u32,
+}
+
+/// A valid click as the index-order fast path files it, under its user number
+/// (`who`, with the alias in `_pad`); also the general click line's decision.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CRec {
@@ -336,6 +348,7 @@ const DCH: usize = 1024; // dedup keys per chunk
 const CCH: usize = 256; // click records per chunk
 const PREC: usize = std::mem::size_of::<PRec>();
 const CREC: usize = std::mem::size_of::<CRec>();
+const KREC: usize = std::mem::size_of::<KRec>();
 
 /// Write-combining buffers: the last few records of a bucket gather here, in cache,
 /// and go to the bucket's memory whole cache lines at a time with streaming stores.
@@ -349,7 +362,7 @@ struct WcK([u64; 8]); // 4 dedup keys
 struct WcE([u32; 48]); // 16 event records
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct WcC([u64; 32]); // 8 click records
+struct WcC([u64; 32]); // 8 fast-path click records, or 16 person click records
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 unsafe impl Sync for dec::Dec {}
@@ -362,7 +375,8 @@ struct Shared<'a> {
     lk: &'a Lookups,
     win: Win,
     evspan: u64, // window_end - window_start
-    pshift: u32, // person number -> person bucket
+    pbits: u32, // person bucket = person number & pmask, place in it = number >> pbits
+    pmask: u32,
     dshift: u32,
     ev: mem::Arena, // event records, addressed by slot
     dk: mem::Arena, // dedup keys
@@ -374,6 +388,13 @@ struct Shared<'a> {
     decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
     dec5: bool,     // the per-line decoders for opaque IDs (dec5.rs), without the fast path
+}
+
+impl Shared<'_> {
+    /// Places per person bucket: every person number is below `places() << pbits`.
+    fn places(&self) -> usize {
+        ((self.links.persons() as usize) >> self.pbits) + 1
+    }
 }
 
 /// Per bucket: records so far, and where the current chunk starts.
@@ -396,6 +417,7 @@ struct Worker {
     cwc: Vec<WcC>,
     ccur: Vec<usize>,
     cchunks: Vec<Vec<usize>>,
+    cids: Vec<Id>, // click_ids of the clicks this thread filed, by `KRec::cref`
     added: u32, // user IDs this thread has added to the table and not yet reported
     // Fast path (fast.rs): events by event-number bucket, clicks by user-number bucket.
     xcnt: Vec<u32>,
@@ -416,7 +438,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(pb: usize, db: usize, nb: usize, nxc: usize) -> Worker {
+    fn new(pb: usize, db: usize, nb: usize, nxc: usize, ncid: usize) -> Worker {
         Worker {
             pfill: vec![Fill::default(); pb],
             pwc: vec![WcE([0; 48]); pb],
@@ -429,6 +451,7 @@ impl Worker {
             cwc: vec![WcC([0; 32]); pb],
             ccur: vec![0; pb],
             cchunks: (0..pb).map(|_| Vec::new()).collect(),
+            cids: Vec::with_capacity(ncid),
             added: 0,
             xcnt: vec![0; nb],
             xwc: vec![fast::WcX([0; 16]); nb],
@@ -537,21 +560,24 @@ impl Worker {
         }
     }
 
+    /// Files a click under person bucket `p`; its click_id goes to `cids`.
     #[inline(always)]
-    unsafe fn push_click(&mut self, sh: &Shared, p: usize, r: CRec) {
+    unsafe fn push_click(&mut self, sh: &Shared, p: usize, who: u32, ts: u32, camp: u32, cid: Id) {
+        let cref = self.cids.len() as u32;
+        self.cids.push(cid);
         let n = *self.ccnt.get_unchecked(p);
         let off = n as usize & (CCH - 1);
         if off == 0 {
-            let c = sh.ck.alloc(CCH * CREC) as usize;
+            let c = sh.ck.alloc(CCH * KREC) as usize;
             *self.ccur.get_unchecked_mut(p) = c;
             self.cchunks.get_unchecked_mut(p).push(c);
         }
         *self.ccnt.get_unchecked_mut(p) = n + 1;
-        let k = (n & 7) as usize;
-        let w = self.cwc.as_mut_ptr().add(p) as *mut CRec;
-        w.add(k).write(r);
-        if k == 7 {
-            mem::stream((*self.ccur.get_unchecked(p) as *mut u8).add((off - 7) * CREC), w as *const u8, 4);
+        let k = (n & 15) as usize;
+        let w = self.cwc.as_mut_ptr().add(p) as *mut KRec;
+        w.add(k).write(KRec { who, ts, camp, cref });
+        if k == 15 {
+            mem::stream((*self.ccur.get_unchecked(p) as *mut u8).add((off - 15) * KREC), w as *const u8, 4);
         }
     }
 
@@ -566,11 +592,11 @@ impl Worker {
                 std::ptr::copy_nonoverlapping(self.pwc.as_ptr().add(p) as *const u8, dst, k * PREC);
             }
             let n = self.ccnt[p] as usize;
-            let k = n & 7;
+            let k = n & 15;
             if k != 0 {
                 let off = (n - k) & (CCH - 1);
-                let dst = (self.ccur[p] as *mut u8).add(off * CREC);
-                std::ptr::copy_nonoverlapping(self.cwc.as_ptr().add(p) as *const u8, dst, k * CREC);
+                let dst = (self.ccur[p] as *mut u8).add(off * KREC);
+                std::ptr::copy_nonoverlapping(self.cwc.as_ptr().add(p) as *const u8, dst, k * KREC);
             }
         }
         for d in 0..self.dcnt.len() {
@@ -621,11 +647,11 @@ impl Worker {
         self.pfill[p].n as usize
     }
 
-    fn click_chunks<'a>(&'a self, p: usize) -> impl Iterator<Item = &'a [CRec]> + 'a {
+    fn click_chunks<'a>(&'a self, p: usize) -> impl Iterator<Item = &'a [KRec]> + 'a {
         let total = self.ccnt[p] as usize;
         self.cchunks[p].iter().enumerate().map(move |(i, &c)| {
             let n = (total - i * CCH).min(CCH);
-            unsafe { std::slice::from_raw_parts(c as *const CRec, n) }
+            unsafe { std::slice::from_raw_parts(c as *const KRec, n) }
         })
     }
 
@@ -718,7 +744,7 @@ unsafe fn events(sh: &Shared, w: &mut Worker, rd: &Reader) {
             return;
         }
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
-        let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: t as u32, pc });
+        let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: t as u32, pc });
         w.push_key(sh, bucket, kid, ((ing_key as u64) << 32) | slot as u64);
     });
     if w.added >= 256 {
@@ -899,7 +925,7 @@ unsafe fn click_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u
     } else {
         let uid = Id::field(d, s1, e1);
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
-        COut::P((who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid })
+        COut::P((who & sh.pmask) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid })
     }
 }
 
@@ -909,7 +935,7 @@ unsafe fn click_x_fields(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u
     match click_x_decide(sh, fx, w, d, f) {
         COut::Drop => {}
         COut::X(c, r) => w.push_xclick(fx, c, r),
-        COut::P(p, r) => w.push_click(sh, p, r),
+        COut::P(p, r) => w.push_click(sh, p, r.who, r.ts, r.camp, r.cid),
     }
 }
 
@@ -985,7 +1011,7 @@ unsafe fn clicks(sh: &Shared, w: &mut Worker, rd: &Reader) {
         let uid = Id::field(d, s1, e1);
         let who = sh.links.person(uid, uid.hash(), &mut w.added);
         let cid = Id::field(d, s0, e0);
-        w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: t as u32, camp, _pad: 0, cid });
+        w.push_click(sh, (who & sh.pmask) as usize, who, t as u32, camp, cid);
     });
     if w.added >= 256 {
         sh.links.added(&mut w.added);
@@ -1186,14 +1212,15 @@ fn phase_a<'a>(
 
     // Bucket counts: enough that a bucket is a few megabytes at most, few enough that
     // a thread's write-combining buffers (192 bytes per person bucket, 64 per key
-    // bucket) stay well inside its share of the L2 cache. Person buckets are ranges
-    // of person numbers.
+    // bucket) stay well inside its share of the L2 cache. Person buckets are person
+    // numbers modulo the bucket count.
     let pb = envn("SS_PB").unwrap_or((est / 65_536).next_power_of_two().clamp(64, 512));
     let db = envn("SS_DB").unwrap_or((est / 32_768).next_power_of_two().clamp(64, 1024));
     let (pb, db) = (pb.next_power_of_two().clamp(2, links.slots()), db.next_power_of_two().max(2));
     let base = ws - WEEK;
     let sh = Shared {
-        pshift: links.slots().trailing_zeros() - pb.trailing_zeros(),
+        pbits: pb.trailing_zeros(),
+        pmask: pb as u32 - 1,
         links,
         lk,
         win: Win::new(base, we),
@@ -1203,7 +1230,7 @@ fn phase_a<'a>(
         // partly filled chunk per bucket: this region cannot overflow.
         ev: mem::Arena::new((ebytes as usize / 34 + (nthreads * pb + 1) * PCH) * PREC, huge, ahead),
         dk: mem::Arena::new(ebytes as usize / 3 + nthreads * db * DCH * 16, huge, ahead),
-        ck: mem::Arena::new(cbytes as usize + nthreads * pb * CCH * CREC, huge, ahead),
+        ck: mem::Arena::new(cbytes as usize / 2 + nthreads * pb * CCH * KREC, huge, ahead),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         dec: (fx.is_some() && envn("SS_DEC") != Some(0)).then(|| dec::Dec::new(base, we, (we - ws) as u64, lk)),
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
@@ -1218,7 +1245,9 @@ fn phase_a<'a>(
     tasks.extend(ranges(click_files, task).into_iter().map(|(f, a, b)| (false, f, a, b)));
     let (nb, nxc) = sh.fx.as_ref().map_or((0, 0), |f| (f.nb, f.nxc));
     let fast = sh.fx.is_some();
-    let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc)).collect();
+    // About one valid click per 45 bytes of click files, shared by the threads.
+    let ncid = (cbytes as usize / 45 / nthreads) * 5 / 4;
+    let mut workers: Vec<Worker> = (0..nthreads).map(|_| Worker::new(pb, db, nb, nxc, ncid)).collect();
     // The per-line decoders read the files straight from their mappings, prefetching
     // a few lines ahead (SS_MMAP=0: through the read buffer, as the indexed path does).
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
@@ -1684,8 +1713,8 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     if n_ev == 0 {
         return;
     }
-    let first = (p as u32) << sh.pshift; // the bucket's first person number
-    let np = 1usize << sh.pshift;
+    let (pbits, first) = (sh.pbits, p as u32); // person number = place << pbits | p
+    let np = sh.places();
     // Events per person, then each person's start in `ev`.
     st.off.clear();
     st.off.resize(np + 1, 0);
@@ -1693,7 +1722,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
         for chunk in w.event_chunks(sh, p) {
             for e in chunk {
                 // A dead copy counts for nobody (the count is shifted out of the last slot).
-                let i = if e.t & DEAD == 0 { (e.who - first) as usize } else { np };
+                let i = if e.t & DEAD == 0 { (e.who >> pbits) as usize } else { np };
                 unsafe { *st.off.get_unchecked_mut(i) += 1 };
             }
         }
@@ -1711,7 +1740,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 let has = unsafe { *st.off.get_unchecked(i + 1) != *st.off.get_unchecked(i) };
                 unsafe { *st.coff.get_unchecked_mut(if has { i } else { np }) += 1 };
             }
@@ -1730,11 +1759,11 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
     for w in workers {
         for chunk in w.click_chunks(p) {
             for c in chunk {
-                let i = (c.who - first) as usize;
+                let i = (c.who >> pbits) as usize;
                 unsafe {
                     if *st.off.get_unchecked(i + 1) != *st.off.get_unchecked(i) {
                         let at = st.coff.get_unchecked_mut(i);
-                        *st.cl.get_unchecked_mut(*at as usize) = Clk { ts: c.ts, camp: c.camp, cid: c.cid };
+                        *st.cl.get_unchecked_mut(*at as usize) = Clk { ts: c.ts, camp: c.camp, cid: *w.cids.get_unchecked(c.cref as usize) };
                         *at += 1;
                     }
                 }
@@ -1748,7 +1777,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
             for e in chunk {
                 if e.t & DEAD == 0 {
                     unsafe {
-                        let at = st.off.get_unchecked_mut((e.who - first) as usize);
+                        let at = st.off.get_unchecked_mut((e.who >> pbits) as usize);
                         *st.ev.get_unchecked_mut(*at as usize) = ((e.t as u64) << 32) | e.pc as u64;
                         *at += 1;
                     }
@@ -1772,7 +1801,7 @@ fn bucket(st: &mut CS, sh: &Shared, workers: &[Worker], ctx: &Ctx, p: usize) {
                 // Time order only; equal-time ties are broken by click_id when crediting.
                 c.sort_unstable_by_key(|x| x.ts);
             }
-            let name = sh.links.name(first + i as u32);
+            let name = sh.links.name((i as u32) << pbits | first);
             person(st, name, e, c, ctx);
         }
         es = ee;

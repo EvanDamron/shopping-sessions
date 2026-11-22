@@ -1,8 +1,11 @@
 //! Linked IDs (rules.md "Linked IDs") and person numbers.
 //!
-//! One shared open-addressing table holds every user ID. A person is numbered by
-//! the table slot of their name: the byte-wise smallest ID of their connected
-//! component, or the ID itself if no link line mentions it.
+//! One shared open-addressing table holds every user ID. A person is named by the
+//! byte-wise smallest ID of their connected component, or by the ID itself if no
+//! link line mentions it, and numbered densely: the roots of linked sets 0..L-1 in
+//! table order when the links are built, then each ID no link mentions with the next
+//! number of its thread's block of `BLOCK` numbers when it is first seen. `names`
+//! holds each person's name by number.
 //!
 //! The link files are read in one parallel pass: each thread interns both IDs of a
 //! line and joins them in a lock-free union-find whose roots are always the
@@ -21,7 +24,20 @@ struct Entry {
     lo: AtomicU64,
     hi: AtomicU64, // 0 = empty, BUSY = being written
     person: AtomicU32,
-    _pad: [u32; 3],
+    root: AtomicU32, // 1 when this ID is its person's name
+    _pad: [u32; 2],
+}
+
+/// Person numbers a thread takes at a time for the IDs it adds.
+const BLOCK: u32 = 256;
+
+/// Every `Links` gets its own epoch, so a thread's block of numbers from an earlier
+/// (abandoned) table is never used with a later one.
+static EPOCH: AtomicU32 = AtomicU32::new(1);
+
+thread_local! {
+    /// This thread's block of person numbers: (epoch, next, end).
+    static NUMS: std::cell::Cell<(u32, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// No ID has this high word: its length byte would be 0xFE.
@@ -41,6 +57,10 @@ pub struct Links {
     pub limit: usize,
     /// Set when the table is too full to go on; the run is then redone with a larger one.
     pub full: AtomicBool,
+    names: *mut Id, // person number -> name
+    ncap: usize,    // room in `names`
+    persons: AtomicU32, // person numbers handed out (to threads, in blocks)
+    epoch: u32,
 }
 unsafe impl Send for Links {}
 unsafe impl Sync for Links {}
@@ -66,11 +86,16 @@ impl Links {
 
     /// Returns part `k` of `n` of the table to the kernel (see `Arena::release_part`).
     pub fn release_part(&self, k: usize, n: usize) {
-        let lo = (self.bytes / n * k) & !4095;
-        let hi = if k + 1 == n { self.bytes } else { (self.bytes / n * (k + 1)) & !4095 };
-        if hi > lo {
-            mem::release(unsafe { (self.tab as *mut u8).add(lo) }, hi - lo);
-        }
+        let part = |base: *mut u8, bytes: usize| {
+            let lo = (bytes / n * k) & !4095;
+            let hi = if k + 1 == n { bytes } else { (bytes / n * (k + 1)) & !4095 };
+            if hi > lo {
+                mem::release(unsafe { base.add(lo) }, hi - lo);
+            }
+        };
+        part(self.tab as *mut u8, self.bytes);
+        let used = (self.persons() as usize).min(self.ncap) * std::mem::size_of::<Id>();
+        part(self.names as *mut u8, used.div_ceil(4096) * 4096);
     }
 
     /// Starts loading the cache line a lookup of an ID with hash `h` will read.
@@ -89,25 +114,51 @@ impl Links {
         prefetch(unsafe { self.tab.add((i + 1) & self.mask) });
     }
 
-    /// Starts loading slot `i`.
+    /// Starts loading the name of person `n`.
     #[inline(always)]
-    pub fn prefetch_slot(&self, i: u32) {
-        prefetch(unsafe { self.tab.add(i as usize) });
+    pub fn prefetch_name(&self, n: u32) {
+        prefetch(unsafe { self.names.add(n as usize) });
     }
 
-    /// The ID in slot `i` and its person, if the slot is in use.
+    /// The ID in slot `i`, its person, and whether it is that person's name, if the
+    /// slot is in use.
     #[inline(always)]
-    pub fn linked_at(&self, i: usize) -> Option<(Id, u32)> {
+    pub fn linked_at(&self, i: usize) -> Option<(Id, u32, bool)> {
         let e = unsafe { &*self.tab.add(i) };
-        let hi = e.hi.load(Relaxed);
-        (hi != 0 && hi != BUSY).then(|| (Id { lo: e.lo.load(Relaxed), hi }, e.person.load(Relaxed)))
+        let hi = e.hi.load(Acquire);
+        (hi != 0 && hi != BUSY).then(|| (Id { lo: e.lo.load(Relaxed), hi }, e.person.load(Relaxed), e.root.load(Relaxed) != 0))
     }
 
     /// The name of person `n`.
     #[inline(always)]
     pub fn name(&self, n: u32) -> Id {
-        let e = unsafe { &*self.tab.add(n as usize) };
-        Id { lo: e.lo.load(Relaxed), hi: e.hi.load(Relaxed) }
+        unsafe { *self.names.add(n as usize) }
+    }
+
+    /// Person numbers handed out so far (every person's number is below this; a few
+    /// numbers of the threads' last blocks belong to nobody).
+    pub fn persons(&self) -> u32 {
+        self.persons.load(Relaxed)
+    }
+
+    /// The next person number for an ID this thread adds.
+    #[inline(always)]
+    fn number(&self) -> u32 {
+        NUMS.with(|c| {
+            let (ep, mut next, mut end) = c.get();
+            if ep != self.epoch || next == end {
+                next = self.persons.fetch_add(BLOCK, Relaxed);
+                end = next + BLOCK;
+                if end as usize > self.ncap {
+                    // More persons than `names` holds: start over with a larger table.
+                    self.full.store(true, Relaxed);
+                    next = 0;
+                    end = BLOCK;
+                }
+            }
+            c.set((self.epoch, next + 1, end));
+            next
+        })
     }
 
     /// The person an ID belongs to. An ID no link line mentions is its own person
@@ -128,11 +179,14 @@ impl Links {
                 if hi == 0 {
                     match e.hi.compare_exchange(0, BUSY, AcqRel, Acquire) {
                         Ok(_) => {
+                            let n = self.number();
+                            unsafe { self.names.add(n as usize).write(id) };
                             e.lo.store(id.lo, Relaxed);
-                            e.person.store(i as u32, Relaxed);
+                            e.person.store(n, Relaxed);
+                            e.root.store(1, Relaxed);
                             e.hi.store(id.hi, Release);
                             *added += 1;
-                            return i as u32;
+                            return n;
                         }
                         Err(cur) => hi = cur,
                     }
@@ -393,37 +447,79 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
     if std::env::var_os("SS_TIME").is_some() {
         eprintln!("  links: interned and joined at {:?}", t0.elapsed());
     }
-    // Write every entry's person (the slot of its set's root) beside it.
+    // Person numbers, in one pass over the table: every linked ID finds its set's
+    // root, and the first thread to reach a root (from the root itself or from any ID
+    // of its set) gives it the next number of its block of `BLOCK` and writes the
+    // name; the others wait for that (the root's `root` word: 0 none yet, 2 being
+    // numbered, 1 numbered). Every linked ID then takes its root's number.
+    let ncap = slots + (1 << 16);
+    let names = mem::map(ncap * std::mem::size_of::<Id>()) as *mut Id;
+    if huge {
+        mem::hugepages(names as *mut u8, ncap * std::mem::size_of::<Id>());
+    }
+    let names_addr = names as usize;
+    let counter = AtomicU32::new(0);
     let next = AtomicUsize::new(0);
     const STEP: usize = 1 << 14;
     std::thread::scope(|sc| {
         for _ in 0..nthreads {
-            let (b, next) = (&b, &next);
-            sc.spawn(move || loop {
-                let lo = next.fetch_add(STEP, Relaxed);
-                if lo >= slots {
-                    break;
-                }
-                let hi = (lo + STEP).min(slots);
-                let mut i = lo;
-                let mut pend = [(0u32, 0u32); BATCH];
-                while i < hi {
-                    let mut n = 0;
-                    while i < hi && n < BATCH {
-                        if b.entry(i).hi.load(Relaxed) != 0 {
-                            let r = b.find(i as u32);
-                            pend[n] = (i as u32, r);
-                            n += 1;
+            let (b, next, counter) = (&b, &next, &counter);
+            sc.spawn(move || {
+                let (mut num, mut end) = (0u32, 0u32);
+                let mut number_of = |r: u32| -> u32 {
+                    let e = b.entry(r as usize);
+                    loop {
+                        match e.root.compare_exchange(0, 2, Acquire, Acquire) {
+                            Ok(_) => {
+                                if num == end {
+                                    num = counter.fetch_add(BLOCK, Relaxed);
+                                    end = num + BLOCK;
+                                }
+                                let n = num;
+                                num += 1;
+                                unsafe { (names_addr as *mut Id).add(n as usize).write(b.id(r)) };
+                                e.person.store(n, Relaxed);
+                                e.root.store(1, Release);
+                                return n;
+                            }
+                            Err(1) => return e.person.load(Relaxed),
+                            Err(_) => std::hint::spin_loop(),
                         }
-                        i += 1;
                     }
-                    for &(k, r) in &pend[..n] {
-                        b.entry(k as usize).person.store(r, Relaxed);
+                };
+                loop {
+                    let lo = next.fetch_add(STEP, Relaxed);
+                    if lo >= slots {
+                        break;
+                    }
+                    let hi = (lo + STEP).min(slots);
+                    let mut i = lo;
+                    let mut pend = [(0u32, 0u32); BATCH];
+                    while i < hi {
+                        let mut n = 0;
+                        while i < hi && n < BATCH {
+                            if b.entry(i).hi.load(Relaxed) != 0 {
+                                let r = b.find(i as u32);
+                                if r as usize != i {
+                                    prefetch(b.entry(r as usize) as *const Entry);
+                                }
+                                pend[n] = (i as u32, r);
+                                n += 1;
+                            }
+                            i += 1;
+                        }
+                        for &(k, r) in &pend[..n] {
+                            let p = number_of(r);
+                            if k != r {
+                                b.entry(k as usize).person.store(p, Relaxed);
+                            }
+                        }
                     }
                 }
             });
         }
     });
+    let nlinked = counter.load(Relaxed);
     if std::env::var_os("SS_TIME").is_some() {
         eprintln!("  links: persons written at {:?}", t0.elapsed());
     }
@@ -441,6 +537,10 @@ fn try_build(files: &[&File], tasks: &[(usize, u64, u64)], slots: usize, nthread
         count: AtomicUsize::new(count),
         limit: slots / 20 * 17,
         full: AtomicBool::new(false),
+        names,
+        ncap,
+        persons: AtomicU32::new(nlinked),
+        epoch: EPOCH.fetch_add(1, Relaxed),
     })
 }
 
