@@ -2295,6 +2295,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn kernels_agree() {
         if !wide_ok() {
