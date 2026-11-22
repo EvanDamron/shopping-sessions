@@ -310,6 +310,19 @@ unsafe fn masks3(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
     (w(b','), w(b'"'), w(b'\n'))
 }
 
+/// Comma and quote masks and the length of the line at p if its newline is in its
+/// first 64 bytes.
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> Option<(u64, u64, usize)> {
+    let (v0, v1) = (ld(p), ld(p.add(32)));
+    let m = |v: __m256i, x: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 as u64;
+    let nl = m(v0, b'\n') | (m(v1, b'\n') << 32);
+    if nl == 0 {
+        return None;
+    }
+    Some((m(v0, b',') | (m(v1, b',') << 32), m(v0, b'"') | (m(v1, b'"') << 32), nl.trailing_zeros() as usize))
+}
+
 /// Lines per batch: decoded first, filed after (the table lines the filing reads
 /// are prefetched by the decoding).
 const BATCH: usize = 96;
@@ -767,9 +780,15 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             nl += 1;
             let p = d.add(ls);
             _mm_prefetch(p.add(AHEAD) as *const i8, _MM_HINT_T0);
-            let (c, q, nm) = masks3(p);
-            let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
-            let len = nm.trailing_zeros() as usize;
+            // Most click lines fit in 64 bytes: their masks from two loads.
+            let (c, q, len) = match masks64(p) {
+                Some((c, q, len)) => ([c, 0], [q, 0], len),
+                None => {
+                    let (c, q, nm) = masks3(p);
+                    let nm = nm[0] as u128 | ((nm[1] as u128) << 64);
+                    (c, q, nm.trailing_zeros() as usize)
+                }
+            };
             if len >= 128 {
                 ls = cold_click_from(sh, w, d, ls);
                 continue;
