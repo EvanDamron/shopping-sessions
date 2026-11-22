@@ -585,5 +585,10 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
     out.extend_from_slice(&m.buf);
     out.extend_from_slice(&mlen.to_le_bytes());
     out.extend_from_slice(b"PAR1");
+    // Diagnostic build: DIAG_NOWRITE encodes the user files but writes nothing.
+    if std::env::var_os("DIAG_NOWRITE").is_some() {
+        std::hint::black_box(&out);
+        return Ok(());
+    }
     std::fs::File::create(path)?.write_all(&out)
 }
