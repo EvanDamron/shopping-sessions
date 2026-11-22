@@ -384,18 +384,41 @@ unsafe fn structure<const K: usize>(c: [u64; 2], q: [u64; 2], len: usize) -> Opt
     if (na + ch.count_ones() != K as u32) | (bad != 0) {
         return None;
     }
-    // Comma positions as bytes: those of the low half, then those of the high half.
+    // Comma positions as bytes: those of the low half, then those of the high half
+    // (at most 4 there; a line with more, both IDs long and quoted, is read the
+    // general way).
+    const HI: usize = 4;
+    if K > HI && (K as u32 - na) as usize > HI {
+        return structure_slow::<K>(cl, ch, len, (ol, oh));
+    }
     let (mut m, mut plo) = (cl, 0u64);
     let (mut n, mut phi) = (ch, 0u64);
     for k in 0..K {
         plo |= (m.trailing_zeros() as u64) << (8 * k);
         m &= m.wrapping_sub(1);
-        phi |= (n.trailing_zeros() as u64) << (8 * k);
-        n &= n.wrapping_sub(1);
+        if k < HI {
+            phi |= (n.trailing_zeros() as u64) << (8 * k);
+            n &= n.wrapping_sub(1);
+        }
     }
     let pos = _bzhi_u64(plo, 8 * na) | ((phi + 0x4040_4040_4040_4040) << (8 * na));
     let pos = _bzhi_u64(pos, 8 * K as u32);
     // Quoted fields: the opening quotes, gathered from the field starts.
+    let fq = _pext_u64(ol, stl) | (_pext_u64(oh, sth) << stl.count_ones());
+    Some(pos | ((len as u64) << 48) | (fq << 56))
+}
+
+/// `structure`'s packing for a line with more than four commas in its high half.
+#[cold]
+#[inline(never)]
+unsafe fn structure_slow<const K: usize>(cl: u64, ch: u64, len: usize, (ol, oh): (u64, u64)) -> Option<u64> {
+    let mut m = cl as u128 | ((ch as u128) << 64);
+    let mut pos = 0u64;
+    for k in 0..K {
+        pos |= (m.trailing_zeros() as u64) << (8 * k);
+        m &= m.wrapping_sub(1);
+    }
+    let (stl, sth) = ((cl << 1) | 1, (ch << 1) | (cl >> 63));
     let fq = _pext_u64(ol, stl) | (_pext_u64(oh, sth) << stl.count_ones());
     Some(pos | ((len as u64) << 48) | (fq << 56))
 }
