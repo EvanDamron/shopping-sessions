@@ -38,24 +38,20 @@ use crate::{flush, CRec, Ctx, PRec, Shared, Worker, CCH, CS};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
-/// One place of the slot table. `u` is user number << 4 | alias (aliases from 15 up
-/// are written as 15, the full value kept aside), or one of the marks below; `t` has
-/// `BUY` set for a purchase; a vacant slot is all ones, so any real ingest key is
-/// smaller than its `ing`.
+/// One place of the slot table: the record's user word as phase A wrote it (`XRec::a`),
+/// its time with `BUY` set for a purchase, and its ingest key. A vacant slot is all
+/// ones, so any real ingest key is smaller than its `ing`. The price of a purchase is
+/// kept in a table of its own (`Tls::pcs`), written and read only for purchases.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot {
+    a: u64,
     t: u32,
-    u: u32,
-    pc: u32,
     ing: u32,
 }
-const VACANT: Slot = Slot { t: !0, u: !0, pc: !0, ing: !0 };
-/// The kept copy fails validation: the event is dropped.
-const U_INVALID: u32 = 0xFFFF_FFF0;
-/// The kept copy has a user ID of another form: its person number is kept aside.
-const U_ODD: u32 = 0xFFFF_FF0F;
-/// Alias code of an alias that does not fit four bits (and the low bits of `U_ODD`).
+const VACANT: Slot = Slot { a: !0, t: !0, ing: !0 };
+/// In the dense user column (user number << 4 | alias): the code of every alias from
+/// 15 up; the full value is kept aside (`Tls::esc`).
 const FAR: u32 = 15;
 const BUY: u32 = 1 << 31;
 const M31: u32 = BUY - 1;
@@ -155,6 +151,19 @@ impl Acc {
     }
 }
 
+/// Adds a thread's campaign counts to the general pipeline's tables.
+unsafe fn fold_counts(acc: &Acc, st: &mut CS, ctx: &Ctx) {
+    let nd = ctx.ndays;
+    for c in 0..=ctx.organic as usize {
+        for d in 0..nd {
+            let (from, to) = ((c << acc.wsh) + d, c * nd + d);
+            st.credit[to][0] += *acc.sess.add(from) as u64 + ((*acc.purch.add(from) as u64) << 32);
+            st.credit[to][1] += *acc.rev.add(from);
+            st.assist[to] += *acc.assist.add(from);
+        }
+    }
+}
+
 /// What a bucket leaves behind about its first or last run.
 #[derive(Clone, Copy)]
 struct Piece {
@@ -212,7 +221,7 @@ impl ToGeneral {
 /// One thread's tables and work areas, made once and used for every bucket.
 struct Tls {
     slots: *mut Slot,
-    full: *mut u64, // per slot, written only with the marks that say so
+    pcs: *mut u32, // per slot: price | category << 24 of a purchase
     t: *mut u32,    // dense columns; index -1 is readable
     u: *mut u32,
     pc: *mut u32,
@@ -239,7 +248,7 @@ impl Tls {
         let col = (cap + 64) * 4;
         let wsh = ctx.ndays.next_power_of_two().max(16).trailing_zeros();
         let cells = (ctx.organic as usize + 1) << wsh;
-        let tables = (cap + 16) * 16 + cap * 8 + 5 * col;
+        let tables = (cap + 16) * 16 + cap * 4 + 5 * col;
         let tables = tables.div_ceil(64) * 64;
         let bytes = tables + cells * 20;
         let len = bytes.div_ceil(H) * H;
@@ -252,8 +261,8 @@ impl Tls {
             for i in 0..cap + 16 {
                 *slots.add(i) = VACANT;
             }
-            let full = base.add((cap + 16) * 16) as *mut u64;
-            let cols = base.add((cap + 16) * 16 + cap * 8);
+            let pcs = base.add((cap + 16) * 16) as *mut u32;
+            let cols = base.add((cap + 16) * 16 + cap * 4);
             // Touch the columns now, so no page is first written inside the bucket loop.
             std::ptr::write_bytes(cols, 0, 5 * col);
             let counts = base.add(tables);
@@ -268,7 +277,7 @@ impl Tls {
             let at = |k: usize| cols.add(k * col + 64) as *mut u32;
             Tls {
                 slots,
-                full,
+                pcs,
                 t: at(0),
                 u: at(1),
                 pc: at(2),
@@ -315,63 +324,66 @@ struct Env<'a> {
 
 /// Places a bucket's records in the slot table.
 #[inline(never)]
-unsafe fn place(tab: *mut Slot, full: *mut u64, l: &[(usize, u32)]) {
+unsafe fn place(tab: *mut Slot, pcs: *mut u32, l: &[(usize, u32)]) {
     const AHEAD: usize = 16;
     for &(c, n) in l {
         let n = n as usize;
         let rs = c as *const XRec;
         for i in 0..n {
             let r = &*rs.add(i);
-            // (The place of a record a few ahead is fetched early, and the records
-            // themselves further ahead.)
-            prefetch_read(rs.add(i + 48));
+            // (The place of a record a few ahead is fetched early.)
             prefetch_write(tab.add((*rs.add((i + AHEAD).min(n - 1))).lo as usize));
             let at = r.lo as usize;
             let s = tab.add(at);
             if r.ing < (*s).ing {
-                let a = r.a;
-                let u = if a & (INVALID | ODDU) == 0 {
-                    (((a >> 9) as u32) << 4) | ((a & 511) as u32).min(FAR)
-                } else if a & INVALID != 0 {
-                    U_INVALID
-                } else {
-                    U_ODD
-                };
-                *s = Slot { t: r.t | if r.pc != 0 { BUY } else { 0 }, u, pc: r.pc, ing: r.ing };
-                if u & 15 == FAR {
-                    *full.add(at) = a;
+                *s = Slot { a: r.a, t: r.t | ((r.pc != 0) as u32) << 31, ing: r.ing };
+                if r.pc != 0 {
+                    *pcs.add(at) = r.pc;
                 }
             }
         }
     }
 }
 
-/// A slot that is neither a plain valid event nor vacant nor invalid.
+/// The dense user word of a valid slot: user number << 4 | alias code.
+#[inline(always)]
+fn user_word(a: u64) -> u32 {
+    (((a >> 9) as u32) << 4) | ((a & 511) as u32).min(FAR)
+}
+
+/// A valid slot that is a purchase or has a far alias, or the slot of an odd user ID:
+/// `n` is its place in the dense columns (the place it would have, for an odd user).
 #[inline(always)]
 unsafe fn special(x: &mut Tls, at: usize, s: Slot, n: usize) {
-    if s.u == U_ODD {
-        x.odd.push((*x.full.add(at), s.t & M31, s.pc));
-    } else {
-        x.esc.push((n as u32, *x.full.add(at)));
+    let pc = if s.t & BUY != 0 { *x.pcs.add(at) } else { 0 };
+    if s.a & (INVALID | ODDU) == ODDU {
+        x.odd.push((s.a, s.t & M31, pc));
+        return;
+    }
+    if s.t & BUY != 0 {
+        *x.pc.add(n) = pc;
+    }
+    if (s.a & 511) as u32 >= FAR {
+        x.esc.push((n as u32, s.a));
     }
 }
 
-/// Reads the slot table out in order, valid events only, into the dense columns, and
-/// leaves the table vacant. Returns the number of events.
+/// Reads the slot table out in order, valid events only, into the dense columns (the
+/// price column is written at purchases only), and leaves the table vacant. Returns
+/// the number of events.
 unsafe fn readout_plain(x: &mut Tls, cap: usize) -> usize {
     let mut n = 0;
     for at in 0..cap {
         let s = *x.slots.add(at);
         *x.slots.add(at) = VACANT;
-        if (s.u as i32) >= 0 {
-            if s.u & 15 == FAR {
+        if s.a & (INVALID | ODDU) == 0 {
+            if s.t & BUY != 0 || (s.a & 511) as u32 >= FAR {
                 special(x, at, s, n);
             }
             *x.t.add(n) = s.t;
-            *x.u.add(n) = s.u;
-            *x.pc.add(n) = s.pc;
+            *x.u.add(n) = user_word(s.a);
             n += 1;
-        } else if s.u == U_ODD {
+        } else if s.a & (INVALID | ODDU) == ODDU {
             special(x, at, s, n);
         }
     }
@@ -384,11 +396,12 @@ unsafe fn readout_wide(x: &mut Tls, cap: usize) -> usize {
     use core::arch::x86_64::*;
     // Sixteen slots are four 64-byte loads; each field is every fourth lane.
     let pick = |f: i32| _mm512_setr_epi32(f, f + 4, f + 8, f + 12, f + 16, f + 20, f + 24, f + 28, 0, 0, 0, 0, 0, 0, 0, 0);
-    let (it, iu, ip) = (pick(0), pick(1), pick(2));
+    let (ilo, ihi, it) = (pick(0), pick(1), pick(2));
     let ones = _mm512_set1_epi32(-1);
     let zero = _mm512_setzero_si512();
-    let low4 = _mm512_set1_epi32(15);
-    let (t, u, pc) = (x.t, x.u, x.pc);
+    let far = _mm512_set1_epi32(FAR as i32);
+    let low9 = _mm512_set1_epi32(511);
+    let (t, u) = (x.t, x.u);
     let mut n = 0usize;
     let mut at = 0usize;
     while at < cap {
@@ -399,9 +412,18 @@ unsafe fn readout_wide(x: &mut Tls, cap: usize) -> usize {
             let b = _mm512_permutex2var_epi32(z2, i, z3);
             _mm512_inserti64x4::<1>(a, _mm512_castsi512_si256(b))
         };
-        let vu = col(iu);
-        let valid = !_mm512_cmplt_epi32_mask(vu, zero);
-        let spec = _mm512_cmpeq_epi32_mask(_mm512_and_si512(vu, low4), low4) & _mm512_cmpneq_epi32_mask(vu, ones);
+        // The user word's two halves: the marks are the top two bits of the high half.
+        let (lo, hi, vt) = (col(ilo), col(ihi), col(it));
+        let marks = _mm512_srli_epi32::<30>(hi);
+        let valid = _mm512_cmpeq_epi32_mask(marks, zero);
+        let odd = _mm512_cmpeq_epi32_mask(marks, _mm512_set1_epi32(1));
+        let alias = _mm512_and_si512(lo, low9);
+        // user number << 4 | alias code: the number is bits 9.. of the 64-bit word.
+        let vu = _mm512_or_si512(
+            _mm512_or_si512(_mm512_slli_epi32::<4>(_mm512_srli_epi32::<9>(lo)), _mm512_slli_epi32::<27>(hi)),
+            _mm512_min_epu32(alias, far),
+        );
+        let spec = (valid & (_mm512_cmplt_epi32_mask(vt, zero) | _mm512_cmpge_epu32_mask(alias, far))) | odd;
         if spec != 0 {
             let mut m = spec as u32;
             while m != 0 {
@@ -412,9 +434,8 @@ unsafe fn readout_wide(x: &mut Tls, cap: usize) -> usize {
                 special(x, at + k, s, n + before);
             }
         }
-        _mm512_storeu_si512(t.add(n) as *mut __m512i, _mm512_maskz_compress_epi32(valid, col(it)));
+        _mm512_storeu_si512(t.add(n) as *mut __m512i, _mm512_maskz_compress_epi32(valid, vt));
         _mm512_storeu_si512(u.add(n) as *mut __m512i, _mm512_maskz_compress_epi32(valid, vu));
-        _mm512_storeu_si512(pc.add(n) as *mut __m512i, _mm512_maskz_compress_epi32(valid, col(ip)));
         n += (valid as u32).count_ones() as usize;
         _mm512_storeu_si512(p, ones);
         _mm512_storeu_si512(p.add(1), ones);
@@ -764,6 +785,17 @@ unsafe fn person_rows(st: &mut CS, acc: &Acc, ctx: &Ctx, name: Id, s: &mut Scr, 
             clicks = click_pass_plain(s, kc, ids, m, words, &cid);
         }
     }
+    {
+        // The rows are appended to six columns that are not in cache: the lines the
+        // next few persons' rows will land on are fetched now.
+        let r = &st.rows;
+        prefetch_write(r.names.as_ptr().wrapping_add(r.names.len() + 256));
+        prefetch_write((r.days.as_ptr() as *const u8).wrapping_add(r.days.len() * 4 + 128));
+        prefetch_write((r.sessions.as_ptr() as *const u8).wrapping_add(r.sessions.len() * 4 + 128));
+        prefetch_write((r.events.as_ptr() as *const u8).wrapping_add(r.events.len() * 4 + 128));
+        prefetch_write((r.revenue.as_ptr() as *const u8).wrapping_add(r.revenue.len() * 8 + 192));
+        prefetch_write(r.tops.as_ptr().wrapping_add(r.tops.len() + 64));
+    }
     let (mut cur, mut us, mut ue, mut ur) = (NONE, 0u32, 0u32, 0u64);
     let mut pp = 0usize;
     let npur = s.pur.len();
@@ -949,14 +981,14 @@ unsafe fn general_extras(env: &Env, x: &mut Tls, w: &mut Worker, more: &[(u64, u
 /// pipeline (a joined run that failed a check; rare).
 #[inline(never)]
 unsafe fn replay(env: &Env, x: &mut Tls, w: &mut Worker, b: usize, g: u32) {
-    place(x.slots, x.full, &env.li.ev[b]);
+    place(x.slots, x.pcs, &env.li.ev[b]);
     x.gen.next_user();
     for at in 0..env.cap {
         let s = *x.slots.add(at);
         *x.slots.add(at) = VACANT;
-        if (s.u as i32) >= 0 && s.u >> 4 == g {
-            let un = if s.u & 15 == FAR { *x.full.add(at) } else { ((g as u64) << 9) | (s.u & 15) as u64 };
-            x.gen.event(env, w, un, s.t & M31, s.pc);
+        if s.a & (INVALID | ODDU) == 0 && (s.a >> 9) as u32 == g {
+            let pc = if s.t & BUY != 0 { *x.pcs.add(at) } else { 0 };
+            x.gen.event(env, w, s.a, s.t & M31, pc);
             x.cnt[1] += 1;
         }
     }
@@ -1013,7 +1045,8 @@ unsafe fn general_run(env: &Env, x: &mut Tls, w: &mut Worker, r0: usize, r1: usi
         } else {
             ((u >> 4) as u64) << 9 | (u & 15) as u64
         };
-        x.gen.event(env, w, un, *x.t.add(i) & M31, *x.pc.add(i));
+        let t = *x.t.add(i);
+        x.gen.event(env, w, un, t & M31, if t & BUY != 0 { *x.pc.add(i) } else { 0 });
     }
     x.cnt[1] += (r1 - r0) as u64;
 }
@@ -1128,7 +1161,7 @@ unsafe fn event_bucket(b: usize, env: &Env, x: &mut Tls, st: &mut CS, w: &mut Wo
         return;
     }
     let t0 = Instant::now();
-    place(x.slots, x.full, l);
+    place(x.slots, x.pcs, l);
     let t1 = Instant::now();
     x.uns.clear();
     x.esc.clear();
@@ -1491,15 +1524,7 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
                     gate2.wait();
                     w.finish(sh);
                     // This thread's campaign counts join the general pipeline's.
-                    let (acc, nd) = (x.acc, env.ctx.ndays);
-                    for c in 0..=env.ctx.organic as usize {
-                        for d in 0..nd {
-                            let (from, to) = ((c << acc.wsh) + d, c * nd + d);
-                            st.credit[to][0] += *acc.sess.add(from) as u64 + ((*acc.purch.add(from) as u64) << 32);
-                            st.credit[to][1] += *acc.rev.add(from);
-                            st.assist[to] += *acc.assist.add(from);
-                        }
-                    }
+                    fold_counts(&x.acc, st, env.ctx);
                     // The click index is done with: each thread returns its share.
                     let part = (kc_bytes / nthreads) & !4095;
                     let lo = part * x.ti;
@@ -1538,4 +1563,273 @@ pub fn run(sh: &Shared, workers: &mut [Worker], cs: &mut [CS], ctx: &Ctx, log: &
         );
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Clk;
+
+    struct Rnd(u64);
+    impl Rnd {
+        fn below(&mut self, m: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % m
+        }
+    }
+
+    fn ctx(cats: &[Vec<u8>]) -> Ctx<'_> {
+        // A 14-day window starting at a midnight: times are ms since 7 days before it.
+        Ctx { ndays: 14, dayoff: -(WEEK as i64), organic: 37, day0: 20_000, cats }
+    }
+
+    /// Sessions of time-sorted events, the plain way: (start, end, events, purchases).
+    fn sessions(ev: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<(u32, u32)>) {
+        let (mut st, mut en, mut sn, mut pur) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, &(t, pc)) in ev.iter().enumerate() {
+            if i == 0 || t - ev[i - 1].0 > MIN30 as u32 {
+                st.push(t);
+                en.push(t);
+                sn.push(0);
+            }
+            *en.last_mut().unwrap() = t;
+            *sn.last_mut().unwrap() += 1;
+            if pc != 0 {
+                pur.push((st.len() as u32 - 1, pc));
+            }
+        }
+        (st, en, sn, pur)
+    }
+
+    fn events(r: &mut Rnd, n: usize) -> Vec<(u32, u32)> {
+        let mut ev: Vec<(u32, u32)> = (0..n)
+            .map(|_| {
+                // Clustered times, with gaps around the 30-minute line.
+                let base = WEEK + r.below(40) as u32 * 7_200_000 * 4;
+                let t = base + r.below(4) as u32 * (MIN30 as u32 - 1 + r.below(3) as u32) + r.below(3) as u32 * 1000;
+                let pc = if r.below(5) == 0 { (1 + r.below(50_000) as u32) | ((r.below(5) as u32) << 24) } else { 0 };
+                (t.min(WEEK + 14 * DAY - 1), pc)
+            })
+            .collect();
+        ev.sort_unstable();
+        ev
+    }
+
+    #[test]
+    fn added_events_resessionize() {
+        let mut r = Rnd(0x1234_5678_9abc_def1);
+        for round in 0..20_000 {
+            let n = 1 + r.below(if round % 50 == 0 { 300 } else { 24 }) as usize;
+            let ev = events(&mut r, n);
+            // Any subset first, the rest added one by one in any order.
+            let mut keep: Vec<(u32, u32)> = Vec::new();
+            let mut later: Vec<(u32, u32)> = Vec::new();
+            for (i, &e) in ev.iter().enumerate() {
+                if i == 0 || r.below(4) != 0 {
+                    keep.push(e);
+                } else {
+                    later.push(e);
+                }
+            }
+            if later.is_empty() {
+                continue;
+            }
+            for i in (1..later.len()).rev() {
+                later.swap(i, r.below(i as u64 + 1) as usize);
+            }
+            let (st, en, sn, pur) = sessions(&keep);
+            let mut s = Scr { st, en, sn, pur, ..Scr::default() };
+            for &(t, pc) in &later {
+                add_event(&mut s, t, pc);
+            }
+            let (st, en, sn, mut pur) = sessions(&ev);
+            assert_eq!((&s.st, &s.sn, &s.en), (&st, &sn, &en), "round {round}");
+            let mut got = s.pur.clone();
+            assert!(got.windows(2).all(|w| w[0].0 <= w[1].0), "purchases by session");
+            got.sort_unstable();
+            pur.sort_unstable();
+            assert_eq!(got, pur, "round {round}");
+        }
+    }
+
+    #[test]
+    fn person_matches_the_general_pipeline() {
+        let cats: Vec<Vec<u8>> = [&b"apparel"[..], b"books", b"garden", b"toys", b"unknown"].iter().map(|c| c.to_vec()).collect();
+        let ctx = ctx(&cats);
+        let cells = (ctx.organic as usize + 1) * ctx.ndays;
+        let mut r = Rnd(0x9abc_def1_1234_5678);
+        let x = Tls::new(64, 0, &ctx);
+        let wides: &[bool] = if wide_ok() { &[false, true] } else { &[false] };
+        for round in 0..6_000 {
+            // Mostly small persons; some with more than 64 and more than 256 sessions.
+            let n = match round % 200 {
+                0 => 3000,
+                1 | 2 => 600,
+                _ => 1 + r.below(40) as usize,
+            };
+            let mut ev = events(&mut r, n);
+            if round % 200 == 0 {
+                // Spread out: one session per event.
+                for (i, e) in ev.iter_mut().enumerate() {
+                    e.0 = (WEEK as u64 + i as u64 * (MIN30 as u64 + 1 + (i as u64 % 3))).min(u32::MAX as u64) as u32;
+                }
+                ev.retain(|e| e.0 < WEEK + 14 * DAY);
+            }
+            let (st, _, sn, pur) = sessions(&ev);
+            let nclicks = match round % 7 {
+                0 => 0,
+                1 => 300,
+                _ => r.below(30) as usize,
+            };
+            let mut ids: Vec<Id> = Vec::new();
+            let mut kc: Vec<Kc> = Vec::new();
+            for _ in 0..nclicks {
+                // Around session starts: at them, a week before, 1 ms either side.
+                let s0 = st[r.below(st.len() as u64) as usize];
+                let ts = match r.below(8) {
+                    0 => s0,
+                    1 => s0 + 1,
+                    2 => s0 - WEEK,
+                    3 => s0 - WEEK - 1,
+                    4 => s0 - r.below(WEEK as u64) as u32,
+                    5 => r.below((21 * DAY) as u64) as u32,
+                    _ => s0 - r.below(3_600_000) as u32,
+                };
+                let camp = if r.below(3) == 0 { r.below(3) as u32 } else { r.below(ctx.organic as u64) as u32 };
+                let alias = r.below(4) as u32;
+                let id = Id::intern(format!("k{}", r.below(1_000_000)).as_bytes());
+                kc.push(Kc { ts, ca: (camp << 9) | alias, j: ids.len() as u32 });
+                ids.push(id);
+                if r.below(10) == 0 {
+                    // A copy of the click, and another click at the same instant.
+                    kc.push(Kc { ts, ca: (camp << 9) | alias, j: ids.len() as u32 });
+                    ids.push(id);
+                    let other = Id::intern(format!("k{}", r.below(1_000_000)).as_bytes());
+                    kc.push(Kc { ts, ca: (r.below(ctx.organic as u64) as u32) << 9 | alias, j: ids.len() as u32 });
+                    ids.push(other);
+                }
+            }
+            let allowed = 0b1011u32;
+            let name = user_text(r.below(1 << 40));
+            // The general pipeline's person(): events and the person's clicks by time.
+            let mut want = CS::new(cells);
+            let evs: Vec<u64> = ev.iter().map(|e| ((e.0 as u64) << 32) | e.1 as u64).collect();
+            let mut cl: Vec<Clk> = kc.iter().filter(|k| (allowed >> (k.ca & 511)) & 1 != 0).map(|k| Clk { ts: k.ts, camp: k.ca >> 9, cid: ids[k.j as usize] }).collect();
+            cl.sort_by_key(|c| c.ts);
+            crate::person(&mut want, name, &evs, &cl, &ctx);
+            for &wide in wides {
+                let mut got = CS::new(cells);
+                let mut s = Scr { st: st.clone(), sn: sn.clone(), pur: pur.clone(), ..Scr::default() };
+                unsafe {
+                    person_rows(&mut got, &x.acc, &ctx, name, &mut s, &kc, allowed, wide, |j| ids[j as usize]);
+                    fold_counts(&x.acc, &mut got, &ctx);
+                    let rows = (ctx.organic as usize + 1) << x.acc.wsh;
+                    std::ptr::write_bytes(x.acc.rev, 0, rows);
+                    std::ptr::write_bytes(x.acc.sess, 0, rows);
+                    std::ptr::write_bytes(x.acc.assist, 0, rows);
+                    std::ptr::write_bytes(x.acc.purch, 0, rows);
+                }
+                let (a, b) = (&got.rows, &want.rows);
+                assert_eq!(a.n, b.n, "round {round} wide {wide}");
+                assert_eq!((&a.names, &a.days, &a.sessions, &a.events), (&b.names, &b.days, &b.sessions, &b.events), "round {round} wide {wide}");
+                assert_eq!((&a.revenue, &a.top_bits, &a.tops), (&b.revenue, &b.top_bits, &b.tops), "round {round} wide {wide}");
+                assert_eq!(got.credit, want.credit, "credit, round {round} wide {wide}");
+                assert_eq!(got.assist, want.assist, "assists, round {round} wide {wide}");
+            }
+        }
+    }
+
+    #[test]
+    fn kernels_agree() {
+        if !wide_ok() {
+            return;
+        }
+        let cats: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+        let ctx = ctx(&cats);
+        let cap = 1024usize;
+        let (mut a, mut b) = (Tls::new(cap, 0, &ctx), Tls::new(cap, 1, &ctx));
+        let mut r = Rnd(0x0f1e_2d3c_4b5a_6978);
+        for round in 0..3_000 {
+            // A table as `place` leaves it: runs of users, times mostly rising, some
+            // vacant, invalid and odd slots, far aliases, purchases, order breaks.
+            let (mut g, mut t) = (r.below(1000), WEEK);
+            let sparse = round % 5 == 0;
+            for at in 0..cap {
+                if r.below(12) == 0 {
+                    g = if r.below(60) == 0 { g.saturating_sub(1 + r.below(3)) } else { g + 1 + r.below(3) };
+                    t = WEEK + r.below(1000) as u32;
+                }
+                t = match r.below(40) {
+                    0 => t + MIN30 as u32 + r.below(3) as u32 - 1,
+                    1 => t.saturating_sub(r.below(2000) as u32).max(1),
+                    _ => t + r.below(3) as u32 * 1000,
+                };
+                let alias = match r.below(30) {
+                    0 => 15 + r.below(400),
+                    1 => 14,
+                    _ => r.below(3),
+                };
+                let buy = r.below(20) == 0;
+                let slot = match r.below(if sparse { 3 } else { 60 }) {
+                    0 => VACANT,
+                    1 => Slot { a: INVALID | r.below(1 << 40), t: r.below(1 << 31) as u32, ing: 5 },
+                    2 if !sparse => Slot { a: ODDU | r.below(1 << 23), t: t | if buy { BUY } else { 0 }, ing: 5 },
+                    _ => Slot { a: (g << 9) | alias, t: t | if buy { BUY } else { 0 }, ing: 5 },
+                };
+                unsafe {
+                    for x in [&mut a, &mut b] {
+                        *x.slots.add(at) = slot;
+                        *x.pcs.add(at) = if buy { 7 + at as u32 } else { 0xDEAD };
+                    }
+                }
+            }
+            for x in [&mut a, &mut b] {
+                x.uns.clear();
+                x.esc.clear();
+                x.odd.clear();
+            }
+            unsafe {
+                let (na, nb) = (readout_plain(&mut a, cap), readout_wide(&mut b, cap));
+                assert_eq!(na, nb, "round {round}");
+                let col = |p: *mut u32, n: usize| std::slice::from_raw_parts(p, n).to_vec();
+                assert_eq!(col(a.t, na), col(b.t, nb), "times, round {round}");
+                assert_eq!(col(a.u, na), col(b.u, nb), "users, round {round}");
+                assert_eq!((&a.esc, &a.odd), (&b.esc, &b.odd), "round {round}");
+                for i in 0..na {
+                    if *a.t.add(i) & BUY != 0 {
+                        assert_eq!(*a.pc.add(i), *b.pc.add(i), "price, round {round}");
+                    }
+                }
+                for at in 0..cap {
+                    let (sa, sb) = (*a.slots.add(at), *b.slots.add(at));
+                    assert!(sa.a == !0 && sa.ing == !0 && sb.a == !0 && sb.ing == !0, "table left vacant");
+                }
+                if na == 0 {
+                    continue;
+                }
+                let (ca, cb) = (cut_plain(&mut a, na), cut_wide(&mut b, nb));
+                assert_eq!((ca.ns, ca.np, ca.down), (cb.ns, cb.np, cb.down), "round {round}");
+                assert_eq!(col(a.ss, ca.ns + 1), col(b.ss, cb.ns + 1), "sessions, round {round}");
+                assert_eq!(col(a.pi, ca.np), col(b.pi, cb.np), "purchases, round {round}");
+                assert_eq!(a.uns, b.uns, "order breaks, round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn names_order_like_text() {
+        let mut r = Rnd(0x2468_ace1_1357_9bdf);
+        let mut ns: Vec<u64> = (0..4000).map(|i| if i % 3 == 0 { r.below(40_000) } else { r.below(1 << 40) }).collect();
+        ns.extend([0, 1, 35, 36, 1295, 1296, (1 << 40) - 1]);
+        for &x in &ns {
+            for &y in ns.iter().take(300) {
+                let (a, b) = (user_text(x), user_text(y));
+                assert_eq!(text_key(x) < text_key(y), a.less(&b), "{x} {y}");
+            }
+        }
+        assert_eq!(user_text(0).bytes(), b"u0");
+        assert_eq!(user_text(36 * 36 + 35).bytes(), b"u10z");
+    }
 }
