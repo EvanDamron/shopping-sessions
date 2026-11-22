@@ -330,16 +330,29 @@ impl Id {
         Id { lo: mum(x, K1 ^ y), hi: mum(y ^ K3, x ^ K4) | (0xFE << 56) }
     }
 
+    /// A click ID of more than 15 bytes by reference: its `len` (< 256) bytes stay
+    /// where they are, in an input mapping that lives to process exit. Such an `Id`
+    /// orders like its bytes (`less`), but equal strings at two places are two
+    /// values: for click IDs, which are only ever ordered, never matched.
+    #[inline(always)]
+    pub fn external(p: *const u8, len: usize) -> Id {
+        debug_assert!(len > 15 && len < 256);
+        Id { lo: p as u64, hi: (0xFD << 56) | len as u64 }
+    }
+
+    /// Stored elsewhere: interned, or (marker 0xFD) by reference.
     #[inline(always)]
     pub fn is_long(&self) -> bool {
-        self.hi >> 56 == 0xFF
+        (self.hi >> 56) | 2 == 0xFF
     }
 
     /// The bytes of the ID (not valid for event keys made by `key`).
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
-            if self.is_long() {
+            if self.hi >> 56 == 0xFD {
+                std::slice::from_raw_parts(self.lo as usize as *const u8, (self.hi & 0xFF) as usize)
+            } else if self.is_long() {
                 let p = self.lo as usize as *const u8;
                 let n = (p as *const u64).read_unaligned() as usize;
                 std::slice::from_raw_parts(p.add(8), n)
@@ -425,5 +438,15 @@ mod tests {
             }
         }
         assert_eq!(Id::intern(b""), Id::EMPTY);
+        // By reference: ordered like the bytes, against inline and interned IDs alike.
+        for a in strs.iter().filter(|a| a.len() > 15).take(300) {
+            let ea = Id::external(a.as_ptr(), a.len());
+            assert_eq!(ea.bytes(), &a[..]);
+            for b in strs.iter().take(200) {
+                let ib = Id::intern(b);
+                assert_eq!(ea.less(&ib), &a[..] < &b[..], "{a:?} {b:?}");
+                assert_eq!(ib.less(&ea), &b[..] < &a[..], "{b:?} {a:?}");
+            }
+        }
     }
 }

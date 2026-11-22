@@ -624,8 +624,8 @@ unsafe fn campaign(sh: &Shared, tab: &[u32], p: *const u8, s: usize, e: usize) -
 
 /// Click lines `d[s..e]`: every line parsed and filed as `crate::clicks` files it.
 #[inline(never)]
-pub(crate) unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, e: usize) {
-    CB.with(|b| clicks_in(sh, w, d, s, e, &mut b.borrow_mut()));
+pub(crate) unsafe fn clicks(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, e: usize, ext: bool) {
+    CB.with(|b| clicks_in(sh, w, d, s, e, ext, &mut b.borrow_mut()));
 }
 
 /// The plain reading of the click line at `ls` whose newline the window did not
@@ -642,7 +642,7 @@ unsafe fn cold_click_from(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize) 
 }
 
 #[inline(always)]
-unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut CBatch) {
+unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, ext: bool, bt: &mut CBatch) {
     let win = &sh.win;
     let tab = camps(sh);
     let mut ls = s;
@@ -711,6 +711,10 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 let cid = Id::short(p.add(s0), clen);
                 *bt.clo.get_unchecked_mut(n) = cid.lo;
                 *bt.chi.get_unchecked_mut(n) = cid.hi;
+            } else if ext {
+                let cid = Id::external(p.add(s0), clen);
+                *bt.clo.get_unchecked_mut(n) = cid.lo;
+                *bt.chi.get_unchecked_mut(n) = cid.hi;
             } else {
                 let h = Id::long_hash(p.add(s0), clen);
                 Id::prefetch_long(h);
@@ -764,7 +768,9 @@ unsafe fn check_batch_clicks(sh: &Shared, d: *const u8, a: usize, b: usize, bt: 
         if le - ls < 128 {
             if let Some(p) = plain_fields::<4>(d, ls, le).and_then(|f| click_row(sh, d, &f)) {
                 let mine = (j < n).then(|| bt.row(j));
-                if mine != Some(p) {
+                // (Click IDs compare by bytes: a long one may be held by reference.)
+                let same = mine.is_some_and(|m| m.uid == p.uid && m.ts == p.ts && m.camp == p.camp && m.cid.bytes() == p.cid.bytes());
+                if !same {
                     eprintln!("click decoder differs from the plain reading on: {:?}\n  decoder {:?}\n  plain   {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(d.add(ls), le - ls)), mine, p);
                     std::process::exit(3);
                 }
