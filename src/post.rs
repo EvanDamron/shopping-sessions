@@ -277,6 +277,37 @@ pub struct Scr {
     asn: Vec<u16>, // per assist cell: assists not yet in `st.assist`
 }
 
+impl Scr {
+    /// Gives the memory back without freeing it (see mem::release_vec).
+    pub fn release(self) {
+        use crate::mem::release_vec as r;
+        let Scr { off, coff, ev, plist, poff, pev, cl, cids, dead, stamp, sid: _, who, ck, keys, rtmp, lo, hi, open, occ, agg, words: _, sfirst, nday, sect: _, ses, asn } = self;
+        r(off);
+        r(coff);
+        r(ev);
+        r(plist);
+        r(poff);
+        r(pev);
+        r(cl);
+        r(cids);
+        r(dead);
+        r(stamp);
+        r(who);
+        r(ck);
+        r(keys);
+        r(rtmp);
+        r(lo);
+        r(hi);
+        r(open);
+        r(occ);
+        r(agg);
+        r(sfirst);
+        r(nday);
+        r(ses);
+        r(asn);
+    }
+}
+
 /// A person's events in one half-hour slot.
 #[derive(Clone, Copy, Default)]
 struct Agg {

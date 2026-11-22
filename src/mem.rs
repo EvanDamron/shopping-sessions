@@ -45,6 +45,19 @@ pub fn release(p: *mut u8, bytes: usize) {
     let _ = (p, bytes);
 }
 
+/// Gives the whole pages of a vector that is never touched again back to the kernel
+/// and leaks it, instead of freeing it: threads that free big blocks at once queue
+/// on the address-space lock (munmap takes it to write), while madvise only reads it.
+pub fn release_vec<T>(v: Vec<T>) {
+    let a = v.as_ptr() as usize;
+    let b = a + v.capacity() * std::mem::size_of::<T>();
+    let (a, b) = ((a + 4095) & !4095, b & !4095);
+    if b > a {
+        release(a as *mut u8, b - a);
+    }
+    std::mem::forget(v);
+}
+
 /// Faults a range in with one call instead of one trap per page (Linux 5.14+;
 /// elsewhere, and on older kernels, the pages are simply faulted on first touch).
 pub fn populate(p: *mut u8, bytes: usize) {
