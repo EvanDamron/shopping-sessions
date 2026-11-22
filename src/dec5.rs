@@ -28,10 +28,6 @@ use crate::id::Id;
 use crate::{parse_price, plain_fields, CRec, PRec, Shared, Worker, CART, DAY, NOSLOT, PURCHASE, VIEW, WEEK};
 use core::arch::x86_64::*;
 
-/// Bytes of a piece whose newlines are found in one go (a batch is the lines that
-/// end in such a stretch).
-const STRETCH: usize = 4096;
-
 /// What the general rules make of one event line (rules.md "Events", steps 1, 3, 4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ERow {
@@ -166,68 +162,7 @@ unsafe fn ld(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p as *const __m256i)
 }
 
-/// Comma and quote masks of the 128 bytes at p.
-#[inline(always)]
-unsafe fn cq128(p: *const u8) -> (u128, u128) {
-    let (v0, v1, v2, v3) = (ld(p), ld(p.add(32)), ld(p.add(64)), ld(p.add(96)));
-    let c = _mm256_set1_epi8(b',' as i8);
-    let q = _mm256_set1_epi8(b'"' as i8);
-    let m = |v: __m256i, x: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, x)) as u32 as u64;
-    let cl = m(v0, c) | (m(v1, c) << 32);
-    let ch = m(v2, c) | (m(v3, c) << 32);
-    let ql = m(v0, q) | (m(v1, q) << 32);
-    let qh = m(v2, q) | (m(v3, q) << 32);
-    (cl as u128 | ((ch as u128) << 64), ql as u128 | ((qh as u128) << 64))
-}
 
-/// Newline mask of the 64 bytes at p.
-#[inline(always)]
-unsafe fn nl64(p: *const u8) -> u64 {
-    let n = _mm256_set1_epi8(b'\n' as i8);
-    let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(p), n)) as u32 as u64;
-    let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(p.add(32)), n)) as u32 as u64;
-    a | (b << 32)
-}
-
-/// `(1 << len) - 1` for `len` below 128.
-static LM: [u128; 128] = {
-    let mut t = [0u128; 128];
-    let mut i = 0;
-    while i < 128 {
-        t[i] = (1u128 << i) - 1;
-        i += 1;
-    }
-    t
-};
-
-/// The commas of the line of `len` (< 128) bytes at p, which must have `K` of them;
-/// None for a malformed line (another comma count, or a quote anywhere but around a
-/// whole field).
-#[inline(always)]
-unsafe fn commas<const K: usize>(p: *const u8, len: usize) -> Option<[usize; K]> {
-    let (c, q) = cq128(p);
-    let lm = *LM.get_unchecked(len);
-    let (c, q) = (c & lm, q & lm);
-    let s = c | lm.wrapping_add(1);
-    // A quote may only open a field (right after a separator or at the line start)
-    // or close one (right before a separator); no quote does both, and a field that
-    // has an opening quote has a closing one (the opening quote, carried up to the
-    // separator that ends its field, lands right after a closing quote).
-    let open = q & ((s << 1) | 1);
-    let close = q & (s >> 1);
-    let ends_open = (!s).wrapping_add(open) & s;
-    let bad = (q ^ (open | close)) | (open & close) | (ends_open ^ (close << 1));
-    if (c.count_ones() as usize != K) | (bad != 0) {
-        return None;
-    }
-    let mut f = [0usize; K];
-    let mut m = c;
-    for g in f.iter_mut() {
-        *g = m.trailing_zeros() as usize;
-        m &= m.wrapping_sub(1);
-    }
-    Some(f)
-}
 
 /// The field `[s, e)` of the line at p without its quotes (the line's quotes are
 /// well-formed).
@@ -237,51 +172,7 @@ unsafe fn uq(p: *const u8, s: usize, e: usize) -> (usize, usize) {
     (s + q, e - q)
 }
 
-/// The line of `len` (< 128) bytes at p, split into its `N` fields (bounds relative
-/// to p, quotes removed); None for a malformed line.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn split_window<const N: usize, const K: usize>(p: *const u8, len: usize) -> Option<[(usize, usize); N]> {
-    let c = commas::<K>(p, len)?;
-    let mut f = [(0usize, 0usize); N];
-    let mut st = 0;
-    for k in 0..N {
-        let e = if k < K { c[k] } else { len };
-        f[k] = uq(p, st, e);
-        st = e + 1;
-    }
-    Some(f)
-}
 
-/// Finds the newlines of `d[a..b)` (b is past a newline), appending their positions
-/// to `out` from `n`; returns the new count. `out` needs room for `b - a + 4`.
-#[inline(always)]
-unsafe fn newlines(d: *const u8, a: usize, b: usize, out: *mut u32, mut n: usize) -> usize {
-    let mut o = a;
-    while o < b {
-        let mut m = nl64(d.add(o));
-        if b - o < 64 {
-            m &= (1u64 << (b - o)) - 1;
-        }
-        let cnt = m.count_ones() as usize;
-        let base = o as u32;
-        *out.add(n) = base + m.trailing_zeros();
-        m &= m.wrapping_sub(1);
-        *out.add(n + 1) = base + m.trailing_zeros();
-        if cnt > 2 {
-            m &= m - 1;
-            let mut i = n + 2;
-            while m != 0 {
-                *out.add(i) = base + m.trailing_zeros();
-                m &= m - 1;
-                i += 1;
-            }
-        }
-        n += cnt;
-        o += 64;
-    }
-    n
-}
 
 /// Rows of a stretch (at most one per 8 bytes of a stretch of at most 4,223).
 const ROWS: usize = 1024;
@@ -798,7 +689,7 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
                 continue;
             };
             let (s3, e3) = (c2 + 1 + qq(3), len - qq(3));
-            let t = win.ts_bl(p.add(s3), e3 - s3);
+            let t = win.ts(p, s3, e3);
             if t as u64 >= win.span as u64 {
                 continue;
             }

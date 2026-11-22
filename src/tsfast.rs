@@ -213,26 +213,6 @@ impl Win {
         }
     }
 
-    /// As `ts` for the `n` bytes at p: F1 and 13-digit F3 are both worked out and
-    /// one is chosen by the length, without a branch on the form; anything that is
-    /// neither, or fails its checks, goes to `ts`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
-    #[inline(always)]
-    pub unsafe fn ts_bl(&self, p: *const u8, n: usize) -> i64 {
-        let (w0, w5) = (load8(p), load8(p.add(5)));
-        let (mok, m) = self.month(w0);
-        let (d, part, hms) = dhms(p.add(8));
-        let ok1 = hms & mok & (d >= m.lo) & (d <= m.hi) & (*p.add(19) == b'Z') & (n == 20);
-        let v1 = ((m.day0 + d) * 86_400 + part) * 1000 - self.base;
-        let ok3 = digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) & (n == 13);
-        let v3 = ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base;
-        let t = if n == 20 { v1 } else { v3 };
-        if ok1 | ok3 {
-            t
-        } else {
-            self.ts(p, 0, n)
-        }
-    }
 
     /// `(ts(pt, 0, nt), ingest(pi, 0, ni))` in one go: the `DDTHH:MM:SS` parts of
     /// both fields are checked and folded in one 256-bit pass (lane 0 `ts` as F1,
@@ -265,18 +245,40 @@ impl Win {
         let (ing_ms, key) = if oki {
             (secs * 1000, ((secs - self.base_s) as i32 as u32) ^ 0x8000_0000)
         } else {
-            self.ingest(pi, 0, ni)
+            self.ingest_cold(pi, ni)
         };
-        // ts: F1 or 13-digit F3, as `f1` / `f3_13`
-        let (w0, w5) = (load8(pt), load8(pt.add(5)));
-        let (mok, m) = self.month(w0);
-        let ok1 = (good & 0xFFFF == 0xFFFF) & mok & (dt >= m.lo) & (dt <= m.hi) & (*pt.add(19) == b'Z') & (nt == 20);
-        let v1 = ((m.day0 + dt) * 86_400 + pt_) * 1000 - self.base;
-        let ok3 = digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) & (nt == 13);
-        let v3 = ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base;
-        let t = if nt == 20 { v1 } else { v3 };
-        let t = if ok1 | ok3 { t } else { self.ts(pt, 0, nt) };
+        // ts: by its length (a branch is cheaper than working out both forms):
+        // F1 from the lane, as `f1`; 13-digit F3 as `f3_13`; anything else `ts`.
+        let t = if nt == 20 {
+            let (mok, m) = self.month(load8(pt));
+            if (good & 0xFFFF == 0xFFFF) & mok & (dt >= m.lo) & (dt <= m.hi) & (*pt.add(19) == b'Z') {
+                ((m.day0 + dt) * 86_400 + pt_) * 1000 - self.base
+            } else {
+                self.ts_cold(pt, nt)
+            }
+        } else if nt == 13 {
+            let (w0, w5) = (load8(pt), load8(pt.add(5)));
+            if digits_ok(w0, u64::MAX) & digits_ok(w5, u64::MAX) {
+                ((parse8(w0) / 1000) * 100_000_000 + parse8(w5)) as i64 - self.base
+            } else {
+                self.ts_cold(pt, nt)
+            }
+        } else {
+            self.ts_cold(pt, nt)
+        };
         (t, ing_ms, key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn ts_cold(&self, p: *const u8, n: usize) -> i64 {
+        self.ts(p, 0, n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn ingest_cold(&self, p: *const u8, n: usize) -> (i64, u32) {
+        self.ingest(p, 0, n)
     }
 
     /// A `ts` field to ms since `base`; FAIL if it is not a timestamp. The caller
@@ -378,8 +380,6 @@ mod tests {
         let n = buf.len();
         buf.extend_from_slice(&[b','; 40]);
         let fast = unsafe { w.ts(buf.as_ptr(), 0, n) };
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
-        assert_eq!(fast, unsafe { w.ts_bl(buf.as_ptr(), n) }, "ts_bl {s:?}");
         let slow = match crate::ts::parse_ts(s.as_bytes()) {
             Some(t) => t.checked_sub(w.base).unwrap_or(i64::MAX),
             None => FAIL,
