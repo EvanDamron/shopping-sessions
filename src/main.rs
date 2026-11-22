@@ -1534,6 +1534,7 @@ fn main() {
             for (ti, st) in cs.iter_mut().enumerate() {
                 sc.spawn(move || {
                     let mut scr = post::Scr::default();
+                    let c0 = post::thread_cpu_ns();
                     loop {
                         let k = next.fetch_add(1, Relaxed);
                         if k >= pb {
@@ -1545,6 +1546,7 @@ fn main() {
                         }
                     }
                     drop(scr);
+                    post::CPU_C.fetch_add(post::thread_cpu_ns() - c0, Relaxed);
                     if std::env::var_os("SS_TIME").is_some() {
                         eprintln!("  thread {ti}: buckets done at {:?}", t0.elapsed());
                     }
@@ -1574,6 +1576,11 @@ fn main() {
         });
     }
     log("phase C sessions, user_daily written");
+    if std::env::var_os("SS_SECT").is_some() {
+        let v: Vec<String> = post::SECT.iter().map(|x| format!("{:.3}", x.load(Relaxed) as f64 / 2.4e9)).collect();
+        log(&format!("post sections (s at a 2.4 GHz TSC, thread sums): {}", v.join(" ")));
+    }
+    log(&format!("post cpu: dedup {:.3} s, buckets {:.3} s (thread sums)", post::CPU_B.load(Relaxed) as f64 * 1e-9, post::CPU_C.load(Relaxed) as f64 * 1e-9));
 
     let mut camp_tot = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for s in &cs {
