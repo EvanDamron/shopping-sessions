@@ -248,6 +248,22 @@ impl Id {
         let _ = h;
     }
 
+    /// Starts loading the interned string a lookup with hash `h` compares first, if
+    /// its table slot (prefetched earlier with `prefetch_long`) holds one with the
+    /// same tag.
+    #[inline(always)]
+    pub fn prefetch_long_string(h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(t) = LTAB.get() {
+            let v = unsafe { t.slots.get_unchecked((h as usize) & t.mask) }.load(Ordering::Relaxed);
+            if v > CLOSED && v & (0xFFFF << 48) == h & (0xFFFF << 48) {
+                unsafe { core::arch::x86_64::_mm_prefetch((v & ((1 << 48) - 1)) as *const i8, core::arch::x86_64::_MM_HINT_T0) }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = h;
+    }
+
     /// `intern` for an ID of more than 15 bytes whose `long_hash` is `h`.
     #[inline(never)]
     pub fn intern_long(b: &[u8], h: u64) -> Id {
