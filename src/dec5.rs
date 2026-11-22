@@ -220,7 +220,13 @@ thread_local! {
 /// after): every line parsed and filed as `crate::events` files it.
 #[inline(never)]
 pub(crate) unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, e: usize) {
-    EB.with(|b| events_in(sh, w, d, s, e, &mut b.borrow_mut()));
+    EB.with(|b| {
+        if sh.kern_on {
+            events_k(sh, w, d, s, e, &mut b.borrow_mut())
+        } else {
+            events_in(sh, w, d, s, e, &mut b.borrow_mut())
+        }
+    });
 }
 
 /// Comma, quote and newline masks of the 128 bytes at p, as (low, high) words.
@@ -471,73 +477,313 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             *bt.ok.get_unchecked_mut(n) = ok as u8;
             n += 1;
         }
-        // Valid rows with a long user ID wait one batch: their interned strings are
-        // prefetched now (the table slots were, during pass 2), they are interned
-        // at the start of the next batch's filing and filed at its end, after their
-        // person's table line had time to arrive. (With the self-check on, at once.)
-        for &(row, _, _) in bt.long.get_unchecked(..nlong) {
-            Id::prefetch_long_string(*bt.uh.get_unchecked(row as usize));
+        file_batch(sh, w, d, bt, n, nlong, first, ls, 128);
+    }
+    // The piece ends: the pending rows are filed now (their bytes are in it).
+    for i in 0..bt.npend {
+        let pr = bt.pend.get_unchecked_mut(i);
+        let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
+        pr.uid = uid;
+        pr.uh = uid.hash();
+        let pr = *pr;
+        file_pending(sh, w, &pr);
+    }
+    bt.npend = 0;
+}
+
+/// Files the n rows of a batch (lines `d[first..ls)`), `nlong` of them with a long
+/// user ID (`bt.long`), and runs the self-check on lines under `maxlen` bytes.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn file_batch(sh: &Shared, w: &mut Worker, d: *const u8, bt: &mut EBatch, n: usize, nlong: usize, first: usize, ls: usize, maxlen: usize) {
+    // Valid rows with a long user ID wait one batch: their interned strings are
+    // prefetched now (the table slots were, during pass 2), they are interned
+    // at the start of the next batch's filing and filed at its end, after their
+    // person's table line had time to arrive. (With the self-check on, at once.)
+    for &(row, _, _) in bt.long.get_unchecked(..nlong) {
+        Id::prefetch_long_string(*bt.uh.get_unchecked(row as usize));
+    }
+    let np = bt.npend;
+    for i in 0..np {
+        let pr = bt.pend.get_unchecked_mut(i);
+        let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
+        pr.uid = uid;
+        pr.uh = uid.hash();
+        sh.links.prefetch2(pr.uh);
+    }
+    let mut li = 0usize;
+    for j in 0..n {
+        let bucket = (*bt.kb.get_unchecked(j) >> sh.dshift) as usize;
+        let ti = *bt.ti.get_unchecked(j);
+        let kid = *bt.kid.get_unchecked(j);
+        let ing = ti & !0xFFFF_FFFF;
+        if *bt.ok.get_unchecked(j) == 0 {
+            w.push_key(sh, bucket, kid, ing | NOSLOT as u64);
+            continue;
         }
-        let np = bt.npend;
-        for i in 0..np {
+        if li < nlong && bt.long.get_unchecked(li).0 as usize == j {
+            li += 1;
+            continue; // a long user ID: filed later
+        }
+        let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
+        let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
+        let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
+        w.push_key(sh, bucket, kid, ing | slot as u64);
+    }
+    for i in 0..np {
+        let pr = *bt.pend.get_unchecked(i);
+        file_pending(sh, w, &pr);
+    }
+    // This batch's long rows become the pending ones.
+    for (i, &(row, at, len)) in bt.long.get_unchecked(..nlong).iter().enumerate() {
+        let j = row as usize;
+        *bt.pend.get_unchecked_mut(i) = Pending {
+            kid: *bt.kid.get_unchecked(j),
+            kb: *bt.kb.get_unchecked(j),
+            ti: *bt.ti.get_unchecked(j),
+            uh: *bt.uh.get_unchecked(j),
+            uid: Id::EMPTY,
+            pc: *bt.pc.get_unchecked(j),
+            at,
+            len,
+        };
+    }
+    bt.npend = nlong;
+    if sh.deccheck {
+        // Resolve this batch's long rows now, so the check sees their IDs.
+        for i in 0..nlong {
             let pr = bt.pend.get_unchecked_mut(i);
             let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
-            pr.uid = uid;
-            pr.uh = uid.hash();
-            sh.links.prefetch2(pr.uh);
+            let row = bt.long.get_unchecked(i).0 as usize;
+            *bt.ulo.get_unchecked_mut(row) = uid.lo;
+            *bt.uhi.get_unchecked_mut(row) = uid.hi;
         }
-        let mut li = 0usize;
-        for j in 0..n {
-            let bucket = (*bt.kb.get_unchecked(j) >> sh.dshift) as usize;
-            let ti = *bt.ti.get_unchecked(j);
-            let kid = *bt.kid.get_unchecked(j);
-            let ing = ti & !0xFFFF_FFFF;
-            if *bt.ok.get_unchecked(j) == 0 {
-                w.push_key(sh, bucket, kid, ing | NOSLOT as u64);
+    }
+    w.nfast += n as u64;
+    if sh.deccheck {
+        check_batch_events(sh, d, first, ls, bt, n, maxlen);
+    }
+}
+
+/// `event_type` words by their low two bits: (expected word, which bytes count,
+/// field length). 'p' (0x70), 'v' (0x76) and 'c' (0x63) differ there; no field has
+/// length 0xFF, so the second row never matches.
+static TYPES: [(u64, u64, usize); 4] = [
+    (PURCHASE, u64::MAX, 8),
+    (0, 0, 0xFF),
+    (VIEW as u64, 0xFFFF_FFFF, 4),
+    (CART as u64, 0xFFFF_FFFF, 4),
+];
+
+/// The event line at `ls`, which the kernel did not take, decided by the general
+/// rules (`plain_fields` + `event_row`) and written into the batch as row `*n` if
+/// it makes one; returns where the next line starts.
+#[cold]
+#[inline(never)]
+unsafe fn plain_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, bt: &mut EBatch, n: &mut usize) -> usize {
+    w.ncold += 1;
+    let mut le = ls;
+    while *d.add(le) != b'\n' {
+        le += 1;
+    }
+    if let Some(r) = plain_fields::<7>(d, ls, le).and_then(|f| event_row(sh, d, &f)) {
+        let h = r.uid.hash();
+        if r.ok {
+            sh.links.prefetch2(h);
+        }
+        let j = *n;
+        *bt.ulo.get_unchecked_mut(j) = r.uid.lo;
+        *bt.uhi.get_unchecked_mut(j) = r.uid.hi;
+        *bt.uh.get_unchecked_mut(j) = h;
+        *bt.kid.get_unchecked_mut(j) = r.kid;
+        *bt.kb.get_unchecked_mut(j) = r.kb;
+        *bt.ti.get_unchecked_mut(j) = r.t as u64 | (r.ing as u64) << 32;
+        *bt.pc.get_unchecked_mut(j) = r.pc;
+        *bt.ok.get_unchecked_mut(j) = r.ok as u8;
+        *n = j + 1;
+    }
+    le + 1
+}
+
+/// Byte mask of `x` in the 32 bytes v.
+#[inline(always)]
+unsafe fn m32(v: __m256i, x: u8) -> u64 {
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32 as u64
+}
+
+/// Quote check of the fields of a window whose separators (the commas between
+/// its fields and the one or newline after the last) are `s` and whose quotes
+/// before the last separator are `q`: (nonzero if a quote is anywhere but around
+/// a whole field, the opening quotes). As `structure1`, on one word.
+#[inline(always)]
+fn quotes(s: u64, q: u64) -> (u64, u64) {
+    let st = (s << 1) | 1; // field starts
+    let o = q & st; // opening quotes
+    let x = q & (s >> 1); // closing quotes
+    let e = (!s).wrapping_add(o) & s; // an opening quote carried up to its field's end
+    ((q ^ (o | x)) | (o & x) | (e ^ (x << 1)), o)
+}
+
+/// Window A of an event line whose two IDs do not both fit in its first 64 bytes:
+/// event_id from those, user_id from the 64 bytes after the first comma.
+/// (second comma, residue, event_id quoted, user_id quoted).
+#[inline(never)]
+unsafe fn wide_ids(p: *const u8, ca: u64, qa: u64, na: u64, c1: usize) -> (usize, u64, usize, usize) {
+    if c1 >= 64 {
+        return (64, 1, 0, 0);
+    }
+    let (bad0, o0) = quotes(1u64 << c1, qa & _bzhi_u64(u64::MAX, c1 as u32));
+    let pu = p.add(c1 + 1);
+    let (u0, u1) = (ld(pu), ld(pu.add(32)));
+    let cu = m32(u0, b',') | (m32(u1, b',') << 32);
+    let qu = m32(u0, b'"') | (m32(u1, b'"') << 32);
+    let nu = m32(u0, b'\n') | (m32(u1, b'\n') << 32);
+    let u = cu.trailing_zeros() as usize;
+    let (bad1, o1) = quotes(_bzhi_u64(cu, u as u32 + 1), qu & _bzhi_u64(u64::MAX, u as u32));
+    let res = bad0 | bad1 | (u >= 64) as u64 | (na & _bzhi_u64(u64::MAX, c1 as u32 + 1)) | (nu & _bzhi_u64(u64::MAX, u as u32 + 1));
+    let _ = ca;
+    (c1 + 1 + u, res, (o0 & 1) as usize, (o1 & 1) as usize)
+}
+
+/// Event lines `d[s..e]` through the line kernel: each line is read in three
+/// windows that follow its commas, so no separate structure pass and no packing:
+///
+///   A  the 64 bytes at the line start: event_id and user_id (the first two commas;
+///      when both IDs are long, user_id from the 64 bytes after the first comma);
+///   B  the 64 bytes after the second comma: ts, ingest_ts, event_type (three commas);
+///   C  the 32 bytes after the fifth comma: product_id, price_cents and the newline.
+///
+/// The windows cover the line without gaps, so the comma count, the quotes (only
+/// around whole fields) and the line end are checked exactly on them. The fields
+/// are converted with straight-line code (kern.rs), and every check leaves a
+/// residue that is zero for a line of the usual shape. A line with a residue (a
+/// field too wide for its window, a quote out of place, a timestamp the kernel
+/// does not take, ...) is decided by the general rules (`plain_line`), in line
+/// order, so the rows and the self-check are as before. Filing is `file_batch`.
+#[inline(never)]
+unsafe fn events_k(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: usize, bt: &mut EBatch) {
+    let win = &sh.win;
+    let kern = &sh.kern;
+    let mut ls = s;
+    while ls < end {
+        let first = ls;
+        let mut n = 0usize; // rows
+        let mut nlong = 0usize;
+        let mut nl = 0usize;
+        let mut nk = 0u64; // rows by the kernel
+        while ls < end && nl < BATCH {
+            nl += 1;
+            let p = d.add(ls);
+            _mm_prefetch(p.add(AHEAD) as *const i8, _MM_HINT_T0);
+            // ---- Structure, window by window.
+            let (a0, a1) = (ld(p), ld(p.add(32)));
+            let ca = m32(a0, b',') | (m32(a1, b',') << 32);
+            let qa = m32(a0, b'"') | (m32(a1, b'"') << 32);
+            let na = m32(a0, b'\n') | (m32(a1, b'\n') << 32);
+            let c1 = ca.trailing_zeros() as usize;
+            let c2 = _blsr_u64(ca).trailing_zeros() as usize; // 64 if there is no second comma
+            // Both IDs in window A (the usual case); otherwise user_id gets its own
+            // window after the first comma.
+            let (c2, ra, q0, q1) = if c2 < 64 {
+                let (bad, oa) = quotes(_bzhi_u64(ca, c2 as u32 + 1), qa & _bzhi_u64(u64::MAX, c2 as u32));
+                (c2, bad | (na & _bzhi_u64(u64::MAX, c2 as u32 + 1)), (oa & 1) as usize, ((oa >> (c1 + 1)) & 1) as usize)
+            } else {
+                wide_ids(p, ca, qa, na, c1)
+            };
+            let pb = p.add(c2 + 1);
+            let (b0, b1) = (ld(pb), ld(pb.add(32)));
+            let cb = m32(b0, b',') | (m32(b1, b',') << 32);
+            let qb = m32(b0, b'"') | (m32(b1, b'"') << 32);
+            let nb = m32(b0, b'\n') | (m32(b1, b'\n') << 32);
+            let t3 = cb.trailing_zeros() as usize;
+            let cb1 = _blsr_u64(cb);
+            let t4 = cb1.trailing_zeros() as usize;
+            let t5 = _blsr_u64(cb1).trailing_zeros() as usize; // 64 if missing
+            let pc = pb.add(t5 + 1);
+            let c0 = ld(pc);
+            let ln = (m32(c0, b'\n') | (1 << 32)).trailing_zeros() as usize; // newline, 32 if not here
+            let cc = m32(c0, b',') & _bzhi_u64(u64::MAX, ln as u32);
+            let qc = m32(c0, b'"') & _bzhi_u64(u64::MAX, ln as u32);
+            let c6 = cc.trailing_zeros() as usize;
+            let sb = _bzhi_u64(cb, t5 as u32 + 1);
+            let (bad_b, ob) = quotes(sb, qb & _bzhi_u64(u64::MAX, t5 as u32));
+            let sc = _blsi_u64(cc) | (1u64 << ln);
+            let (bad_c, oc) = quotes(sc, qc);
+            let rs = ((t5 >= 64) as u64 | (ln >= 32) as u64 | (cc == 0) as u64)
+                | ra
+                | (nb & _bzhi_u64(u64::MAX, t5 as u32 + 1)) // a newline before the fifth comma
+                | _blsr_u64(cc) // more than one comma in the last window
+                | bad_b
+                | bad_c;
+            if rs != 0 {
+                ls = plain_line(sh, w, d, ls, bt, &mut n);
                 continue;
             }
-            if li < nlong && bt.long.get_unchecked(li).0 as usize == j {
-                li += 1;
-                continue; // a long user ID: filed later
+            // ---- Fields (quotes removed), as offsets from the line start.
+            let l0 = c1 - 2 * q0;
+            let (s1, ulen) = (c1 + 1 + q1, c2 - c1 - 1 - 2 * q1);
+            let bo = c2 + 1; // window B's start
+            let qt = (ob & 1) as usize;
+            let qi = ((ob >> (t3 + 1)) & 1) as usize;
+            let qy = ((ob >> (t4 + 1)) & 1) as usize;
+            let (s2, l2) = (bo + qt, t3 - 2 * qt);
+            let (s3, l3) = (bo + t3 + 1 + qi, t4 - t3 - 1 - 2 * qi);
+            let (s4, tl) = (bo + t4 + 1 + qy, t5 - t4 - 1 - 2 * qy);
+            let co = bo + t5 + 1; // window C's start
+            let qp = (oc & 1) as usize;
+            let l5 = c6 - 2 * qp;
+            let (t, ing_ms, ing, rt) = kern.ts_ingest(p.add(s2), l2, p.add(s3), l3);
+            if (rt | (l0 == 0) as u64) != 0 {
+                ls = plain_line(sh, w, d, ls, bt, &mut n);
+                continue;
             }
-            let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
-            let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
-            let slot = w.push_event(sh, (who & sh.pmask) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
-            w.push_key(sh, bucket, kid, ing | slot as u64);
-        }
-        for i in 0..np {
-            let pr = *bt.pend.get_unchecked(i);
-            file_pending(sh, w, &pr);
-        }
-        // This batch's long rows become the pending ones.
-        for (i, &(row, at, len)) in bt.long.get_unchecked(..nlong).iter().enumerate() {
-            let j = row as usize;
-            *bt.pend.get_unchecked_mut(i) = Pending {
-                kid: *bt.kid.get_unchecked(j),
-                kb: *bt.kb.get_unchecked(j),
-                ti: *bt.ti.get_unchecked(j),
-                uh: *bt.uh.get_unchecked(j),
-                uid: Id::EMPTY,
-                pc: *bt.pc.get_unchecked(j),
-                at,
-                len,
-            };
-        }
-        bt.npend = nlong;
-        if sh.deccheck {
-            // Resolve this batch's long rows now, so the check sees their IDs.
-            for i in 0..nlong {
-                let pr = bt.pend.get_unchecked_mut(i);
-                let uid = Id::intern_long(std::slice::from_raw_parts(d.add(pr.at as usize), pr.len as usize), pr.uh);
-                let row = bt.long.get_unchecked(i).0 as usize;
-                *bt.ulo.get_unchecked_mut(row) = uid.lo;
-                *bt.uhi.get_unchecked_mut(row) = uid.hi;
+            let le = co + ln; // the newline
+            let (kid, kb) = Id::key(p, q0, q0 + l0).hash2();
+            let tw = (p.add(s4) as *const u64).read_unaligned();
+            let ty = *TYPES.get_unchecked((tw & 3) as usize);
+            let typed = ((tw ^ ty.0) & ty.1 == 0) & (tl == ty.2);
+            let purchase = typed & (tw & 3 == 0);
+            let mut ok = typed
+                & (ulen != 0)
+                & (l5 != 0)
+                & ((t.wrapping_sub(WEEK) as u64) < sh.evspan)
+                & (ing_ms.wrapping_sub(t.wrapping_add(win.base)) <= DAY);
+            let mut pc = 0u32;
+            if purchase & ok {
+                let qr = ((oc >> (c6 + 1)) & 1) as usize;
+                let s6 = co + c6 + 1 + qr;
+                match purchase_pc(sh, p, (co + qp, l5), (s6, le - qr - s6)) {
+                    Some(v) => pc = v,
+                    None => ok = false,
+                }
             }
+            if ulen <= 15 {
+                let uid = Id::short(p.add(s1), ulen);
+                let h = uid.hash();
+                if ok {
+                    sh.links.prefetch2(h);
+                }
+                *bt.ulo.get_unchecked_mut(n) = uid.lo;
+                *bt.uhi.get_unchecked_mut(n) = uid.hi;
+                *bt.uh.get_unchecked_mut(n) = h;
+            } else if ok {
+                let h = Id::long_hash(p.add(s1), ulen);
+                Id::prefetch_long(h);
+                *bt.uh.get_unchecked_mut(n) = h;
+                *bt.long.get_unchecked_mut(nlong) = (n as u32, (ls + s1) as u32, ulen as u32);
+                nlong += 1;
+            }
+            *bt.kid.get_unchecked_mut(n) = kid;
+            *bt.kb.get_unchecked_mut(n) = kb;
+            *bt.ti.get_unchecked_mut(n) = t as u32 as u64 | (ing as u64) << 32;
+            *bt.pc.get_unchecked_mut(n) = pc;
+            *bt.ok.get_unchecked_mut(n) = ok as u8;
+            n += 1;
+            nk += 1;
+            ls += le + 1;
         }
-        w.nfast += n as u64;
-        if sh.deccheck {
-            check_batch_events(sh, d, first, ls, bt, n);
-        }
+        w.nfast = w.nfast.wrapping_add(nk).wrapping_sub(n as u64); // (file_batch counts every row)
+        file_batch(sh, w, d, bt, n, nlong, first, ls, usize::MAX);
     }
     // The piece ends: the pending rows are filed now (their bytes are in it).
     for i in 0..bt.npend {
@@ -592,7 +838,7 @@ unsafe fn check_event(sh: &Shared, d: *const u8, ls: usize, le: usize, r: &ERow)
 /// alike, against the plain reading.
 #[cold]
 #[inline(never)]
-unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: &EBatch, n: usize) {
+unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: &EBatch, n: usize, maxlen: usize) {
     let mut ls = a;
     let mut j = 0;
     while ls < b {
@@ -600,7 +846,7 @@ unsafe fn check_batch_events(sh: &Shared, d: *const u8, a: usize, b: usize, bt: 
         while *d.add(le) != b'\n' {
             le += 1;
         }
-        if le - ls < 128 && plain_fields::<7>(d, ls, le).and_then(|f| event_row(sh, d, &f)).is_some() {
+        if le - ls < maxlen && plain_fields::<7>(d, ls, le).and_then(|f| event_row(sh, d, &f)).is_some() {
             if j >= n {
                 eprintln!("decoder kept fewer rows of a batch than the plain reading");
                 std::process::exit(3);

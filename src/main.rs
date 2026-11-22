@@ -19,6 +19,8 @@ mod decc;
 mod dec5;
 mod fast;
 mod id;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod kern;
 mod links;
 mod mem;
 mod post;
@@ -389,6 +391,8 @@ struct Shared<'a> {
     links: Links,
     lk: &'a Lookups,
     win: Win,
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    kern: kern::Kern, // the line kernels' tables (kern.rs)
     evspan: u64, // window_end - window_start
     pbits: u32, // person bucket = person number & pmask, place in it = number >> pbits
     pmask: u32,
@@ -403,6 +407,7 @@ struct Shared<'a> {
     decc: Option<Box<decc::DecC>>, // the click-line decoder's own tables (decc.rs), with `dec`
     deccheck: bool, // test hook: every line the decoder takes is also read the plain way and compared
     dec5: bool,     // the per-line decoders for opaque IDs (dec5.rs), without the fast path
+    kern_on: bool,  // SS_KERN=1: event lines through the line kernel (dec5::events_k) instead of the two passes (measured slower; kept for reference)
 }
 
 impl Shared<'_> {
@@ -1325,6 +1330,8 @@ fn phase_a<'a>(
         links,
         lk,
         win: Win::new(base, we),
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        kern: kern::Kern::new(base, we),
         evspan: (we - ws) as u64,
         dshift: 64 - db.trailing_zeros(),
         ev,
@@ -1336,6 +1343,7 @@ fn phase_a<'a>(
         decc: (fx.is_some() && envn("SS_DEC") != Some(0) && envn("SS_DECC") != Some(0)).then(|| decc::DecC::new(lk)),
         deccheck: envn("SS_DECCHECK") == Some(1),
         dec5: cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")) && fx.is_none() && envn("SS_DEC5") != Some(0),
+        kern_on: envn("SS_KERN") == Some(1),
         fx,
     };
     let fast = sh.fx.is_some();
