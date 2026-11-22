@@ -82,6 +82,7 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                 let mut tab: Vec<[u64; 2]> = Vec::new();
                 let mut used: Vec<u64> = Vec::new();
                 let (mut seen, mut twice): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+                let mut cand: Vec<[u64; 2]> = Vec::new();
                 let mut kill = |slot: u32| {
                     if slot != NOSLOT {
                         let m = unsafe { *cmap.get_unchecked(slot as usize / PCH) };
@@ -97,6 +98,7 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                     if total == 0 {
                         continue;
                     }
+                    let tp0 = tsc();
                     // Pass 1: a bitmap with 16 positions per key; a position hit a second
                     // time is marked in `twice`. Only keys at marked positions can have a
                     // copy, and only they go through the exact table in pass 2.
@@ -129,9 +131,12 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                             }
                         }
                     }
+                    let tq = tsc();
+                    SECT[10].fetch_add(tq - tp0, Relaxed);
                     if hits == 0 {
                         continue;
                     }
+                    let tq = tsc();
                     // Pass 2: the candidates (at most 2 * hits) in an exact table.
                     let cap = (hits * 4).next_power_of_two().max(64);
                     let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
@@ -140,40 +145,60 @@ pub fn dedup(sh: &Shared, workers: &[Worker], nthreads: usize, pb: usize, db: us
                     }
                     used.clear();
                     used.resize(cap.div_ceil(64), 0);
-                    let tp = tab.as_mut_ptr();
+                    // The candidates, gathered without branches (the key stream prefetched
+                    // as in pass 1), then put in the table with its slots prefetched.
+                    cand.clear();
+                    cand.reserve(hits * 2 + 8);
+                    let cdst = cand.as_mut_ptr();
+                    let mut nc = 0usize;
                     for w in workers {
                         for chunk in w.key_chunks(d) {
-                            for &[id, v] in chunk {
+                            let cp = chunk.as_ptr();
+                            for (j, k) in chunk.iter().enumerate() {
                                 unsafe {
-                                    let b = (id & bmask) as usize;
-                                    if *twice.get_unchecked(b >> 6) & (1u64 << (b & 63)) == 0 {
-                                        continue;
+                                    if j % 4 == 0 {
+                                        prefetch(cp.wrapping_add(j + 64));
                                     }
-                                    let mut s = (id >> shift) as usize;
-                                    loop {
-                                        let (word, bit) = (s >> 6, 1u64 << (s & 63));
-                                        if *used.get_unchecked(word) & bit == 0 {
-                                            *used.get_unchecked_mut(word) |= bit;
-                                            *tp.add(s) = [id, v];
-                                            break;
-                                        }
-                                        let o = &mut *tp.add(s);
-                                        if o[0] == id {
-                                            // Another copy of this event: the smaller ingest_ts stays.
-                                            if (v >> 32) < (o[1] >> 32) {
-                                                kill(o[1] as u32);
-                                                o[1] = v;
-                                            } else {
-                                                kill(v as u32);
-                                            }
-                                            break;
-                                        }
-                                        s = (s + 1) & mask;
-                                    }
+                                    let b = (k[0] & bmask) as usize;
+                                    cdst.add(nc).write(*k);
+                                    nc += (*twice.get_unchecked(b >> 6) >> (b & 63) & 1) as usize;
                                 }
                             }
                         }
                     }
+                    debug_assert!(nc <= hits * 2);
+                    unsafe { cand.set_len(nc) };
+                    let tp = tab.as_mut_ptr();
+                    for j in 0..nc {
+                        unsafe {
+                            if j + 8 < nc {
+                                prefetch(tp.add((cand.get_unchecked(j + 8)[0] >> shift) as usize));
+                            }
+                            let [id, v] = *cand.get_unchecked(j);
+                            let mut s = (id >> shift) as usize;
+                            loop {
+                                let (word, bit) = (s >> 6, 1u64 << (s & 63));
+                                if *used.get_unchecked(word) & bit == 0 {
+                                    *used.get_unchecked_mut(word) |= bit;
+                                    *tp.add(s) = [id, v];
+                                    break;
+                                }
+                                let o = &mut *tp.add(s);
+                                if o[0] == id {
+                                    // Another copy of this event: the smaller ingest_ts stays.
+                                    if (v >> 32) < (o[1] >> 32) {
+                                        kill(o[1] as u32);
+                                        o[1] = v;
+                                    } else {
+                                        kill(v as u32);
+                                    }
+                                    break;
+                                }
+                                s = (s + 1) & mask;
+                            }
+                        }
+                    }
+                    SECT[11].fetch_add(tsc() - tq, Relaxed);
                 }
             });
         }
@@ -191,10 +216,11 @@ fn tsc() -> u64 {
     0
 }
 
-/// Time stamp counter ticks per section of phase C, summed over threads: bitmap,
-/// event count, click count, person list, click filing, event filing, persons
-/// (of which: click order, sessions and rows, assists of persons with many clicks).
-pub static SECT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Time stamp counter ticks per section, summed over threads: phase C's bitmap,
+/// event count, click count, person list, click filing, event filing, persons (of
+/// which: click order, sessions and rows, assists of persons with many clicks), and
+/// dedup's two passes.
+pub static SECT: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 #[inline(always)]
 fn lap(t: &mut u64, acc: &mut u64) {
