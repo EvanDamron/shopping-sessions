@@ -312,43 +312,123 @@ fn uleb(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
-/// RLE/bit-packed hybrid as one bit-packed run of `vals` at `bw` bits (LSB first).
-/// Every value must fit in `bw` bits, and `bw` is at most 32.
-fn bitpacked(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, bw: u32) {
-    let groups = n.div_ceil(8);
-    uleb(out, ((groups as u64) << 1) | 1);
-    let start = out.len();
-    out.resize(start + groups * bw as usize, 0);
-    let buf = &mut out[start..];
-    let (mut acc, mut nbits, mut at) = (0u64, 0u32, 0usize);
-    for v in vals.take(n) {
-        acc |= (v as u64) << nbits;
-        nbits += bw;
-        if nbits >= 32 {
-            // at + 4 bytes hold only bits already produced, so this stays in `buf`.
-            buf[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
-            at += 4;
-            acc >>= 32;
-            nbits -= 32;
-        }
+/// The file being written, through a small buffer that stays in cache: pages are
+/// encoded straight into it, so writing a file touches no memory beyond it.
+struct Sink {
+    f: std::fs::File,
+    buf: Vec<u8>,
+    at: usize, // bytes already handed to the file
+}
+
+const SINK: usize = 1 << 18;
+
+impl Sink {
+    fn pos(&self) -> usize {
+        self.at + self.buf.len()
     }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.f.write_all(&self.buf)?;
+        self.at += self.buf.len();
+        self.buf.clear();
+        Ok(())
+    }
+    /// Makes room for `k` more bytes (k <= SINK).
+    #[inline]
+    fn room(&mut self, k: usize) -> std::io::Result<()> {
+        if self.buf.len() + k > SINK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn put(&mut self, s: &[u8]) -> std::io::Result<()> {
+        if s.len() > SINK / 2 {
+            self.flush()?;
+            self.at += s.len();
+            return self.f.write_all(s);
+        }
+        self.room(s.len())?;
+        self.buf.extend_from_slice(s);
+        Ok(())
+    }
+}
+
+/// Values per block of the encoders below: each block first makes room for its
+/// worst case (4 bytes per value, plus a few).
+const BLOCK: usize = 8192;
+
+/// Length of the RLE/bit-packed hybrid that `bitpacked` writes.
+fn bitpacked_len(n: usize, bw: u32) -> usize {
+    let groups = n.div_ceil(8);
+    let mut h = Vec::new();
+    uleb(&mut h, ((groups as u64) << 1) | 1);
+    h.len() + groups * bw as usize
+}
+
+/// RLE/bit-packed hybrid as one bit-packed run of `get(0..n)` at `bw` bits (LSB
+/// first). Every value must fit in `bw` bits, and `bw` is at most 32.
+fn bitpacked(s: &mut Sink, get: impl Fn(usize) -> u32, n: usize, bw: u32) -> std::io::Result<()> {
+    let groups = n.div_ceil(8);
+    let mut h = Vec::new();
+    uleb(&mut h, ((groups as u64) << 1) | 1);
+    s.put(&h)?;
+    let (mut acc, mut nbits, mut done) = (0u64, 0u32, 0usize);
+    let mut i = 0;
+    while i < n {
+        let end = (i + BLOCK).min(n);
+        s.room(4 * (end - i) + 8)?;
+        let len = s.buf.len();
+        let p = unsafe { s.buf.as_mut_ptr().add(len) };
+        let mut at = 0usize;
+        for k in i..end {
+            acc |= (get(k) as u64) << nbits;
+            nbits += bw;
+            if nbits >= 32 {
+                unsafe { std::ptr::write_unaligned(p.add(at) as *mut u32, (acc as u32).to_le()) };
+                at += 4;
+                acc >>= 32;
+                nbits -= 32;
+            }
+        }
+        unsafe { s.buf.set_len(len + at) };
+        done += at;
+        i = end;
+    }
+    // The bits left over, then zeros up to whole groups of 8 values.
     while nbits > 0 {
-        buf[at] = acc as u8;
-        at += 1;
+        s.room(1)?;
+        s.buf.push(acc as u8);
+        done += 1;
         acc >>= 8;
         nbits = nbits.saturating_sub(8);
     }
+    let pad = groups * bw as usize - done;
+    s.room(pad)?;
+    s.buf.resize(s.buf.len() + pad, 0);
+    Ok(())
+}
+
+fn uleb_len(v: u64) -> usize {
+    ((64 - (v | 1).leading_zeros()) as usize).div_ceil(7)
+}
+
+/// Length of the RLE runs that `rle_counting` writes.
+fn rle_counting_len(runs: &[u32], bw: u32) -> usize {
+    let vb = bw.div_ceil(8) as usize;
+    runs.iter().map(|&len| uleb_len((len as u64) << 1) + vb).sum()
 }
 
 /// RLE/bit-packed hybrid as RLE runs: run i repeats value i, `runs[i]` times.
-fn rle_counting(out: &mut Vec<u8>, runs: &[u32], bw: u32) {
+fn rle_counting(s: &mut Sink, runs: &[u32], bw: u32) -> std::io::Result<()> {
     let vb = bw.div_ceil(8) as usize;
-    for (i, &len) in runs.iter().enumerate() {
-        uleb(out, (len as u64) << 1);
-        out.extend_from_slice(&(i as u64).to_le_bytes()[..vb]);
+    for (b, block) in runs.chunks(BLOCK).enumerate() {
+        s.room(block.len() * (5 + vb))?;
+        for (k, &len) in block.iter().enumerate() {
+            uleb(&mut s.buf, (len as u64) << 1);
+            s.buf.extend_from_slice(&((b * BLOCK + k) as u64).to_le_bytes()[..vb]);
+        }
     }
+    Ok(())
 }
-
 struct Chunk {
     ty: i32,
     dict_off: Option<usize>,
@@ -380,32 +460,45 @@ fn page_header(kind: i32, len: usize, nvals: usize, data_enc: i32) -> Vec<u8> {
 }
 
 /// Writes one thread's user_daily rows. `cats` are the category names by index.
-pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std::io::Result<()> {
+/// `r.revenue` is used as scratch: its contents are gone afterwards.
+pub fn write_user(path: &std::path::Path, r: &mut UserRows, cats: &[Vec<u8>]) -> std::io::Result<()> {
     let names = ["user_id", "day", "sessions", "events", "revenue_cents", "top_category"];
     let n = r.n;
-    let mut out: Vec<u8> = Vec::with_capacity(r.dict.len() + n * 12 + 4096);
-    out.extend_from_slice(b"PAR1");
+    let mut s = Sink { f: std::fs::File::create(path)?, buf: Vec::with_capacity(SINK), at: 0 };
+    s.put(b"PAR1")?;
     let mut chunks: Vec<Chunk> = Vec::new();
-    // Appends [dictionary page] + data page; returns the chunk.
-    let mut put = |out: &mut Vec<u8>, ty: i32, dict: Option<(&[u8], usize)>, data: &[u8], data_enc: i32| {
-        let dict_off = dict.map(|(d, nd)| {
-            let off = out.len();
-            out.extend_from_slice(&page_header(2, d.len(), nd, 0));
-            out.extend_from_slice(d);
-            off
-        });
-        let data_off = out.len();
-        out.extend_from_slice(&page_header(0, data.len(), n, data_enc));
-        out.extend_from_slice(data);
+    // Writes [dictionary page] + data page header; `data` then writes the page's
+    // `len` bytes. Records the chunk.
+    let mut put = |s: &mut Sink,
+                   ty: i32,
+                   dict: Option<(&[u8], usize)>,
+                   len: usize,
+                   data_enc: i32,
+                   data: &mut dyn FnMut(&mut Sink) -> std::io::Result<()>|
+     -> std::io::Result<()> {
+        let mut dict_off = None;
+        if let Some((d, nd)) = dict {
+            dict_off = Some(s.pos());
+            s.put(&page_header(2, d.len(), nd, 0))?;
+            s.put(d)?;
+        }
+        let data_off = s.pos();
+        s.put(&page_header(0, len, n, data_enc))?;
+        let at = s.pos();
+        data(s)?;
+        debug_assert_eq!(s.pos() - at, len);
         let start = dict_off.unwrap_or(data_off);
-        chunks.push(Chunk { ty, dict_off, data_off, size: out.len() - start, dict_enc: dict.is_some() });
+        chunks.push(Chunk { ty, dict_off, data_off, size: s.pos() - start, dict_enc: dict.is_some() });
+        Ok(())
     };
     if n > 0 {
         // user_id
         let bw = bits_for(r.ndict.saturating_sub(1) as u64);
-        let mut d = vec![bw as u8];
-        rle_counting(&mut d, &r.runs, bw);
-        put(&mut out, TYPE_BYTE_ARRAY, Some((&r.dict, r.ndict)), &d, ENC_RLE_DICT);
+        let runs = &r.runs;
+        put(&mut s, TYPE_BYTE_ARRAY, Some((&r.dict, r.ndict)), 1 + rle_counting_len(runs, bw), ENC_RLE_DICT, &mut |s| {
+            s.put(&[bw as u8])?;
+            rle_counting(s, runs, bw)
+        })?;
         // day: dictionary [min..=max]
         let (dmin, dmax) = r.days.iter().fold((i32::MAX, i32::MIN), |a, &x| (a.0.min(x), a.1.max(x)));
         let mut dict = Vec::new();
@@ -413,9 +506,11 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
             dict.extend_from_slice(&x.to_le_bytes());
         }
         let bw = bits_for((dmax - dmin) as u64);
-        let mut d = vec![bw as u8];
-        bitpacked(&mut d, r.days.iter().map(|&x| (x - dmin) as u32), n, bw);
-        put(&mut out, TYPE_INT32, Some((&dict, (dmax - dmin + 1) as usize)), &d, ENC_RLE_DICT);
+        let days = &r.days;
+        put(&mut s, TYPE_INT32, Some((&dict, (dmax - dmin + 1) as usize)), 1 + bitpacked_len(n, bw), ENC_RLE_DICT, &mut |s| {
+            s.put(&[bw as u8])?;
+            bitpacked(s, |i| unsafe { (*days.get_unchecked(i) - dmin) as u32 }, n, bw)
+        })?;
         // sessions, events: dictionary [0..=max] when small, else PLAIN
         for col in [&r.sessions, &r.events] {
             let (min, max) = col.iter().fold((0i32, 0i32), |a, &x| (a.0.min(x), a.1.max(x)));
@@ -426,67 +521,75 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
                     dict.extend_from_slice(&x.to_le_bytes());
                 }
                 let bw = bits_for(max);
-                let mut d = vec![bw as u8];
-                bitpacked(&mut d, col.iter().map(|&x| x as u32), n, bw);
-                put(&mut out, TYPE_INT32, Some((&dict, max as usize + 1)), &d, ENC_RLE_DICT);
+                put(&mut s, TYPE_INT32, Some((&dict, max as usize + 1)), 1 + bitpacked_len(n, bw), ENC_RLE_DICT, &mut |s| {
+                    s.put(&[bw as u8])?;
+                    bitpacked(s, |i| unsafe { *col.get_unchecked(i) as u32 }, n, bw)
+                })?;
             } else {
-                let mut d = Vec::with_capacity(n * 4);
-                for &x in col.iter() {
-                    d.extend_from_slice(&x.to_le_bytes());
-                }
-                put(&mut out, TYPE_INT32, None, &d, ENC_PLAIN);
+                let bytes = unsafe { std::slice::from_raw_parts(col.as_ptr() as *const u8, n * 4) };
+                put(&mut s, TYPE_INT32, None, n * 4, ENC_PLAIN, &mut |s| {
+                    for c in bytes.chunks(SINK / 2) {
+                        s.put(c)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         // revenue_cents: dictionary of the distinct values. Most rows are 0, which is
-        // entry 0; the rest go through a small table that doubles at half load.
+        // entry 0; the rest go through a small table that doubles at half load. The
+        // dictionary index of row i replaces the value in place, as u32 i of the buffer
+        // (it lands on bytes of rows already read).
         {
             let mut cap = 4096usize;
             let mut slots: Vec<u32> = vec![u32::MAX; cap];
             let mut vals: Vec<i64> = vec![0];
-            let mut idx: Vec<u32> = Vec::with_capacity(n);
             let slot = |x: i64, mask: usize| ((x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
-            for &x in &r.revenue {
-                if x == 0 {
-                    idx.push(0);
-                    continue;
-                }
-                let mask = cap - 1;
-                let mut i = slot(x, mask);
-                loop {
-                    let v = slots[i];
-                    if v == u32::MAX {
-                        slots[i] = vals.len() as u32;
-                        idx.push(vals.len() as u32);
-                        vals.push(x);
-                        if vals.len() * 2 > cap {
-                            cap *= 2;
-                            let mask = cap - 1;
-                            slots = vec![u32::MAX; cap];
-                            for (k, &y) in vals.iter().enumerate().skip(1) {
-                                let mut j = slot(y, mask);
-                                while slots[j] != u32::MAX {
-                                    j = (j + 1) & mask;
+            let rev = r.revenue.as_mut_ptr() as *mut u8;
+            for i in 0..n {
+                let x = unsafe { std::ptr::read(rev.add(8 * i) as *const i64) };
+                let k = if x == 0 {
+                    0
+                } else {
+                    let mask = cap - 1;
+                    let mut j = slot(x, mask);
+                    loop {
+                        let v = slots[j];
+                        if v == u32::MAX {
+                            let k = vals.len() as u32;
+                            slots[j] = k;
+                            vals.push(x);
+                            if vals.len() * 2 > cap {
+                                cap *= 2;
+                                let mask = cap - 1;
+                                slots = vec![u32::MAX; cap];
+                                for (k, &y) in vals.iter().enumerate().skip(1) {
+                                    let mut j = slot(y, mask);
+                                    while slots[j] != u32::MAX {
+                                        j = (j + 1) & mask;
+                                    }
+                                    slots[j] = k as u32;
                                 }
-                                slots[j] = k as u32;
                             }
+                            break k;
                         }
-                        break;
+                        if vals[v as usize] == x {
+                            break v;
+                        }
+                        j = (j + 1) & mask;
                     }
-                    if vals[v as usize] == x {
-                        idx.push(v);
-                        break;
-                    }
-                    i = (i + 1) & mask;
-                }
+                };
+                unsafe { std::ptr::write(rev.add(4 * i) as *mut u32, k) };
             }
+            let idx = unsafe { std::slice::from_raw_parts(rev as *const u32, n) };
             let mut dict = Vec::with_capacity(vals.len() * 8);
             for &x in &vals {
                 dict.extend_from_slice(&x.to_le_bytes());
             }
             let bw = bits_for(vals.len().saturating_sub(1) as u64);
-            let mut d = vec![bw as u8];
-            bitpacked(&mut d, idx.iter().copied(), n, bw);
-            put(&mut out, TYPE_INT64, Some((&dict, vals.len())), &d, ENC_RLE_DICT);
+            put(&mut s, TYPE_INT64, Some((&dict, vals.len())), 1 + bitpacked_len(n, bw), ENC_RLE_DICT, &mut |s| {
+                s.put(&[bw as u8])?;
+                bitpacked(s, |i| unsafe { *idx.get_unchecked(i) }, n, bw)
+            })?;
         }
         // top_category: definition levels, then dictionary indices of present rows
         let mut dict = Vec::new();
@@ -497,14 +600,16 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
         let groups = n.div_ceil(8);
         let mut lv = Vec::new();
         uleb(&mut lv, ((groups as u64) << 1) | 1);
-        lv.extend_from_slice(&r.top_bits[..groups]);
-        let mut d = Vec::new();
-        d.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-        d.extend_from_slice(&lv);
         let bw = bits_for(cats.len().saturating_sub(1) as u64);
-        d.push(bw as u8);
-        bitpacked(&mut d, r.tops.iter().map(|&x| x as u32), r.tops.len(), bw);
-        put(&mut out, TYPE_BYTE_ARRAY, Some((&dict, cats.len())), &d, ENC_RLE_DICT);
+        let (bits, tops) = (&r.top_bits[..groups], &r.tops);
+        let len = 4 + lv.len() + groups + 1 + bitpacked_len(tops.len(), bw);
+        put(&mut s, TYPE_BYTE_ARRAY, Some((&dict, cats.len())), len, ENC_RLE_DICT, &mut |s| {
+            s.put(&((lv.len() + groups) as u32).to_le_bytes())?;
+            s.put(&lv)?;
+            s.put(bits)?;
+            s.put(&[bw as u8])?;
+            bitpacked(s, |i| unsafe { *tops.get_unchecked(i) as u32 }, tops.len(), bw)
+        })?;
     }
     // FileMetaData
     let mut m = Thrift::new();
@@ -582,8 +687,8 @@ pub fn write_user(path: &std::path::Path, r: &UserRows, cats: &[Vec<u8>]) -> std
     m.bin(6, b"sessions");
     m.buf.push(0);
     let mlen = m.buf.len() as u32;
-    out.extend_from_slice(&m.buf);
-    out.extend_from_slice(&mlen.to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&out)
+    s.put(&m.buf)?;
+    s.put(&mlen.to_le_bytes())?;
+    s.put(b"PAR1")?;
+    s.flush()
 }
