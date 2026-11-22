@@ -326,16 +326,17 @@ struct Batch {
     ids: [[u64; 2]; B], // event ID value, user ID value
     t: [i64; B],        // ts, ms since the click window's start (i64::MIN: a purchase with a bad price)
     ing: [i64; B],      // ingest_ts, seconds since the click window's start
-    pc: [u64; B],       // price and category, in the high 32 bits
+    pc: [u64; B],       // price and category of a purchase with a good price, else 0
     line: [u32; B],
     // Filled by `flush`:
     ix: [u64; B], // event number, u64::MAX if either ID's number is out of range
     un: [u64; B], // user number
-    // The record's three words: user number or INVALID; t and price/category;
-    // ingest key and event number within the bucket.
+    // The record's two words (fast::XRec): user word with the event number within
+    // the bucket on top; time, BUY and ingest key. And the price and category for
+    // the extension record of a valid purchase (else 0).
     a: [u64; B],
     w1: [u64; B],
-    w2: [u64; B],
+    px: [u64; B],
     // For `lines_asm`: each row's line and the line after it (addresses), which rows
     // are purchases, the lines queued for the plain reading, and a few words it
     // keeps to hand.
@@ -464,6 +465,7 @@ unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, b
     let span = _mm256_set1_epi64x(dec.evspan.min(i64::MAX as u64) as i64);
     let c = _mm256_set1_epi64x(dec.base_s * 1000 - dec.base - BIAS * 1000);
     let low32 = _mm256_set1_epi64x(0xFFFF_FFFF);
+    let m31 = _mm256_set1_epi64x(0x7FFF_FFFF);
     let lomask = _mm256_set1_epi64x(((1u64 << fx.xsh) - 1) as i64);
     let mut j = 0;
     while j < n {
@@ -476,12 +478,15 @@ unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, b
         let late = _mm256_cmpgt_epi64(_mm256_sub_epi64(ing_ms, t), _mm256_set1_epi64x(DAY));
         let ok = _mm256_andnot_si256(late, inwin);
         let a = _mm256_blendv_epi8(_mm256_set1_epi64x(fast::INVALID as i64), ld(bt.un.as_ptr().add(j) as *const u8), ok);
-        _mm256_storeu_si256(bt.a.as_mut_ptr().add(j) as *mut __m256i, a);
-        let w1 = _mm256_or_si256(_mm256_and_si256(t, low32), ld(bt.pc.as_ptr().add(j) as *const u8));
+        let lo = _mm256_slli_epi64(_mm256_and_si256(ld(bt.ix.as_ptr().add(j) as *const u8), lomask), fast::XLO as i32);
+        _mm256_storeu_si256(bt.a.as_mut_ptr().add(j) as *mut __m256i, _mm256_or_si256(a, lo));
+        // Price and category count for a valid row only; BUY says there is one.
+        let px = _mm256_and_si256(ld(bt.pc.as_ptr().add(j) as *const u8), ok);
+        _mm256_storeu_si256(bt.px.as_mut_ptr().add(j) as *mut __m256i, px);
+        let buy = _mm256_andnot_si256(_mm256_cmpeq_epi64(px, _mm256_setzero_si256()), _mm256_set1_epi64x(fast::BUY as i64));
+        let key = _mm256_slli_epi64(_mm256_xor_si256(_mm256_and_si256(ing0, low32), _mm256_set1_epi64x(0x8000_0000)), 32);
+        let w1 = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(t, m31), buy), key);
         _mm256_storeu_si256(bt.w1.as_mut_ptr().add(j) as *mut __m256i, w1);
-        let lo = _mm256_slli_epi64(_mm256_and_si256(ld(bt.ix.as_ptr().add(j) as *const u8), lomask), 32);
-        let w2 = _mm256_or_si256(_mm256_xor_si256(_mm256_and_si256(ing0, low32), _mm256_set1_epi64x(0x8000_0000)), lo);
-        _mm256_storeu_si256(bt.w2.as_mut_ptr().add(j) as *mut __m256i, w2);
         j += 4;
     }
     if sh.deccheck {
@@ -498,20 +503,28 @@ unsafe fn flush(sh: &Shared, fx: &Fx, dec: &Dec, w: &mut Worker, d: *const u8, b
             continue;
         }
         let b = (idx >> xsh) as usize;
-        let nrec = *cnt.add(b);
-        let off = nrec as usize & (fast::XCH - 1);
-        if off == 0 {
-            new_chunk(fx, w, b);
-        }
-        *cnt.add(b) = nrec + 1;
-        let k = (nrec & 7) as usize;
-        let buf = wc.add(b * 24);
-        let slot = buf.add(k * 3);
-        *slot = *bt.a.get_unchecked(j);
-        *slot.add(1) = *bt.w1.get_unchecked(j);
-        *slot.add(2) = *bt.w2.get_unchecked(j);
-        if k == 7 {
-            crate::mem::stream((*cur.add(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 3);
+        let (mut x0, mut x1) = (*bt.a.get_unchecked(j), *bt.w1.get_unchecked(j));
+        let px = *bt.px.get_unchecked(j);
+        loop {
+            let nrec = *cnt.add(b);
+            let off = nrec as usize & (fast::XCH - 1);
+            if off == 0 {
+                new_chunk(fx, w, b);
+            }
+            *cnt.add(b) = nrec + 1;
+            let k = (nrec & 7) as usize;
+            let buf = wc.add(b * 16);
+            *buf.add(k * 2) = x0;
+            *buf.add(k * 2 + 1) = x1;
+            if k == 7 {
+                crate::mem::stream((*cur.add(b) as *mut u8).add((off - 7) * fast::XREC), buf as *const u8, 2);
+            }
+            // A valid purchase: its extension record next (same place and ingest
+            // key, the price and category where the time was).
+            if px == 0 || x0 & fast::EXT != 0 {
+                break;
+            }
+            (x0, x1) = (fast::EXT | (x0 & !fast::XA), (x1 & !0xFFFF_FFFF) | px);
         }
     }
 }
@@ -538,11 +551,14 @@ unsafe fn check(sh: &Shared, w: &mut Worker, d: *const u8, bt: &Batch, n: usize)
         while *d.add(le) != b'\n' {
             le += 1;
         }
-        // (the three words exactly as they are filed)
-        let mine = (bt.ix[j], bt.a[j], (bt.w2[j] as u32, (bt.w2[j] >> 32) as u32));
+        // (the words exactly as they are filed, against the plain reading packed the same way)
         let same = match crate::event_x_plain(sh, w, d, ls, le) {
             Some((idx, r)) => {
-                (idx, r.a, (r.ing, r.lo)) == mine && (r.a == fast::INVALID || (r.t == bt.w1[j] as u32 && r.pc == (bt.w1[j] >> 32) as u32))
+                let (x, ext) = r.pack();
+                idx == bt.ix[j]
+                    && (x.a, x.ing) == (bt.a[j], (bt.w1[j] >> 32) as u32)
+                    && (r.a == fast::INVALID || x.t == bt.w1[j] as u32)
+                    && ext.map_or(0, |e| e.t as u64) == bt.px[j]
             }
             None => false,
         };
@@ -688,7 +704,7 @@ pub unsafe fn events(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, en
         let mut pc = 0u64;
         if is_purchase != 0 {
             match purchase(sh, dec, d, next - 1) {
-                Some(x) => pc = (x as u64) << 32,
+                Some(x) => pc = x as u64,
                 None => tms = i64::MIN, // outside every window: the copy is invalid
             }
         }
@@ -1079,7 +1095,7 @@ pub unsafe fn events_a(sh: &Shared, w: &mut Worker, d: *const u8, start: usize, 
             let j = m.trailing_zeros() as usize;
             m &= m - 1;
             match purchase(sh, dec, d, (bt.nx[j] - d as u64) as usize - 1) {
-                Some(x) => bt.pc[j] = (x as u64) << 32,
+                Some(x) => bt.pc[j] = x as u64,
                 None => bt.t[j] = i64::MIN,
             }
         }

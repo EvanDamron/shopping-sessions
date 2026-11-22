@@ -425,7 +425,7 @@ impl Worker {
             cchunks: (0..pb).map(|_| Vec::new()).collect(),
             added: 0,
             xcnt: vec![0; nb],
-            xwc: vec![fast::WcX([0; 24]); nb],
+            xwc: vec![fast::WcX([0; 16]); nb],
             xcur: vec![0; nb],
             xchunks: (0..nb).map(|_| Vec::new()).collect(),
             xccnt: vec![0; nxc],
@@ -442,7 +442,17 @@ impl Worker {
 
     /// Files an event under event-number bucket `b` (fast path).
     #[inline(always)]
-    unsafe fn push_x(&mut self, fx: &fast::Fx, b: usize, r: fast::XRec) {
+    unsafe fn push_x(&mut self, fx: &fast::Fx, b: usize, r: fast::XEv) {
+        let (r, ext) = r.pack();
+        self.push_xrec(fx, b, r);
+        if let Some(e) = ext {
+            self.push_xrec(fx, b, e);
+        }
+    }
+
+    /// Files one 16-byte record under event-number bucket `b`.
+    #[inline(always)]
+    unsafe fn push_xrec(&mut self, fx: &fast::Fx, b: usize, r: fast::XRec) {
         let n = *self.xcnt.get_unchecked(b);
         let off = n as usize & (fast::XCH - 1);
         if off == 0 {
@@ -455,7 +465,7 @@ impl Worker {
         let w = self.xwc.as_mut_ptr().add(b) as *mut fast::XRec;
         w.add(k).write(r);
         if k == 7 {
-            mem::stream((*self.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), w as *const u8, 3);
+            mem::stream((*self.xcur.get_unchecked(b) as *mut u8).add((off - 7) * fast::XREC), w as *const u8, 2);
         }
     }
 
@@ -715,7 +725,7 @@ enum XOut {
     /// An event ID of another form than the generator's: kept aside, matched by the ID itself later.
     Odd(fast::OddEv),
     /// Filed under its event number.
-    Rec(u64, fast::XRec),
+    Rec(u64, fast::XEv),
 }
 
 /// One event line with the fast path on, given its seven fields without their
@@ -769,7 +779,7 @@ unsafe fn event_x_decide(sh: &Shared, fx: &fast::Fx, w: &mut Worker, d: *const u
         return XOut::Odd(fast::OddEv { key: Id::key(d, s0, e0), ing: ing_key, a, t: t as u32, pc });
     }
     let lo = (idx & ((1 << fx.xsh) - 1)) as u32;
-    XOut::Rec(idx, fast::XRec { a, t: t as u32, pc, ing: ing_key, lo })
+    XOut::Rec(idx, fast::XEv { a, t: t as u32, pc, ing: ing_key, lo })
 }
 
 /// `event_x_decide`, and the line filed accordingly.
@@ -837,7 +847,7 @@ unsafe fn event_x_line(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le:
 /// Test hook (SS_DECCHECK=1): what the plain reading makes of a line the decoder took.
 #[allow(dead_code)]
 #[inline(never)]
-unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<(u64, fast::XRec)> {
+unsafe fn event_x_plain(sh: &Shared, w: &mut Worker, d: *const u8, ls: usize, le: usize) -> Option<(u64, fast::XEv)> {
     match event_x_decide(sh, sh.fx.as_ref().unwrap_unchecked(), w, d, &plain_fields(d, ls, le)?) {
         XOut::Rec(idx, r) => Some((idx, r)),
         _ => None,
