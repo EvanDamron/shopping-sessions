@@ -25,7 +25,7 @@
 //! decoder takes the plain way and compares the decisions.
 
 use crate::id::Id;
-use crate::{parse_price, plain_fields, CRec, PRec, Shared, Worker, CART, DAY, NOSLOT, PURCHASE, VIEW, WEEK};
+use crate::{parse_price, plain_fields, CRec, PRec, Shared, Worker, CART, CCH, CREC, DAY, DCH, NOSLOT, PCH, PREC, PURCHASE, VIEW, WEEK};
 use core::arch::x86_64::*;
 
 /// What the general rules make of one event line (rules.md "Events", steps 1, 3, 4).
@@ -111,24 +111,102 @@ unsafe fn purchase_pc(sh: &Shared, p: *const u8, (s5, l5): (usize, usize), (s6, 
     Some(v | (sh.lk.products.get(Id::field(p, s5, s5 + l5)).unwrap_or(sh.lk.unknown_cat) << 24))
 }
 
+/// `Worker::push_event`, `push_key` and `push_click` with the rare chunk allocation
+/// out of line, so the filing loops keep their registers.
+#[cold]
+#[inline(never)]
+unsafe fn new_pchunk(sh: &Shared, w: &mut Worker, p: usize) {
+    let f = w.pfill.get_unchecked_mut(p);
+    f.cur = (sh.ev.alloc_offset(PCH * PREC) / PREC) as u32;
+    w.pchunks.get_unchecked_mut(p).push(f.cur);
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn new_dchunk(sh: &Shared, w: &mut Worker, d: usize) {
+    let c = sh.dk.alloc(DCH * 16) as usize;
+    *w.dcur.get_unchecked_mut(d) = c;
+    w.dchunks.get_unchecked_mut(d).push(c);
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn new_cchunk(sh: &Shared, w: &mut Worker, p: usize) {
+    let c = sh.ck.alloc(CCH * CREC) as usize;
+    *w.ccur.get_unchecked_mut(p) = c;
+    w.cchunks.get_unchecked_mut(p).push(c);
+}
+
+#[inline(always)]
+unsafe fn push_event(sh: &Shared, w: &mut Worker, p: usize, r: PRec) -> u32 {
+    let f = w.pfill.as_mut_ptr().add(p);
+    let n = (*f).n;
+    let off = n & (PCH as u32 - 1);
+    if off == 0 {
+        new_pchunk(sh, w, p);
+    }
+    (*f).n = n + 1;
+    let slot = (*f).cur + off;
+    let k = (n & 15) as usize;
+    let b = w.pwc.as_mut_ptr().add(p) as *mut PRec;
+    b.add(k).write(r);
+    if k == 15 {
+        crate::mem::stream(sh.ev.base().add((slot - 15) as usize * PREC), b as *const u8, 3);
+    }
+    slot
+}
+
+#[inline(always)]
+unsafe fn push_key(sh: &Shared, w: &mut Worker, d: usize, w0: u64, w1: u64) {
+    let n = *w.dcnt.get_unchecked(d);
+    let off = n as usize & (DCH - 1);
+    if off == 0 {
+        new_dchunk(sh, w, d);
+    }
+    *w.dcnt.get_unchecked_mut(d) = n + 1;
+    let k = (n & 3) as usize;
+    let b = w.dwc.as_mut_ptr().add(d) as *mut u64;
+    *b.add(2 * k) = w0;
+    *b.add(2 * k + 1) = w1;
+    if k == 3 {
+        crate::mem::stream((*w.dcur.get_unchecked(d) as *mut u8).add((off - 3) * 16), b as *const u8, 1);
+    }
+}
+
+#[inline(always)]
+unsafe fn push_click(sh: &Shared, w: &mut Worker, p: usize, r: CRec) {
+    let n = *w.ccnt.get_unchecked(p);
+    let off = n as usize & (CCH - 1);
+    if off == 0 {
+        new_cchunk(sh, w, p);
+    }
+    *w.ccnt.get_unchecked_mut(p) = n + 1;
+    let k = (n & 7) as usize;
+    let b = w.cwc.as_mut_ptr().add(p) as *mut CRec;
+    b.add(k).write(r);
+    if k == 7 {
+        crate::mem::stream((*w.ccur.get_unchecked(p) as *mut u8).add((off - 7) * CREC), b as *const u8, 4);
+    }
+}
+
 /// Files an event row as `crate::events` does.
 #[inline(always)]
 unsafe fn file_event(sh: &Shared, w: &mut Worker, r: &ERow, uh: u64) {
     let bucket = (r.kb >> sh.dshift) as usize;
     if !r.ok {
-        w.push_key(sh, bucket, r.kid, ((r.ing as u64) << 32) | NOSLOT as u64);
+        push_key(sh, w, bucket, r.kid, ((r.ing as u64) << 32) | NOSLOT as u64);
         return;
     }
     let who = sh.links.person(r.uid, uh, &mut w.added);
-    let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: r.t, pc: r.pc });
-    w.push_key(sh, bucket, r.kid, ((r.ing as u64) << 32) | slot as u64);
+    let slot = push_event(sh, w, (who >> sh.pshift) as usize, PRec { who, t: r.t, pc: r.pc });
+    push_key(sh, w, bucket, r.kid, ((r.ing as u64) << 32) | slot as u64);
 }
 
 /// Files a click row as `crate::clicks` does.
 #[inline(always)]
 unsafe fn file_click(sh: &Shared, w: &mut Worker, r: &CRow, uh: u64) {
     let who = sh.links.person(r.uid, uh, &mut w.added);
-    w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
+    push_click(sh, w, (who >> sh.pshift) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
 }
 
 /// The plain reading of an event line the window does not hold.
@@ -434,7 +512,7 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let kid = *bt.kid.get_unchecked(j);
             let ing = ti & !0xFFFF_FFFF;
             if *bt.ok.get_unchecked(j) == 0 {
-                w.push_key(sh, bucket, kid, ing | NOSLOT as u64);
+                push_key(sh, w, bucket, kid, ing | NOSLOT as u64);
                 continue;
             }
             if li < nlong && bt.long.get_unchecked(li).0 as usize == j {
@@ -443,8 +521,8 @@ unsafe fn events_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             }
             let uid = Id { lo: *bt.ulo.get_unchecked(j), hi: *bt.uhi.get_unchecked(j) };
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
-            let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
-            w.push_key(sh, bucket, kid, ing | slot as u64);
+            let slot = push_event(sh, w, (who >> sh.pshift) as usize, PRec { who, t: ti as u32, pc: *bt.pc.get_unchecked(j) });
+            push_key(sh, w, bucket, kid, ing | slot as u64);
         }
         for i in 0..np {
             let pr = *bt.pend.get_unchecked(i);
@@ -510,8 +588,8 @@ struct Pending {
 unsafe fn file_pending(sh: &Shared, w: &mut Worker, pr: &Pending) {
     let bucket = (pr.kb >> sh.dshift) as usize;
     let who = sh.links.person(pr.uid, pr.uh, &mut w.added);
-    let slot = w.push_event(sh, (who >> sh.pshift) as usize, PRec { who, t: pr.ti as u32, pc: pr.pc });
-    w.push_key(sh, bucket, pr.kid, (pr.ti & !0xFFFF_FFFF) | slot as u64);
+    let slot = push_event(sh, w, (who >> sh.pshift) as usize, PRec { who, t: pr.ti as u32, pc: pr.pc });
+    push_key(sh, w, bucket, pr.kid, (pr.ti & !0xFFFF_FFFF) | slot as u64);
 }
 
 /// Test hook: a row the decoder made, against the plain reading of its line.
@@ -756,7 +834,7 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
             let tc = *bt.tc.get_unchecked(j);
             let cid = Id { lo: *bt.clo.get_unchecked(j), hi: *bt.chi.get_unchecked(j) };
-            w.push_click(sh, (who >> sh.pshift) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
+            push_click(sh, w, (who >> sh.pshift) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
         }
         w.ncfast += n as u64;
         if sh.deccheck {
