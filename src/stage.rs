@@ -1245,7 +1245,7 @@ unsafe fn pool_click(env: &Env, w: &mut Worker, r: &CRec) {
     if w.added >= 256 {
         env.sh.links.added(&mut w.added);
     }
-    w.push_click(env.sh, (who & env.sh.pmask) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
+    w.push_click(env.sh, (who & env.sh.pmask) as usize, who, r.ts, r.camp, r.cid);
 }
 
 /// Files every click of user number `g` with the general pipeline.

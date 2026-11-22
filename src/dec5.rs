@@ -25,7 +25,7 @@
 //! decoder takes the plain way and compares the decisions.
 
 use crate::id::Id;
-use crate::{parse_price, plain_fields, CRec, PRec, Shared, Worker, CART, DAY, NOSLOT, PURCHASE, VIEW, WEEK};
+use crate::{parse_price, plain_fields, PRec, Shared, Worker, CART, DAY, NOSLOT, PURCHASE, VIEW, WEEK};
 use core::arch::x86_64::*;
 
 /// What the general rules make of one event line (rules.md "Events", steps 1, 3, 4).
@@ -130,7 +130,7 @@ unsafe fn file_event(sh: &Shared, w: &mut Worker, r: &ERow, uh: u64) {
 #[inline(always)]
 unsafe fn file_click(sh: &Shared, w: &mut Worker, r: &CRow, uh: u64) {
     let who = sh.links.person(r.uid, uh, &mut w.added);
-    w.push_click(sh, (who & sh.pmask) as usize, CRec { who, ts: r.ts, camp: r.camp, _pad: 0, cid: r.cid });
+    w.push_click(sh, (who & sh.pmask) as usize, who, r.ts, r.camp, r.cid);
 }
 
 /// The plain reading of an event line the window does not hold.
@@ -741,7 +741,7 @@ unsafe fn clicks_in(sh: &Shared, w: &mut Worker, d: *const u8, s: usize, end: us
             let who = sh.links.person(uid, *bt.uh.get_unchecked(j), &mut w.added);
             let tc = *bt.tc.get_unchecked(j);
             let cid = Id { lo: *bt.clo.get_unchecked(j), hi: *bt.chi.get_unchecked(j) };
-            w.push_click(sh, (who & sh.pmask) as usize, CRec { who, ts: tc as u32, camp: (tc >> 32) as u32, _pad: 0, cid });
+            w.push_click(sh, (who & sh.pmask) as usize, who, tc as u32, (tc >> 32) as u32, cid);
         }
         w.ncfast += n as u64;
         if sh.deccheck {
