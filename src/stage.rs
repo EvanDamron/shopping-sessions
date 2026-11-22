@@ -1077,6 +1077,88 @@ fn span(lo: usize, e: usize) -> u64 {
     below(e) & !below(lo)
 }
 
+/// `few_pass_wide` for at most 16 clicks, in index order (no sort): per click, the
+/// clicks later than it (`later`) and the earlier ones of its campaign (`twin`), as
+/// lanes of bits; then per session, of the clicks in reach, those with no later one in
+/// reach are the credited click (or a tie) and those with no earlier one of the same
+/// campaign in reach give the assists.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+#[inline]
+unsafe fn few16_wide(f: &mut Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, org: u32, sess: bool, out: *mut u32, cid: &impl Fn(u32) -> Id) {
+    use core::arch::x86_64::*;
+    let n = f.n;
+    let tsv = _mm512_loadu_si512(f.ts.as_ptr() as *const __m512i);
+    let cv = _mm512_loadu_si512(f.camp.as_ptr() as *const __m512i);
+    // (Place 16: the organic campaign, for a session no click reaches.)
+    f.camp[16] = org;
+    let valid = ((1u32 << n) - 1) as __mmask16;
+    let (mut later, mut twin) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+    for k in 0..n {
+        let bit = _mm512_set1_epi32(1 << k);
+        let lt = _mm512_cmplt_epu32_mask(tsv, _mm512_set1_epi32(*f.ts.get_unchecked(k) as i32));
+        later = _mm512_mask_or_epi32(later, lt, later, bit);
+        let above = valid & !(((2u32 << k) - 1) as __mmask16);
+        let eq = _mm512_mask_cmpeq_epi32_mask(above, cv, _mm512_set1_epi32(*f.camp.get_unchecked(k) as i32));
+        twin = _mm512_mask_or_epi32(twin, eq, twin, bit);
+    }
+    for j in 0..m {
+        let s = *st.add(j);
+        let (bs, bw) = (_mm512_set1_epi32(s as i32), _mm512_set1_epi32(s.saturating_sub(WEEK) as i32));
+        let r = _mm512_mask_cmpge_epu32_mask(_mm512_mask_cmple_epu32_mask(valid, tsv, bs), tsv, bw);
+        let rv = _mm512_set1_epi32(r as i32);
+        let tie = (r & !_mm512_mask_test_epi32_mask(r, later, rv)) as u32;
+        let mut first = (r & !_mm512_mask_test_epi32_mask(r, twin, rv)) as u32;
+        let d = *day.add(j);
+        let mut camp = *f.camp.get_unchecked((tie | 1 << 16).trailing_zeros() as usize);
+        if tie & tie.wrapping_sub(1) != 0 {
+            camp = few16_tie(f, tie, cid);
+        }
+        if sess {
+            *acc.sess.add(((camp as usize) << acc.wsh) + d as usize) += 1;
+        }
+        *out.add(j) = camp;
+        // The first two assists without a branch: with none left, place 16 (organic)
+        // gets 0 added.
+        for _ in 0..2 {
+            let c = *f.camp.get_unchecked((first | 1 << 16).trailing_zeros() as usize);
+            *acc.assist.add(((c as usize) << acc.wsh) + d as usize) += (first != 0) as u32;
+            first &= first.wrapping_sub(1);
+        }
+        while first != 0 {
+            let c = *f.camp.get_unchecked(first.trailing_zeros() as usize);
+            *acc.assist.add(((c as usize) << acc.wsh) + d as usize) += 1;
+            first &= first - 1;
+        }
+    }
+}
+
+/// As `few_tie` for `few16_wide`: `tie`, two or more clicks in index order.
+#[cold]
+#[inline(never)]
+unsafe fn few16_tie(f: &Few, tie: u32, cid: &impl Fn(u32) -> Id) -> u32 {
+    let mut best = tie.trailing_zeros() as usize;
+    let c0 = f.camp[best];
+    let mut rest = tie & (tie - 1);
+    let mut same = true;
+    while rest != 0 {
+        same &= f.camp[rest.trailing_zeros() as usize] == c0;
+        rest &= rest - 1;
+    }
+    if same {
+        return c0;
+    }
+    let mut rest = tie & (tie - 1);
+    while rest != 0 {
+        let i = rest.trailing_zeros() as usize;
+        if f.j[i] != f.j[best] && cid(f.j[i]).less(&cid(f.j[best])) {
+            best = i;
+        }
+        rest &= rest - 1;
+    }
+    f.camp[best]
+}
+
 /// Credit and assists of a person with few clicks (gathered in `f`, `f.n` > 0) and `m`
 /// sessions with starts `st` and days `day`: each session's campaign goes to `out`, its
 /// assists to `acc`, and the session itself if `sess` (`org`: the organic campaign).
@@ -1089,6 +1171,9 @@ fn span(lo: usize, e: usize) -> u64 {
 unsafe fn few_pass_wide(f: &mut Few, st: *const u32, day: *const u32, m: usize, acc: &Acc, org: u32, sess: bool, out: *mut u32, cid: &impl Fn(u32) -> Id) {
     use core::arch::x86_64::*;
     let n = f.n;
+    if n <= 16 {
+        return few16_wide(f, st, day, m, acc, org, sess, out, cid);
+    }
     let nv = n.div_ceil(16);
     let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
     let valid = |v: usize| (all >> (16 * v)) as __mmask16;
